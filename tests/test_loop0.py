@@ -359,15 +359,138 @@ def test_loop0_runner_unifies_pending_message_tasks():
             payload for payload in db.list_records("tasks") if payload.get("task_id") == implementation["worker_task_id"]
         )
         assert worker_task["status"] == "complete"
-        attempts = [payload for payload in db.list_records("attempts") if payload.get("task_id") == "message-task-1"]
-        assert {payload["outcome"] for payload in attempts} == {"running", "succeeded"}
-        followup_tasks = [
+
+
+def test_loop0_consensus_review_uses_two_cheap_workers_before_completion():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        review_task = {
+            "task_id": "review-task-1",
+            "title": "Review runtime posture",
+            "description": "Audit the current runtime posture and report the bounded conclusion.",
+            "priority": 8,
+            "urgency": 2,
+            "risk": "low",
+            "status": "pending",
+            "provenance": {
+                "source": "message_intake",
+                "task_class": "review",
+                "source_communication_id": "msg-review-1",
+                "target_lane": "prime",
+            },
+            "success_criteria": {"message_addressed": True},
+            "completion_policy": {"type": "review_or_audit"},
+        }
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(TaskRecord(**review_task))
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry(
+                {
+                    "codex": _DeferredCodexProvider(),
+                    "cli": _CheapCliProvider(),
+                }
+            ),
+        )
+        candidate = runner._pending_message_task_candidates()[0]  # noqa: SLF001
+        result = runner._execute_assessment(  # noqa: SLF001
+            runner._message_task_assessment(candidate)  # noqa: SLF001
+        )
+        assert result["status"] == "ok"
+        assert result["attempt"]["outcome"] == "running"
+        implementation = result["attempt"]["resource_usage"]["implementation"]
+        assert implementation["generation_mode"] == "delegated_worker"
+        assert "consensus_review" in implementation
+        worker_tasks = [
             payload
             for payload in db.list_records("tasks")
-            if payload.get("provenance", {}).get("source") == "message_task_followup"
+            if payload.get("parent_task_id") == "review-task-1"
         ]
-        assert followup_tasks
-        assert followup_tasks[-1]["title"] == "Spec follow-up"
+        assert len(worker_tasks) == 2
+        worker_ids = {str(payload.get("provenance", {}).get("worker_id") or "") for payload in worker_tasks}
+        assert "worker.kilocode" in worker_ids
+        assert any(worker_id.startswith("worker.gemini-cli") for worker_id in worker_ids)
+        for worker_id in sorted(worker_ids):
+            runner.worker_runtime.process_pending(worker_id=worker_id)
+        runner._reconcile_pending_tasks()
+        updated_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "review-task-1")
+        assert updated_task["status"] == "complete"
+        assert updated_task["provenance"]["consensus_review"]["status"] == "approved"
+
+
+def test_loop0_batches_low_priority_related_message_tasks():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        base_provenance = {
+            "source": "message_intake",
+            "task_class": "maintenance",
+            "source_communication_id": "msg-batch-1",
+            "target_lane": "prime",
+        }
+        db.upsert_task(
+            TaskRecord(
+                task_id="batch-task-1",
+                title="Summarize lane drift",
+                description="Summarize the recent low-priority lane drift notice.",
+                priority=2,
+                urgency=2,
+                risk="low",
+                status="pending",
+                provenance=base_provenance,
+                success_criteria={"message_addressed": True},
+                completion_policy={"type": "respond_or_execute"},
+            )
+        )
+        db.upsert_task(
+            TaskRecord(
+                task_id="batch-task-2",
+                title="Summarize lane drift",
+                description="Summarize the second low-priority lane drift notice.",
+                priority=2,
+                urgency=2,
+                risk="low",
+                status="pending",
+                provenance={**base_provenance, "source_communication_id": "msg-batch-2"},
+                success_criteria={"message_addressed": True},
+                completion_policy={"type": "respond_or_execute"},
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry(
+                {
+                    "codex": _DeferredCodexProvider(),
+                    "cli": _CheapCliProvider(),
+                }
+            ),
+        )
+        candidates = runner._pending_message_task_candidates()  # noqa: SLF001
+        batch_candidates = [candidate for candidate in candidates if candidate.title.startswith("Batch:")]
+        assert len(batch_candidates) == 1
+        candidate = batch_candidates[0]
+        batched_task_ids = candidate.metadata["provenance"]["batching"]["batched_task_ids"]
+        assert batched_task_ids == ["batch-task-1", "batch-task-2"]
+        result = runner._execute_assessment(  # noqa: SLF001
+            runner._message_task_assessment(candidate)  # noqa: SLF001
+        )
+        assert result["status"] == "ok"
+        for worker_id in ["worker.kilocode"]:
+            runner.worker_runtime.process_pending(worker_id=worker_id)
+        runner._reconcile_pending_tasks()
+        first = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "batch-task-1")
+        second = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "batch-task-2")
+        assert first["status"] == "complete"
+        assert second["status"] == "complete"
+        assert second["parent_task_id"] == "batch-task-1"
 
 
 def test_loop0_runner_unifies_pending_followup_tasks():

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,7 @@ from astrata.providers.registry import ProviderRegistry, build_default_registry
 from astrata.records.handoffs import HandoffRecord
 from astrata.records.models import ArtifactRecord, AttemptRecord, TaskRecord, VerificationRecord
 from astrata.routing.advisor import RoutePerformanceAdvisor
+from astrata.routing.prime_policy import infer_task_policy
 from astrata.routing.policy import RouteChooser
 from astrata.scheduling.prioritizer import WorkPrioritizer
 from astrata.scheduling.quota import QuotaPolicy, default_source_limits
@@ -696,7 +697,30 @@ class Loop0Runner:
                 continue
             payload = dict(message.payload or {})
             task_id = str(payload.get("task_id") or "").strip()
+            worker_task_id = str(payload.get("worker_task_id") or "").strip()
             if not task_id:
+                self.principal_lane.acknowledge(message.communication_id)
+                continue
+            consensus_task_payload = None
+            if worker_task_id:
+                consensus_task_payload = next(
+                    (
+                        item
+                        for item in self.db.list_records("tasks")
+                        if str(item.get("task_id") or "").strip() == worker_task_id
+                        and str(dict(item.get("provenance") or {}).get("role") or "").strip() == "consensus_review"
+                    ),
+                    None,
+                )
+            if consensus_task_payload is not None:
+                consensus_updates = self._reconcile_consensus_worker_result(
+                    worker_task_payload=consensus_task_payload,
+                    message_payload=payload,
+                )
+                for update in consensus_updates:
+                    self.db.upsert_task(update)
+                    reconciled.append(update)
+                self._record_worker_completion_attempt(task=TaskRecord(**consensus_task_payload), message_payload=payload)
                 self.principal_lane.acknowledge(message.communication_id)
                 continue
             task_payload = next(
@@ -708,6 +732,7 @@ class Loop0Runner:
                 continue
             task = self._task_from_worker_result(task_payload, message_payload=payload)
             self.db.upsert_task(task)
+            self._sync_batched_peer_tasks(task)
             self._record_worker_completion_attempt(task=task, message_payload=payload)
             self.principal_lane.acknowledge(message.communication_id)
             reconciled.append(task)
@@ -888,6 +913,157 @@ class Loop0Runner:
         payload["provenance"] = provenance
         return TaskRecord(**payload)
 
+    def _reconcile_consensus_worker_result(
+        self,
+        *,
+        worker_task_payload: dict[str, Any],
+        message_payload: dict[str, Any],
+    ) -> list[TaskRecord]:
+        worker_payload = dict(worker_task_payload)
+        worker_payload["status"] = "complete" if str(message_payload.get("status") or "") == "applied" else "failed"
+        worker_payload["updated_at"] = _now_iso()
+        worker_payload["provenance"] = {
+            **dict(worker_payload.get("provenance") or {}),
+            "worker_result": {
+                "route": message_payload.get("route"),
+                "status": message_payload.get("status"),
+                "detail": message_payload.get("detail"),
+                "received_at": _now_iso(),
+            },
+        }
+        worker_task = TaskRecord(**worker_payload)
+        parent_task_id = str(worker_task.parent_task_id or dict(worker_payload.get("provenance") or {}).get("parent_task_id") or "").strip()
+        parent_payload = next(
+            (item for item in self.db.list_records("tasks") if str(item.get("task_id") or "").strip() == parent_task_id),
+            None,
+        )
+        if not parent_payload:
+            return [worker_task]
+        parent_update = dict(parent_payload)
+        parent_provenance = dict(parent_update.get("provenance") or {})
+        consensus = dict(parent_provenance.get("consensus_review") or {})
+        existing_results = list(consensus.get("results") or [])
+        raw_content = str(message_payload.get("raw_content") or "")
+        result_payload = {
+            "worker_task_id": str(worker_payload.get("task_id") or ""),
+            "worker_id": message_payload.get("worker_id"),
+            "status": message_payload.get("status"),
+            "route": message_payload.get("route"),
+            "principal_response": self._extract_principal_response(raw_content),
+            "followup_tasks": self._extract_followup_tasks(raw_content, parent_update),
+            "derived_artifact": self._extract_message_artifact(
+                raw_content,
+                Loop0TaskCandidate(
+                    key=f"task:{parent_update.get('task_id')}",
+                    title=str(parent_update.get("title") or ""),
+                    description=str(parent_update.get("description") or ""),
+                    expected_paths=(),
+                    strategy="message_task",
+                    metadata=parent_update,
+                ),
+                parent_update,
+            ),
+            "raw_content": raw_content,
+        }
+        existing_results = [
+            item for item in existing_results if str(item.get("worker_task_id") or "").strip() != result_payload["worker_task_id"]
+        ]
+        existing_results.append(result_payload)
+        consensus["results"] = existing_results
+        consensus["status"] = "collecting"
+        parent_update["provenance"] = {
+            **parent_provenance,
+            "consensus_review": consensus,
+        }
+        parent_update["updated_at"] = _now_iso()
+        successful = [item for item in existing_results if str(item.get("status") or "") == "applied"]
+        required = max(2, int(consensus.get("required_reviews") or 2))
+        if len(successful) >= required:
+            canonical = self._normalize_consensus_text(str(successful[0].get("principal_response") or ""))
+            if all(self._normalize_consensus_text(str(item.get("principal_response") or "")) == canonical for item in successful[:required]):
+                approved = self._task_from_worker_result(parent_update, message_payload={
+                    **message_payload,
+                    "raw_content": str(successful[0].get("raw_content") or ""),
+                    "route": successful[0].get("route") or message_payload.get("route") or {},
+                    "status": "applied",
+                })
+                approved_payload = approved.model_dump(mode="json")
+                approved_payload["provenance"] = {
+                    **dict(approved_payload.get("provenance") or {}),
+                    "consensus_review": {
+                        **consensus,
+                        "status": "approved",
+                        "approved_at": _now_iso(),
+                    },
+                }
+                approved_task = TaskRecord(**approved_payload)
+                self._sync_batched_peer_tasks(approved_task)
+                return [approved_task, worker_task]
+            disagreement_artifact = ArtifactRecord(
+                artifact_type="consensus_review_disagreement",
+                title=f"Consensus disagreement: {parent_update.get('title') or parent_task_id}",
+                description="Cheap review lanes disagreed on a bounded task outcome and require escalation.",
+                content_summary=json.dumps({"results": successful[:required]}, indent=2),
+                provenance={"task_id": parent_task_id, "source": "consensus_review"},
+                status="degraded",
+            )
+            self.db.upsert_artifact(disagreement_artifact)
+            parent_update["status"] = "blocked"
+            parent_update["provenance"] = {
+                **dict(parent_update.get("provenance") or {}),
+                "consensus_review": {
+                    **consensus,
+                    "status": "disagreement",
+                    "artifact_id": disagreement_artifact.artifact_id,
+                },
+            }
+            blocked_task = TaskRecord(**parent_update)
+            self._sync_batched_peer_tasks(blocked_task)
+            return [blocked_task, worker_task]
+        active_child_ids = [
+            child_id
+            for child_id in list(parent_update.get("active_child_ids") or [])
+            if str(child_id).strip() and str(child_id).strip() != str(worker_payload.get("task_id") or "")
+        ]
+        pending_consensus = TaskRecord(
+            **{
+                **parent_update,
+                "status": "working",
+                "active_child_ids": active_child_ids,
+            }
+        )
+        self._sync_batched_peer_tasks(pending_consensus)
+        return [pending_consensus, worker_task]
+
+    def _normalize_consensus_text(self, value: str) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    def _sync_batched_peer_tasks(self, parent_task: TaskRecord) -> None:
+        batched_task_ids = [
+            str(task_id).strip()
+            for task_id in list(dict(parent_task.provenance or {}).get("batching", {}).get("batched_task_ids") or [])
+            if str(task_id).strip()
+        ]
+        if not batched_task_ids:
+            return
+        for task_payload in self.db.list_records("tasks"):
+            task_id = str(task_payload.get("task_id") or "").strip()
+            if task_id not in batched_task_ids or task_id == parent_task.task_id:
+                continue
+            updated = TaskRecord(
+                **{
+                    **dict(task_payload),
+                    "status": parent_task.status,
+                    "parent_task_id": parent_task.task_id,
+                    "updated_at": _now_iso(),
+                    "provenance": {
+                        **dict(task_payload.get("provenance") or {}),
+                        "batched_under_task_id": parent_task.task_id,
+                    },
+                }
+            )
+            self.db.upsert_task(updated)
+
     def _record_worker_completion_attempt(self, *, task: TaskRecord, message_payload: dict[str, Any]) -> None:
         raw_content = str(message_payload.get("raw_content") or "")
         status = str(message_payload.get("status") or "").strip().lower()
@@ -947,6 +1123,7 @@ class Loop0Runner:
         completion_policy = dict(task_payload.get("completion_policy") or {})
         route_preferences = dict(completion_policy.get("route_preferences") or {})
         provenance = dict(task_payload.get("provenance") or {})
+        policy = infer_task_policy(task_payload)
         title = str(task_payload.get("title") or "")
         description = str(task_payload.get("description") or "")
         task_id = str(task_payload.get("task_id") or "")
@@ -963,6 +1140,10 @@ class Loop0Runner:
             "is_followup": provenance.get("source") == "message_task_followup",
             "likely_satisfied": self._task_likely_satisfied(task_payload),
             "closure_pressure": self._task_closure_pressure(task_payload),
+            "batchable": bool(policy.get("batchable")),
+            "consensus_eligible": bool(policy.get("consensus_eligible")),
+            "task_class": str(policy.get("task_class") or "general"),
+            "batch_size": len(list(task_payload.get("batched_task_ids") or [])) or 1,
         }
         return scheduling
 
@@ -1118,8 +1299,8 @@ class Loop0Runner:
         return str(canonical.get("task_id") or "").strip() != task_id
 
     def _pending_message_task_candidates(self) -> list[Loop0TaskCandidate]:
-        candidates: list[Loop0TaskCandidate] = []
         tasks_by_id = self._tasks_by_id()
+        raw_candidates: list[Loop0TaskCandidate] = []
         for task_payload in self.db.list_records("tasks"):
             provenance = dict(task_payload.get("provenance") or {})
             if task_payload.get("status") != "pending":
@@ -1135,7 +1316,7 @@ class Loop0Runner:
             task_id = str(task_payload.get("task_id") or "").strip()
             if not task_id:
                 continue
-            candidates.append(
+            raw_candidates.append(
                 Loop0TaskCandidate(
                     key=f"task:{task_id}",
                     title=str(task_payload.get("title") or "Process inbound task"),
@@ -1149,7 +1330,76 @@ class Loop0Runner:
                     metadata=task_payload,
                 )
             )
-        return candidates
+        return self._collapse_batchable_message_candidates(raw_candidates)
+
+    def _collapse_batchable_message_candidates(
+        self,
+        candidates: list[Loop0TaskCandidate],
+    ) -> list[Loop0TaskCandidate]:
+        grouped: dict[tuple[str, str, str], list[Loop0TaskCandidate]] = {}
+        passthrough: list[Loop0TaskCandidate] = []
+        for candidate in candidates:
+            metadata = dict(candidate.metadata or {})
+            policy = infer_task_policy(metadata)
+            if not policy.get("batchable"):
+                passthrough.append(candidate)
+                continue
+            provenance = dict(metadata.get("provenance") or {})
+            lane_sender, _conversation_id = self._message_task_lane_context(metadata)
+            batch_key = (
+                lane_sender,
+                str(policy.get("task_class") or "general"),
+                str(dict(metadata.get("completion_policy") or {}).get("type") or "").strip().lower(),
+            )
+            grouped.setdefault(batch_key, []).append(candidate)
+        collapsed: list[Loop0TaskCandidate] = list(passthrough)
+        for batch in grouped.values():
+            ordered = sorted(
+                batch,
+                key=lambda item: (
+                    str(dict(item.metadata or {}).get("created_at") or ""),
+                    str(item.source_task_id or ""),
+                ),
+            )
+            if len(ordered) < 2:
+                collapsed.extend(ordered)
+                continue
+            carrier = ordered[0]
+            batched_payloads = [dict(item.metadata or {}) for item in ordered[:4]]
+            batched_task_ids = [
+                str(payload.get("task_id") or "").strip()
+                for payload in batched_payloads
+                if str(payload.get("task_id") or "").strip()
+            ]
+            if len(batched_task_ids) < 2:
+                collapsed.extend(ordered)
+                continue
+            carrier_payload = {
+                **dict(carrier.metadata or {}),
+                "provenance": {
+                    **dict(dict(carrier.metadata or {}).get("provenance") or {}),
+                    "batching": {
+                        "batched_task_ids": batched_task_ids,
+                    },
+                },
+                "batched_task_payloads": batched_payloads,
+            }
+            collapsed.append(
+                replace(
+                    carrier,
+                    title=f"Batch: {carrier.title}",
+                    description=(
+                        f"Handle {len(batched_task_ids)} low-priority related tasks as one bounded batch. "
+                        + " | ".join(
+                            str(payload.get("description") or "").strip()
+                            for payload in batched_payloads[:3]
+                            if str(payload.get("description") or "").strip()
+                        )
+                    )[:400],
+                    metadata=carrier_payload,
+                )
+            )
+        return collapsed
 
     def _retry_task_candidates(self) -> list[Loop0TaskCandidate]:
         tasks_by_id = self._tasks_by_id()
@@ -1595,6 +1845,10 @@ class Loop0Runner:
 
     def _task_class_for_candidate(self, candidate: Loop0TaskCandidate) -> str:
         metadata = dict(candidate.metadata or {})
+        provenance = dict(metadata.get("provenance") or {})
+        explicit_task_class = str(metadata.get("task_class") or provenance.get("task_class") or "").strip().lower()
+        if explicit_task_class:
+            return explicit_task_class
         domains = [str(item).strip().lower() for item in list(metadata.get("domains") or []) if str(item).strip()]
         request_kind = str(metadata.get("derived_request_kind") or metadata.get("request_kind") or "").strip().lower()
         if "implementation" in domains or "tasking" in domains:
@@ -1686,6 +1940,7 @@ class Loop0Runner:
             coordination=coordination,
         )
         self.db.upsert_task(task)
+        self._sync_batched_peer_tasks(task)
         followup_tasks = self._materialize_followup_tasks(
             candidate=candidate,
             parent_task=task,
@@ -2012,6 +2267,24 @@ class Loop0Runner:
         )
         if candidate.strategy == "message_task" and candidate.metadata:
             payload = dict(candidate.metadata)
+            task_id = str(payload.get("task_id") or candidate.source_task_id or "").strip()
+            existing_payload = next(
+                (
+                    item
+                    for item in self.db.list_records("tasks")
+                    if str(item.get("task_id") or "").strip() == task_id
+                ),
+                None,
+            )
+            if existing_payload:
+                payload = {
+                    **dict(existing_payload),
+                    **payload,
+                    "provenance": {
+                        **dict(existing_payload.get("provenance") or {}),
+                        **dict(payload.get("provenance") or {}),
+                    },
+                }
             payload["status"] = status
             provenance = dict(payload.get("provenance") or {})
             provenance["dispatch"] = {
@@ -2155,7 +2428,7 @@ class Loop0Runner:
                 "baseline_inspection": coordination.get("baseline_inspection") or {},
             }
         if candidate.strategy == "message_task":
-            return self._apply_message_task(candidate, route=route)
+            return self._apply_message_task(candidate, route=route, coordination=coordination)
         governance_block = self._ensure_governance_write_allowed(
             candidate=candidate,
             candidate_paths=list(candidate.expected_paths),
@@ -2196,9 +2469,14 @@ class Loop0Runner:
         candidate: Loop0TaskCandidate,
         *,
         route: dict[str, Any],
+        coordination: dict[str, Any],
     ) -> dict[str, Any]:
         task_payload = dict(candidate.metadata or {})
         completion_policy = dict(task_payload.get("completion_policy") or {})
+        coordination_actions = [
+            *list(dict(coordination.get("source_decision") or {}).get("followup_actions") or []),
+            *list(dict(coordination.get("decision") or {}).get("followup_actions") or []),
+        ]
         task_id = str(task_payload.get("task_id") or candidate.source_task_id or candidate.key)
         lane_sender, conversation_id = self._message_task_lane_context(task_payload)
         provider = self.registry.get_provider(str(route.get("provider") or "").strip() or None)
@@ -2214,6 +2492,17 @@ class Loop0Runner:
             if execution_result is not None:
                 return execution_result
         if self._should_delegate_message_task(candidate, route=route, task_payload=task_payload):
+            if self._consensus_review_requested(coordination_actions):
+                delegated_consensus = self._delegate_consensus_message_task(
+                    candidate,
+                    task_payload=task_payload,
+                    task_id=task_id,
+                    route=route,
+                    baseline_inspection=baseline_inspection,
+                    required_reviews=self._required_consensus_reviews(coordination_actions),
+                )
+                if delegated_consensus is not None:
+                    return delegated_consensus
             delegated = self._delegate_message_task(
                 candidate,
                 task_payload=task_payload,
@@ -2329,6 +2618,193 @@ class Loop0Runner:
         if prefer_cheap_lanes and provider in {"cli", "google", "custom", "anthropic"}:
             return True
         return False
+
+    def _consensus_review_requested(self, actions: list[dict[str, Any]]) -> bool:
+        return any(str(action.get("type") or "").strip() == "consensus_approval_eligible" for action in actions)
+
+    def _required_consensus_reviews(self, actions: list[dict[str, Any]]) -> int:
+        for action in actions:
+            if str(action.get("type") or "").strip() != "consensus_approval_eligible":
+                continue
+            try:
+                return max(2, int(action.get("required_reviews") or 2))
+            except Exception:
+                return 2
+        return 2
+
+    def _consensus_worker_routes(
+        self,
+        *,
+        primary_route: dict[str, Any],
+        task_payload: dict[str, Any],
+        required_reviews: int,
+    ) -> list[dict[str, Any]]:
+        route_preferences = dict(dict(task_payload.get("completion_policy") or {}).get("route_preferences") or {})
+        preferred_cli_tools = [
+            str(item).strip().lower()
+            for item in list(route_preferences.get("preferred_cli_tools") or [])
+            if str(item).strip()
+        ]
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def _add(route: dict[str, Any]) -> None:
+            key = (
+                str(route.get("provider") or "").strip().lower(),
+                str(route.get("cli_tool") or "").strip().lower(),
+                str(route.get("model") or "").strip().lower(),
+            )
+            if not key[0] or key in seen:
+                return
+            seen.add(key)
+            candidates.append(route)
+
+        _add(dict(primary_route))
+        for cli_tool in [*preferred_cli_tools, "kilocode", "gemini-cli", "claude-code"]:
+            if cli_tool == str(primary_route.get("cli_tool") or "").strip().lower():
+                continue
+            if cli_tool == "gemini-cli":
+                _add(
+                    {
+                        "provider": "cli",
+                        "cli_tool": cli_tool,
+                        "model": str(route_preferences.get("preferred_model") or "").strip() or "gemini-2.5-flash",
+                        "reason": "consensus_review_peer",
+                    }
+                )
+                continue
+            _add(
+                {
+                    "provider": "cli",
+                    "cli_tool": cli_tool,
+                    "model": None,
+                    "reason": "consensus_review_peer",
+                }
+            )
+        return candidates[: max(2, required_reviews)]
+
+    def _delegate_consensus_message_task(
+        self,
+        candidate: Loop0TaskCandidate,
+        *,
+        task_payload: dict[str, Any],
+        task_id: str,
+        route: dict[str, Any],
+        baseline_inspection: dict[str, Any],
+        required_reviews: int,
+    ) -> dict[str, Any] | None:
+        routes = self._consensus_worker_routes(
+            primary_route=route,
+            task_payload=task_payload,
+            required_reviews=required_reviews,
+        )
+        if len(routes) < 2:
+            return None
+        worker_task_ids: list[str] = []
+        worker_ids: list[str] = []
+        request_ids: list[str] = []
+        for index, worker_route in enumerate(routes, start=1):
+            worker_id = worker_id_for_route(worker_route)
+            worker_ids.append(worker_id)
+            worker_task = TaskRecord(
+                parent_task_id=task_id,
+                title=f"Consensus Review {index}: {candidate.title}",
+                description=f"Execute bounded consensus review on {worker_id}.",
+                priority=candidate.priority,
+                urgency=candidate.urgency,
+                risk=str(task_payload.get("risk") or candidate.risk or "low"),
+                status="working",
+                provenance={
+                    "source": "worker_delegation",
+                    "role": "consensus_review",
+                    "parent_task_id": task_id,
+                    "worker_id": worker_id,
+                    "task_class": "delegated_message_task",
+                    "route": worker_route,
+                },
+                success_criteria={"worker_result_reconciled": True},
+                completion_policy={
+                    "type": "worker_execution",
+                    "route_preferences": dict(task_payload.get("completion_policy", {}).get("route_preferences") or {}),
+                },
+            )
+            self.db.upsert_task(worker_task)
+            worker_task_ids.append(worker_task.task_id)
+            request = self.principal_lane.send(
+                sender="prime",
+                recipient=worker_id,
+                conversation_id=self.principal_lane.default_conversation_id(worker_id),
+                kind="delegation",
+                intent="worker_delegation_request",
+                payload={
+                    "delegation_kind": "message_task",
+                    "task_id": task_id,
+                    "title": candidate.title,
+                    "description": candidate.description,
+                    "message": candidate.description,
+                    "task_payload": {
+                        **task_payload,
+                        "consensus_review": {
+                            "required_reviews": required_reviews,
+                            "worker_routes": routes,
+                        },
+                    },
+                    "route": worker_route,
+                    "worker_task_id": worker_task.task_id,
+                },
+                priority=candidate.priority,
+                urgency=candidate.urgency,
+                related_task_ids=[task_id],
+            )
+            request_ids.append(request.communication_id)
+        if candidate.metadata:
+            updated_parent = TaskRecord(
+                **{
+                    **dict(task_payload),
+                    "status": "working",
+                    "updated_at": _now_iso(),
+                    "active_child_ids": list(dict.fromkeys([*list(task_payload.get("active_child_ids") or []), *worker_task_ids])),
+                    "provenance": {
+                        **dict(task_payload.get("provenance") or {}),
+                        "consensus_review": {
+                            "required_reviews": required_reviews,
+                            "worker_task_ids": worker_task_ids,
+                            "worker_ids": worker_ids,
+                            "request_ids": request_ids,
+                            "status": "pending",
+                            "results": [],
+                        },
+                    },
+                }
+            )
+            self.db.upsert_task(updated_parent)
+        return {
+            "status": "delegated",
+            "reason": "Unified queue delegated the inbound task to multiple cheap worker lanes for bounded consensus review.",
+            "written_paths": [],
+            "generation_mode": "delegated_worker",
+            "requested_route": route,
+            "resolved_route": {},
+            "preflight": {"ok": True, "reason": "consensus_workers_enqueued"},
+            "failure_kind": None,
+            "degraded_reason": None,
+            "provider_error": None,
+            "attempt_count": 0,
+            "baseline_inspection": baseline_inspection,
+            "assistant_output": "",
+            "followup_tasks": [],
+            "derived_artifact": None,
+            "delegated_via_worker": ",".join(worker_ids),
+            "worker_task_id": worker_task_ids[0],
+            "delegation_request_id": request_ids[0],
+            "delegation_result_id": None,
+            "emitted_communication_id": None,
+            "consensus_review": {
+                "required_reviews": required_reviews,
+                "worker_task_ids": worker_task_ids,
+                "worker_ids": worker_ids,
+            },
+        }
 
     def _delegate_message_task(
         self,
@@ -2569,6 +3045,7 @@ class Loop0Runner:
         completion_policy = dict(task_payload.get("completion_policy") or {})
         provenance = dict(task_payload.get("provenance") or {})
         success_criteria = dict(task_payload.get("success_criteria") or {})
+        batched_task_payloads = list(task_payload.get("batched_task_payloads") or [])
         system_prompt = (
             "You are Astrata handling an inbound principal-derived task. "
             "Respond concisely and usefully. Return strict JSON with keys "
@@ -2584,6 +3061,11 @@ class Loop0Runner:
             "If no follow-up work is needed, return an empty list. "
             "Do not mention internal quotas or routing unless directly relevant."
         )
+        if batched_task_payloads:
+            system_prompt += (
+                " This task carries a small batch of related low-priority requests. "
+                "Address them together in one bounded response when practical."
+            )
         return [
             Message(role="system", content=system_prompt),
             Message(
@@ -2600,6 +3082,14 @@ class Loop0Runner:
                         "completion_policy": completion_policy,
                         "success_criteria": success_criteria,
                         "provenance": provenance,
+                        "batched_tasks": [
+                            {
+                                "task_id": str(item.get("task_id") or ""),
+                                "title": str(item.get("title") or ""),
+                                "description": str(item.get("description") or ""),
+                            }
+                            for item in batched_task_payloads[:4]
+                        ],
                     },
                     indent=2,
                 ),
