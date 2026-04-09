@@ -17,6 +17,7 @@ from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
 from astrata.loop0.planner import Loop0Planner, PlannerSnapshot
+from astrata.loop0.resolution import determine_task_resolution
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
 from astrata.procedures.health import RouteHealthStore
 from astrata.procedures.models import ProcedureRecord, ProcedureStructure, ProcedureTaskNode
@@ -416,7 +417,60 @@ class Loop0Runner:
                     "assistant_output": operator_response,
                 },
             )
-        payload["status"] = "complete" if str(message_payload.get("status") or "") == "applied" else "failed"
+        if str(message_payload.get("status") or "") == "applied":
+            payload["status"] = "complete"
+            resolution_payload = None
+        else:
+            resolution = determine_task_resolution(
+                task_payload=payload,
+                message_payload=message_payload,
+                attempts=[
+                    attempt
+                    for attempt in self.db.list_records("attempts")
+                    if str(attempt.get("task_id") or "").strip() == str(payload.get("task_id") or "").strip()
+                ],
+            )
+            payload["status"] = resolution.next_status
+            resolution_payload = resolution.model_dump(mode="json")
+            if resolution.followup_specs:
+                parent_task = TaskRecord(**payload)
+                self._materialize_followup_tasks(
+                    candidate=Loop0TaskCandidate(
+                        key=f"task:{payload.get('task_id')}",
+                        title=str(payload.get("title") or ""),
+                        description=str(payload.get("description") or ""),
+                        expected_paths=(),
+                        strategy="message_task",
+                        metadata=payload,
+                    ),
+                    parent_task=parent_task,
+                    implementation={
+                        "followup_tasks": resolution.followup_specs,
+                        "derived_artifact": {
+                            "artifact_type": "task_resolution",
+                            "title": f"Resolution for {payload.get('title') or payload.get('task_id')}",
+                            "description": str(payload.get("description") or ""),
+                            "summary": resolution.reason,
+                            "confidence": resolution.confidence,
+                            "findings": [resolution.kind],
+                            "status": "degraded",
+                        },
+                        "assistant_output": operator_response,
+                    },
+                )
+            self.db.upsert_artifact(
+                ArtifactRecord(
+                    artifact_type="task_resolution",
+                    title=f"Task resolution: {payload.get('title') or payload.get('task_id')}",
+                    description="Deterministic resolution selected after delegated worker failure.",
+                    content_summary=json.dumps(resolution_payload, indent=2),
+                    provenance={
+                        "task_id": str(payload.get("task_id") or ""),
+                        "source": "worker_resolution_policy",
+                    },
+                    status="degraded",
+                )
+            )
         payload["updated_at"] = _now_iso()
         provenance = dict(payload.get("provenance") or {})
         worker_task_id = str(message_payload.get("worker_task_id") or provenance.get("worker_task_id") or "").strip()
@@ -456,11 +510,14 @@ class Loop0Runner:
             "result_message_id": message_payload.get("source_communication_id"),
             "emitted_communication_id": notice.communication_id,
         }
+        if resolution_payload is not None:
+            provenance["resolution"] = resolution_payload
         payload["provenance"] = provenance
         return TaskRecord(**payload)
 
     def _record_worker_completion_attempt(self, *, task: TaskRecord, message_payload: dict[str, Any]) -> None:
         raw_content = str(message_payload.get("raw_content") or "")
+        status = str(message_payload.get("status") or "").strip().lower()
         attempt = AttemptRecord(
             task_id=task.task_id,
             actor=str(message_payload.get("worker_id") or "worker"),
@@ -470,9 +527,11 @@ class Loop0Runner:
                 "route": message_payload.get("route"),
             },
             attempt_reason="worker delegation result reconciled by loop0",
-            outcome="succeeded" if str(message_payload.get("status") or "") == "applied" else "failed",
+            outcome="succeeded" if status == "applied" else ("blocked" if status == "blocked" else "failed"),
             result_summary=self._extract_operator_response(raw_content) or "Worker result reconciled.",
-            verification_status="passed" if str(message_payload.get("status") or "") == "applied" else "uncertain",
+            failure_kind=None if status == "applied" else str(message_payload.get("detail") or "").strip() or status,
+            degraded_reason=None if status == "applied" else str(message_payload.get("reason") or "").strip() or status,
+            verification_status="passed" if status == "applied" else "uncertain",
             resource_usage={"route": message_payload.get("route") or {}, "implementation": {"generation_mode": "delegated_worker_result"}},
             started_at=_now_iso(),
             ended_at=_now_iso(),

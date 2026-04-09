@@ -142,6 +142,11 @@ class _FileCodexProvider(_DeferredCodexProvider):
         return super().complete(request)
 
 
+class _FailingCliProvider(_CheapCliProvider):
+    def complete(self, request: CompletionRequest) -> CompletionResponse:
+        raise RuntimeError("provider_execution_failed")
+
+
 def test_loop0_runner_records_coordination_deferral():
     settings = load_settings(Path("/Users/jon/Projects/Astrata"))
     db = AstrataDatabase(settings.paths.data_dir / "test-loop0-coordinator.db")
@@ -617,3 +622,55 @@ def test_pending_followup_with_unresolved_dependency_is_not_selected():
         candidate_ids = {candidate.source_task_id for candidate in candidates}
         assert "inspect-task" in candidate_ids
         assert "persist-task" not in candidate_ids
+
+
+def test_loop0_worker_failure_decomposes_multistage_task():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(
+            TaskRecord(
+                task_id="multistage-failure",
+                title="Inspect and then summarize runtime posture",
+                description="Inspect the runtime posture and then summarize the findings in a durable note.",
+                priority=10,
+                urgency=10,
+                provenance={"source": "message_intake", "source_communication_id": "msg-fail"},
+                permissions={},
+                risk="low",
+                status="pending",
+                success_criteria={"message_addressed": True},
+                completion_policy={"type": "review_or_audit"},
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _DeferredCodexProvider(), "cli": _FailingCliProvider()}),
+        )
+        assessment = runner.next_candidate_assessment()
+        assert assessment is not None
+        assert assessment.candidate.source_task_id == "multistage-failure"
+        result = runner.run_once()
+        assert result["status"] == "ok"
+        worker_task = next(
+            payload
+            for payload in db.list_records("tasks")
+            if payload.get("parent_task_id") == "multistage-failure"
+            and payload.get("provenance", {}).get("source") == "worker_delegation"
+        )
+        runner.worker_runtime.process_pending(worker_id=str(worker_task["provenance"]["worker_id"]))
+        runner._reconcile_pending_tasks()
+        updated = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "multistage-failure")
+        assert updated["status"] == "blocked"
+        assert updated["provenance"]["resolution"]["kind"] == "decompose"
+        followups = [
+            payload
+            for payload in db.list_records("tasks")
+            if payload.get("provenance", {}).get("source") == "message_task_followup"
+        ]
+        assert followups
+        assert followups[-1]["title"].startswith("Decompose:")
