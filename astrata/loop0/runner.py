@@ -18,6 +18,7 @@ from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
+from astrata.eval.observations import EvalObservation, EvalObservationStore
 from astrata.governance.policy import (
     GovernanceDriftMonitor,
     governance_change_is_authorized,
@@ -147,6 +148,8 @@ class Loop0Runner:
         limits["anthropic"] = settings.runtime_limits.anthropic_requests_per_hour
         limits["custom"] = settings.runtime_limits.custom_requests_per_hour
         health_store = RouteHealthStore(settings.paths.data_dir / "route_health.json")
+        self.health_store = health_store
+        self.route_observations = EvalObservationStore(state_path=settings.paths.data_dir / "eval_observations.json")
         quota_policy = QuotaPolicy(db=db, limits_per_source=limits, registry=self.registry)
         self.quota_policy = quota_policy
         self.procedures = BoundedFileGenerationProcedure(
@@ -1105,6 +1108,11 @@ class Loop0Runner:
             status="good" if not review.findings else "degraded",
         )
         self.db.upsert_artifact(review_artifact)
+        self._record_audit_route_observations(
+            review=review,
+            artifact_type=artifact_type,
+            provenance=provenance,
+        )
         meta_review = review_audit_review(review=review)
         meta_artifact = ArtifactRecord(
             artifact_type=f"{artifact_type}_meta_review",
@@ -1155,6 +1163,143 @@ class Loop0Runner:
             )
             self.db.upsert_artifact(followup_artifact)
         return review_artifact, meta_artifact
+
+    def _record_audit_route_observations(
+        self,
+        *,
+        review: Any,
+        artifact_type: str,
+        provenance: dict[str, Any],
+    ) -> None:
+        route_records = self._routes_for_audit_subject(review=review, provenance=provenance)
+        if not route_records:
+            return
+        passed = not bool(review.findings)
+        score = 0.92 if passed else 0.2
+        confidence = 0.82 if passed else 0.9
+        for route_record in route_records:
+            route = dict(route_record.get("route") or {})
+            if not route:
+                continue
+            variant_id = self._variant_id_for_route(route)
+            task_class = str(route_record.get("task_class") or "review").strip().lower() or "review"
+            self.route_observations.record(
+                EvalObservation(
+                    subject_kind="execution_route",
+                    subject_id=variant_id,
+                    variant_id=variant_id,
+                    task_class=task_class,
+                    score=score,
+                    passed=passed,
+                    confidence=confidence,
+                    evidence=[
+                        f"audit_artifact:{artifact_type}",
+                        f"subject_kind:{review.subject_kind}",
+                        f"subject_id:{review.subject_id}",
+                        f"review_status:{review.status}",
+                        f"findings:{len(review.findings)}",
+                    ],
+                    metadata={
+                        "route": route,
+                        "artifact_type": artifact_type,
+                        "subject_kind": review.subject_kind,
+                        "subject_id": review.subject_id,
+                    },
+                )
+            )
+            if passed:
+                self.health_store.record_success(route)
+            else:
+                self.health_store.record_failure(
+                    route,
+                    failure_kind=f"audit:{artifact_type}",
+                    error="; ".join(finding.summary for finding in review.findings[:3]) or "audit review found route issues",
+                )
+
+    def _routes_for_audit_subject(
+        self,
+        *,
+        review: Any,
+        provenance: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        subject_kind = str(review.subject_kind or "").strip().lower()
+        if subject_kind == "verification":
+            attempt_id = str(provenance.get("attempt_id") or "").strip()
+            if not attempt_id:
+                return []
+            attempt_payload = next(
+                (
+                    item
+                    for item in self.db.list_records("attempts")
+                    if str(item.get("attempt_id") or "").strip() == attempt_id
+                ),
+                None,
+            )
+            if not attempt_payload:
+                return []
+            route = self._route_from_attempt_payload(attempt_payload)
+            if not route:
+                return []
+            task_payload = next(
+                (
+                    item
+                    for item in self.db.list_records("tasks")
+                    if str(item.get("task_id") or "").strip() == str(attempt_payload.get("task_id") or "").strip()
+                ),
+                None,
+            )
+            return [{"route": route, "task_class": self._task_class_from_payload(task_payload or {})}]
+        if subject_kind == "consensus_judgment":
+            task_id = str(provenance.get("task_id") or review.subject_id or "").strip()
+            if not task_id:
+                return []
+            task_payload = next(
+                (
+                    item
+                    for item in self.db.list_records("tasks")
+                    if str(item.get("task_id") or "").strip() == task_id
+                ),
+                None,
+            )
+            if not task_payload:
+                return []
+            consensus = dict(dict(task_payload.get("provenance") or {}).get("consensus_review") or {})
+            task_class = self._task_class_from_payload(task_payload)
+            routes: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for result in list(consensus.get("results") or []):
+                route = dict(result.get("route") or {})
+                variant_id = self._variant_id_for_route(route) if route else ""
+                if not route or variant_id in seen:
+                    continue
+                seen.add(variant_id)
+                routes.append({"route": route, "task_class": task_class})
+            return routes
+        return []
+
+    def _route_from_attempt_payload(self, attempt_payload: dict[str, Any]) -> dict[str, Any]:
+        usage = dict(attempt_payload.get("resource_usage") or {})
+        implementation = dict(usage.get("implementation") or {})
+        for key in ("resolved_route", "requested_route", "route"):
+            route = dict(implementation.get(key) or usage.get(key) or {})
+            if route:
+                return route
+        provenance_route = dict(dict(attempt_payload.get("provenance") or {}).get("route") or {})
+        return provenance_route
+
+    def _variant_id_for_route(self, route: dict[str, Any]) -> str:
+        provider = str(route.get("provider") or "").strip().lower()
+        cli_tool = str(route.get("cli_tool") or "").strip().lower()
+        model = str(route.get("model") or "").strip().lower()
+        if cli_tool:
+            return f"cli:{cli_tool}:{model}" if model else f"cli:{cli_tool}"
+        if provider == "local":
+            return f"local:{model}" if model else "local:managed"
+        return f"{provider}:{model}" if model else provider
+
+    def _task_class_from_payload(self, task_payload: dict[str, Any]) -> str:
+        provenance = dict(task_payload.get("provenance") or {})
+        return str(task_payload.get("task_class") or provenance.get("task_class") or "review").strip().lower() or "review"
 
     def _materialize_review_followup_tasks(
         self,
