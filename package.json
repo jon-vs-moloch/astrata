@@ -1,0 +1,13 @@
+{
+  "name": "astrata-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "desktop:dev": "tauri dev --config src-tauri/tauri.conf.json",
+    "desktop:build": "tauri build --config src-tauri/tauri.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1"
+  }
+}

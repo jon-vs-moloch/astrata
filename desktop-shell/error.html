@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Astrata Startup Error</title>
+    <style>
+      :root {
+        --bg: #17120f;
+        --panel: rgba(255, 248, 239, 0.08);
+        --ink: #f7efe3;
+        --muted: #cdbca8;
+        --accent: #d16a41;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at top left, rgba(209, 106, 65, 0.24), transparent 32%),
+          linear-gradient(180deg, #221912 0%, var(--bg) 100%);
+        color: var(--ink);
+        font-family: "Avenir Next", "Helvetica Neue", sans-serif;
+      }
+      .panel {
+        width: min(620px, calc(100vw - 32px));
+        padding: 28px;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: var(--panel);
+        backdrop-filter: blur(16px);
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-family: "Iowan Old Style", "Georgia", serif;
+        font-size: clamp(2rem, 5vw, 3.2rem);
+        line-height: 0.96;
+      }
+      p, li {
+        color: var(--muted);
+        line-height: 1.55;
+      }
+      code {
+        color: var(--ink);
+        background: rgba(255,255,255,0.06);
+        padding: 2px 6px;
+      }
+      .alert {
+        margin: 16px 0;
+        padding: 14px 16px;
+        border-left: 3px solid var(--accent);
+        background: rgba(209, 106, 65, 0.12);
+        color: var(--ink);
+        white-space: pre-wrap;
+      }
+      .meta {
+        font-size: 0.95rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <p>Astrata Desktop</p>
+      <h1>The app shell started, but the local backend did not.</h1>
+      <div id="startupError" class="alert">Loading startup error details...</div>
+      <p>
+        Astrata now leaves explicit startup telemetry instead of crashing silently. Check:
+      </p>
+      <ul>
+        <li><code id="preflightPath">/Users/jon/Projects/Astrata/.astrata/startup-preflight.json</code></li>
+        <li><code id="startupErrorPath">/Users/jon/Projects/Astrata/.astrata/desktop-startup-error.json</code></li>
+        <li><code>/Users/jon/Projects/Astrata/.astrata/desktop-launcher.log</code></li>
+        <li><code>/Users/jon/Projects/Astrata/.astrata/desktop-ui.log</code></li>
+      </ul>
+      <p class="meta">
+        During development, the most common cause is a Python environment mismatch or
+        missing dependencies in the interpreter the desktop wrapper selected.
+      </p>
+    </div>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const error = params.get("error");
+      const preflight = params.get("preflight");
+      const startupError = params.get("startup_error");
+      const errorNode = document.getElementById("startupError");
+      const preflightNode = document.getElementById("preflightPath");
+      const startupErrorNode = document.getElementById("startupErrorPath");
+      if (error) {
+        errorNode.textContent = error;
+      } else {
+        errorNode.textContent = "Astrata did not provide a detailed startup error.";
+      }
+      if (preflight) {
+        preflightNode.textContent = preflight;
+      }
+      if (startupError) {
+        startupErrorNode.textContent = startupError;
+      }
+    </script>
+  </body>
+  </html>

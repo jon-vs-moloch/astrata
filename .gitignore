@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+node_modules/
+
+# Local Astrata runtime state and downloaded models
+.astrata/
+
+# Build and desktop artifacts
+dist/
+build/
+src-tauri/target/

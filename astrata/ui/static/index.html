@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Astrata</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="grain"></div>
+    <main class="app-shell">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Astrata Operator Surface</p>
+          <h1>One runtime. Real state. No terminal required.</h1>
+          <p class="lede">
+            Watch the loop, steer the machine, and keep the local stack healthy without
+            dropping into CLI glue.
+          </p>
+          <div class="hero-actions">
+            <button id="refreshButton" class="button button-primary">Refresh Surface</button>
+            <button id="runLoopButton" class="button button-secondary">Run One Loop Step</button>
+          </div>
+        </div>
+        <div class="hero-status">
+          <div class="metric-column">
+            <span class="metric-label">Default Route</span>
+            <span id="defaultRouteValue" class="metric-value">...</span>
+          </div>
+          <div class="metric-column">
+            <span class="metric-label">Thermal State</span>
+            <span id="thermalStateValue" class="metric-value">...</span>
+          </div>
+          <div class="metric-column">
+            <span class="metric-label">Queue Pressure</span>
+            <span id="queuePressureValue" class="metric-value">...</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace-grid">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Startup</p>
+              <h2>Preflight and self-reflection</h2>
+            </div>
+          </div>
+          <div id="startupCounts" class="badge-row"></div>
+          <div id="startupList" class="list-stack"></div>
+        </section>
+
+        <section class="panel panel-runtime">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Local Runtime</p>
+              <h2>Quiet-first local control</h2>
+            </div>
+            <div class="panel-actions">
+              <button id="startRuntimeButton" class="button button-secondary">Start</button>
+              <button id="stopRuntimeButton" class="button button-ghost">Stop</button>
+            </div>
+          </div>
+          <div id="runtimeSummary" class="runtime-summary"></div>
+          <div class="subsection">
+            <h3>Discovered Models</h3>
+            <div id="modelList" class="list-stack"></div>
+          </div>
+        </section>
+
+        <section class="panel panel-compose">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Operator Lanes</p>
+              <h2>Talk to the machine directly</h2>
+            </div>
+          </div>
+          <form id="messageForm" class="compose-form">
+            <textarea
+              id="messageInput"
+              placeholder="Talk to Prime or Local. Ask for implementation, review, diagnosis, or coordination help."
+              rows="6"
+            ></textarea>
+            <div class="compose-row">
+              <select id="recipientSelect">
+                <option value="prime">Prime</option>
+                <option value="local">Local</option>
+              </select>
+              <button class="button button-primary" type="submit">Send Message</button>
+            </div>
+          </form>
+          <div id="laneCounts" class="badge-row"></div>
+          <div class="subsection">
+            <h3>Recent Operator Messages</h3>
+            <div id="operatorInbox" class="list-stack"></div>
+          </div>
+          <div class="subsection">
+            <div class="panel-header compact">
+              <div>
+                <h3>Lane Transcript</h3>
+              </div>
+              <div class="panel-actions">
+                <button id="showPrimeTranscriptButton" class="button button-ghost" type="button">Prime</button>
+                <button id="showLocalTranscriptButton" class="button button-ghost" type="button">Local</button>
+              </div>
+            </div>
+            <div id="laneTranscript" class="list-stack"></div>
+          </div>
+          <div class="subsection">
+            <h3>Prime Lane</h3>
+            <div id="primeInbox" class="list-stack"></div>
+          </div>
+          <div class="subsection">
+            <h3>Local Lane</h3>
+            <div id="localInbox" class="list-stack"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Queue</p>
+              <h2>Governed work</h2>
+            </div>
+          </div>
+          <div id="queueCounts" class="badge-row"></div>
+          <div id="taskList" class="list-stack"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Attempts</p>
+              <h2>Execution history</h2>
+            </div>
+          </div>
+          <div id="attemptCounts" class="badge-row"></div>
+          <div id="attemptList" class="list-stack"></div>
+        </section>
+      </section>
+
+      <section class="bottom-grid">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">System Work</p>
+              <h2>Internal inbox and governed tasks</h2>
+            </div>
+          </div>
+          <div id="astrataInbox" class="list-stack"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Artifacts</p>
+              <h2>What the system is leaving behind</h2>
+            </div>
+          </div>
+          <div id="artifactList" class="list-stack"></div>
+        </section>
+      </section>
+
+      <section class="bottom-grid">
+        <section class="panel panel-detail">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Task Detail</p>
+              <h2>Trace one unit of work</h2>
+            </div>
+          </div>
+          <div id="taskDetailEmpty" class="list-item">Select a task to inspect its attempts, artifacts, and related messages.</div>
+          <div id="taskDetail" class="detail-shell" hidden>
+            <div id="taskDetailSummary" class="detail-summary"></div>
+            <section class="subsection">
+              <h3>Blockers</h3>
+              <div id="taskDetailBlockers" class="list-stack"></div>
+            </section>
+            <div class="detail-grid">
+              <section class="subsection">
+                <h3>Attempts</h3>
+                <div id="taskDetailAttempts" class="list-stack"></div>
+              </section>
+              <section class="subsection">
+                <h3>Artifacts</h3>
+                <div id="taskDetailArtifacts" class="list-stack"></div>
+              </section>
+            </div>
+            <div class="detail-grid">
+              <section class="subsection">
+                <h3>Messages</h3>
+                <div id="taskDetailMessages" class="list-stack"></div>
+              </section>
+              <section class="subsection">
+                <h3>Verifications</h3>
+                <div id="taskDetailVerifications" class="list-stack"></div>
+              </section>
+            </div>
+            <div class="detail-grid">
+              <section class="subsection">
+                <h3>Child Tasks</h3>
+                <div id="taskDetailChildren" class="list-stack"></div>
+              </section>
+              <section class="subsection">
+                <h3>Related Work</h3>
+                <div id="taskDetailRelated" class="list-stack"></div>
+              </section>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+  </html>
