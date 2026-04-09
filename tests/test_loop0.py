@@ -41,6 +41,7 @@ def test_loop0_runner_records_one_cycle():
     assert "loop0_gap_report" in artifact_types
     assert "loop0_implementation_report" in artifact_types
     assert "loop0_verification_review" in artifact_types
+    assert "loop0_inference_telemetry" in artifact_types
     assert result["verification"]["result"] in {"pass", "fail", "uncertain"}
 
 
@@ -263,6 +264,9 @@ def test_loop0_runner_unifies_pending_message_tasks():
         assert result["task"]["task_id"] == "message-task-1"
         assert result["attempt"]["outcome"] == "running"
         assert result["verification"]["result"] == "uncertain"
+        telemetry = result["inference_telemetry"]
+        assert telemetry["artifact_type"] == "loop0_inference_telemetry"
+        assert '"delegated_worker"' in telemetry["content_summary"]
         assert result["operator_message"]["intent"] == "loop0_result"
         route = result["attempt"]["resource_usage"]["route"]
         assert route["provider"] == "cli"

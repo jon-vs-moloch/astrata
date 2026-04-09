@@ -12,6 +12,7 @@ from astrata.comms.intake import process_inbound_messages
 from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
 from astrata.config.settings import Settings, load_settings
+from astrata.context import build_quota_snapshot, summarize_inference_activity
 from astrata.governance.documents import load_governance_bundle
 from astrata.local.backends.llama_cpp import LlamaCppBackend
 from astrata.local.hardware import probe_thermal_state
@@ -24,6 +25,7 @@ from astrata.providers.registry import build_default_registry
 from astrata.records.communications import CommunicationRecord
 from astrata.records.models import AttemptRecord, ArtifactRecord, TaskRecord, VerificationRecord
 from astrata.routing.policy import RouteChooser
+from astrata.scheduling.quota import QuotaPolicy, default_source_limits
 from astrata.storage.db import AstrataDatabase
 from astrata.startup.diagnostics import (
     generate_python_preflight_report,
@@ -78,6 +80,11 @@ class AstrataUIService:
         startup_runtime = load_runtime_report(self.settings)
         if startup_runtime is None:
             startup_runtime = run_startup_reflection(self.settings, db=db).report
+        inference_telemetry = summarize_inference_activity(
+            attempts=[attempt.model_dump(mode="json") for attempt in attempts],
+            tasks=[task.model_dump(mode="json") for task in tasks],
+            quota_snapshots=self._quota_snapshots(db, registry),
+        )
         return {
             "generated_at": _now_iso(),
             "product": {
@@ -107,6 +114,7 @@ class AstrataUIService:
                 "counts": dict(Counter(attempt.outcome for attempt in attempts)),
                 "recent_attempts": [self._attempt_summary(attempt) for attempt in attempts[:8]],
             },
+            "inference": inference_telemetry,
             "communications": {
                 "principal_inbox": [self._message_summary(message) for message in principal_messages],
                 "operator_inbox": [self._message_summary(message) for message in principal_messages],
@@ -333,6 +341,68 @@ class AstrataUIService:
     def _communications(self, db: AstrataDatabase) -> list[CommunicationRecord]:
         communications = [CommunicationRecord(**payload) for payload in db.list_records("communications")]
         return sorted(communications, key=lambda item: item.created_at, reverse=True)
+
+    def _quota_policy(self, db: AstrataDatabase, registry: ProviderRegistry) -> QuotaPolicy:
+        limits = default_source_limits()
+        limits["codex"] = self.settings.runtime_limits.codex_requests_per_hour
+        limits["cli:codex-cli"] = self.settings.runtime_limits.codex_requests_per_hour
+        limits["cli:kilocode"] = self.settings.runtime_limits.kilocode_requests_per_hour
+        limits["cli:gemini-cli"] = self.settings.runtime_limits.gemini_requests_per_hour
+        limits["cli:claude-code"] = self.settings.runtime_limits.claude_requests_per_hour
+        limits["openai"] = self.settings.runtime_limits.openai_requests_per_hour
+        limits["google"] = self.settings.runtime_limits.google_requests_per_hour
+        limits["anthropic"] = self.settings.runtime_limits.anthropic_requests_per_hour
+        limits["custom"] = self.settings.runtime_limits.custom_requests_per_hour
+        return QuotaPolicy(db=db, limits_per_source=limits, registry=registry)
+
+    def _route_cost_rank(self, route: dict[str, Any]) -> int:
+        provider = str(route.get("provider") or "").strip().lower()
+        cli_tool = str(route.get("cli_tool") or "").strip().lower()
+        model = str(route.get("model") or "").strip().lower()
+        if provider == "cli":
+            if cli_tool == "kilocode":
+                return 1
+            if cli_tool == "gemini-cli":
+                if "flash" in model:
+                    return 2
+                if "pro" in model:
+                    return 4
+                return 3
+            if cli_tool == "claude-code":
+                return 6
+            if cli_tool == "codex-cli":
+                return 7
+        if provider == "google":
+            return 5
+        if provider == "openai":
+            return 8
+        if provider == "anthropic":
+            return 7
+        return 9
+
+    def _inference_source_route(self, source: dict[str, Any]) -> dict[str, Any]:
+        route = {
+            "provider": source.get("provider"),
+            "cli_tool": source.get("cli_tool"),
+        }
+        model = source.get("default_model")
+        if model:
+            route["model"] = model
+        return route
+
+    def _quota_snapshots(self, db: AstrataDatabase, registry: ProviderRegistry) -> list[dict[str, Any]]:
+        quota_policy = self._quota_policy(db, registry)
+        snapshots: list[dict[str, Any]] = []
+        for source in registry.list_available_inference_sources():
+            route = self._inference_source_route(source)
+            snapshots.append(
+                build_quota_snapshot(
+                    route=route,
+                    decision=quota_policy.assess(route),
+                    cost_rank=self._route_cost_rank(route),
+                )
+            )
+        return snapshots
 
     def _task_summary(self, task: TaskRecord) -> dict[str, Any]:
         return {

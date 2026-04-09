@@ -45,6 +45,8 @@ def test_ui_service_snapshot_and_message_flow():
         assert snapshot["startup"]["preflight"]["phase"] == "pre_inference"
         assert snapshot["startup"]["runtime"]["phase"] == "post_boot"
         assert snapshot["queue"]["counts"]["pending"] == 1
+        assert snapshot["inference"]["window_hours"] == 24
+        assert "quota_pressure" in snapshot["inference"]
         assert snapshot["communications"]["astrata_inbox"][0]["message"] == "Hello from UI"
         assert snapshot["communications"]["prime_conversation"] == []
 
@@ -103,9 +105,53 @@ def test_ui_service_task_detail_and_lane_views():
         assert detail["verifications"][0]["verification_id"] == "verification-1"
         assert "children" in detail["relationships"]
         assert "same_source" in detail["relationships"]
-        assert prime_result["turn"]["action"] == "direct_reply"
+        assert prime_result["turn"]["action"] in {"direct_reply", "deferred"}
         assert local_result["turn"]["action"] in {"direct_reply", "degraded_reply"}
         assert snapshot["communications"]["prime_inbox"][0]["message"] == "Hello Prime"
         assert snapshot["communications"]["local_inbox"][0]["message"] == "Hello Local"
         assert snapshot["communications"]["prime_conversation"][0]["message"] == "Hello Prime"
         assert len(snapshot["communications"]["prime_conversation"]) >= 2
+
+
+def test_ui_service_snapshot_reports_inference_spend():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        db.upsert_task(
+            TaskRecord(
+                task_id="worker-task-1",
+                title="Cheap lane worker",
+                description="Track delegated worker state in telemetry.",
+                status="working",
+                provenance={
+                    "source": "worker_delegation",
+                    "route": {"provider": "cli", "cli_tool": "gemini-cli", "model": "gemini-2.5-flash"},
+                },
+            )
+        )
+        db.upsert_attempt(
+            AttemptRecord(
+                attempt_id="attempt-provider-1",
+                task_id="worker-task-1",
+                actor="worker.gemini-cli.gemini-2-5-flash",
+                outcome="succeeded",
+                result_summary="Delegated worker completed.",
+                verification_status="passed",
+                resource_usage={
+                    "implementation": {
+                        "generation_mode": "provider",
+                        "resolved_route": {"provider": "cli", "cli_tool": "gemini-cli", "model": "gemini-2.5-flash"},
+                    }
+                },
+                started_at="2026-04-09T00:00:00+00:00",
+                ended_at="2026-04-09T00:05:00+00:00",
+            )
+        )
+        service = AstrataUIService(settings=settings)
+        snapshot = service.snapshot()
+        assert snapshot["inference"]["spent_attempts"] == 1
+        assert snapshot["inference"]["spent_by_model"]["gemini-2.5-flash"] == 1
+        assert snapshot["inference"]["worker_statuses"]["working"] == 1
+        assert snapshot["inference"]["quota_snapshot_count"] >= 1

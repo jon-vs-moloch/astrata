@@ -12,6 +12,7 @@ from typing import Any
 from astrata.config.settings import Settings
 from astrata.comms.intake import normalize_derived_task_proposal
 from astrata.comms.lanes import HandoffLane, PrincipalMessageLane
+from astrata.context import build_quota_snapshot, summarize_inference_activity
 from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
@@ -446,19 +447,11 @@ class Loop0Runner:
 
     def _quota_snapshot_for_route(self, route: dict[str, Any]) -> dict[str, Any]:
         decision = self.quota_policy.assess(route)
-        active_window = dict(decision.active_window or {})
-        remaining = int(active_window.get("requests_remaining") or 0)
-        limit = int(active_window.get("requests_limit") or 0)
-        headroom_ratio = (float(remaining) / float(limit)) if limit > 0 else (1.0 if decision.allowed else 0.0)
-        return {
-            "allowed": decision.allowed,
-            "reason": decision.reason,
-            "usage_last_hour": decision.usage_last_hour,
-            "limit_per_hour": decision.limit_per_hour,
-            "next_allowed_at": decision.next_allowed_at,
-            "active_window": active_window,
-            "headroom_ratio": round(headroom_ratio, 4),
-        }
+        return build_quota_snapshot(
+            route=route,
+            decision=decision,
+            cost_rank=self._route_cost_rank(route),
+        )
 
     def _select_supervision_route(
         self,
@@ -1753,6 +1746,21 @@ class Loop0Runner:
         )
         self.db.upsert_artifact(review_artifact)
 
+        inference_telemetry = summarize_inference_activity(
+            attempts=self.db.list_records("attempts"),
+            tasks=self.db.list_records("tasks"),
+            quota_snapshots=[self._quota_snapshot_for_route(route)] if route else [],
+        )
+        telemetry_artifact = ArtifactRecord(
+            artifact_type="loop0_inference_telemetry",
+            title=f"Loop 0 inference telemetry: {candidate.title}",
+            description="Resource-awareness summary for recent inference activity and quota pressure.",
+            content_summary=json.dumps(inference_telemetry, indent=2),
+            provenance={"task_id": task.task_id, "attempt_id": attempt.attempt_id},
+            status="good",
+        )
+        self.db.upsert_artifact(telemetry_artifact)
+
         self.db.upsert_verification(verification)
 
         principal_message = self.principal_lane.send(
@@ -1788,6 +1796,7 @@ class Loop0Runner:
             "followup_report": None if followup_report is None else followup_report.model_dump(mode="json"),
             "followup_tasks": [followup.model_dump(mode="json") for followup in followup_tasks],
             "verification_review": review_artifact.model_dump(mode="json"),
+            "inference_telemetry": telemetry_artifact.model_dump(mode="json"),
             "verification": verification.model_dump(mode="json"),
             "principal_message": principal_message.model_dump(mode="json"),
             # TODO: Remove the legacy `operator_message` mirror once downstream callers
