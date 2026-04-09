@@ -180,5 +180,7 @@ class PrincipalMessageLane:
         return updated
 
 
+# TODO: Remove the legacy `operator` compatibility alias and fallback channel handling
+# once all callers, stored records, and UI consumers have fully migrated to `principal`.
 # Backwards-compatible alias while older imports migrate.
 OperatorMessageLane = PrincipalMessageLane

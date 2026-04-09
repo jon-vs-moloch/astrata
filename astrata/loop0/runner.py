@@ -1435,6 +1435,8 @@ class Loop0Runner:
             "verification_review": review_artifact.model_dump(mode="json"),
             "verification": verification.model_dump(mode="json"),
             "principal_message": principal_message.model_dump(mode="json"),
+            # TODO: Remove the legacy `operator_message` mirror once downstream callers
+            # have migrated to `principal_message`.
             "operator_message": principal_message.model_dump(mode="json"),
         }
 
