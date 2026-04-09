@@ -41,6 +41,7 @@ def test_loop0_runner_records_one_cycle():
     assert "loop0_gap_report" in artifact_types
     assert "loop0_implementation_report" in artifact_types
     assert "loop0_verification_review" in artifact_types
+    assert "loop0_verification_review_meta_review" in artifact_types
     assert "loop0_inference_telemetry" in artifact_types
     assert result["verification"]["result"] in {"pass", "fail", "uncertain"}
 
@@ -420,6 +421,9 @@ def test_loop0_consensus_review_uses_two_cheap_workers_before_completion():
         updated_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "review-task-1")
         assert updated_task["status"] == "complete"
         assert updated_task["provenance"]["consensus_review"]["status"] == "approved"
+        artifact_types = {record["artifact_type"] for record in db.list_records("artifacts")}
+        assert "consensus_review_audit" in artifact_types
+        assert "consensus_review_audit_meta_review" in artifact_types
 
 
 def test_loop0_batches_low_priority_related_message_tasks():

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from astrata.audit import review_audit_review, review_consensus_judgment
 from astrata.config.settings import Settings
 from astrata.comms.intake import normalize_derived_task_proposal
 from astrata.comms.lanes import HandoffLane, PrincipalMessageLane
@@ -997,6 +998,17 @@ class Loop0Runner:
                     },
                 }
                 approved_task = TaskRecord(**approved_payload)
+                consensus_review = review_consensus_judgment(
+                    task_id=approved_task.task_id,
+                    consensus=dict(approved_task.provenance.get("consensus_review") or {}),
+                )
+                self._persist_audit_review(
+                    review=consensus_review,
+                    artifact_type="consensus_review_audit",
+                    title=f"Consensus review audit: {approved_task.title}",
+                    description="Second-pass audit of whether the consensus judgment matches preserved worker evidence.",
+                    provenance={"task_id": approved_task.task_id},
+                )
                 self._sync_batched_peer_tasks(approved_task)
                 return [approved_task, worker_task]
             disagreement_artifact = ArtifactRecord(
@@ -1018,6 +1030,17 @@ class Loop0Runner:
                 },
             }
             blocked_task = TaskRecord(**parent_update)
+            consensus_review = review_consensus_judgment(
+                task_id=blocked_task.task_id,
+                consensus=dict(blocked_task.provenance.get("consensus_review") or {}),
+            )
+            self._persist_audit_review(
+                review=consensus_review,
+                artifact_type="consensus_review_audit",
+                title=f"Consensus review audit: {blocked_task.title}",
+                description="Second-pass audit of whether the disagreement judgment matches preserved worker evidence.",
+                provenance={"task_id": blocked_task.task_id},
+            )
             self._sync_batched_peer_tasks(blocked_task)
             return [blocked_task, worker_task]
         active_child_ids = [
@@ -1063,6 +1086,41 @@ class Loop0Runner:
                 }
             )
             self.db.upsert_task(updated)
+
+    def _persist_audit_review(
+        self,
+        *,
+        review: Any,
+        artifact_type: str,
+        title: str,
+        description: str,
+        provenance: dict[str, Any],
+    ) -> tuple[ArtifactRecord, ArtifactRecord]:
+        review_artifact = ArtifactRecord(
+            artifact_type=artifact_type,
+            title=title,
+            description=description,
+            content_summary=review.model_dump_json(indent=2),
+            provenance=provenance,
+            status="good" if not review.findings else "degraded",
+        )
+        self.db.upsert_artifact(review_artifact)
+        meta_review = review_audit_review(review=review)
+        meta_artifact = ArtifactRecord(
+            artifact_type=f"{artifact_type}_meta_review",
+            title=f"{title} meta-review",
+            description="Audit of whether the review itself is internally coherent.",
+            content_summary=meta_review.model_dump_json(indent=2),
+            provenance={
+                **provenance,
+                "review_id": review.review_id,
+                "subject_kind": review.subject_kind,
+                "subject_id": review.subject_id,
+            },
+            status="good" if not meta_review.findings else "degraded",
+        )
+        self.db.upsert_artifact(meta_artifact)
+        return review_artifact, meta_artifact
 
     def _record_worker_completion_attempt(self, *, task: TaskRecord, message_payload: dict[str, Any]) -> None:
         raw_content = str(message_payload.get("raw_content") or "")
@@ -2098,15 +2156,13 @@ class Loop0Runner:
             implementation=implementation,
             verification=verification,
         )
-        review_artifact = ArtifactRecord(
+        review_artifact, verification_meta_review_artifact = self._persist_audit_review(
+            review=verification_review,
             artifact_type="loop0_verification_review",
             title=f"Loop 0 verification review: {candidate.title}",
             description="Second-pass audit of whether verification matched observed repository state.",
-            content_summary=verification_review.model_dump_json(indent=2),
             provenance={"task_id": task.task_id, "attempt_id": attempt.attempt_id},
-            status="good" if not verification_review.findings else "degraded",
         )
-        self.db.upsert_artifact(review_artifact)
 
         inference_telemetry = summarize_inference_activity(
             attempts=self.db.list_records("attempts"),
@@ -2158,6 +2214,7 @@ class Loop0Runner:
             "followup_report": None if followup_report is None else followup_report.model_dump(mode="json"),
             "followup_tasks": [followup.model_dump(mode="json") for followup in followup_tasks],
             "verification_review": review_artifact.model_dump(mode="json"),
+            "verification_review_meta": verification_meta_review_artifact.model_dump(mode="json"),
             "inference_telemetry": telemetry_artifact.model_dump(mode="json"),
             "verification": verification.model_dump(mode="json"),
             "principal_message": principal_message.model_dump(mode="json"),
