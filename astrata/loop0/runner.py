@@ -281,9 +281,284 @@ class Loop0Runner:
             ),
         )
 
+    def _supervise_worker_tasks(self) -> list[TaskRecord]:
+        reconciled: list[TaskRecord] = []
+        tasks_by_id = self._tasks_by_id()
+        for task_payload in self.db.list_records("tasks"):
+            provenance = dict(task_payload.get("provenance") or {})
+            if provenance.get("source") != "worker_delegation":
+                continue
+            if task_payload.get("status") != "working":
+                continue
+            parent_task_id = str(task_payload.get("parent_task_id") or provenance.get("parent_task_id") or "").strip()
+            if not parent_task_id:
+                continue
+            pending_request = self._pending_worker_request_for_task(str(task_payload.get("task_id") or ""))
+            health = self._worker_health_snapshot(pending_request=pending_request)
+            updated_worker = TaskRecord(
+                **{
+                    **dict(task_payload),
+                    "updated_at": _now_iso(),
+                    "provenance": {
+                        **provenance,
+                        "worker_health": health,
+                    },
+                }
+            )
+            self.db.upsert_task(updated_worker)
+            reconciled.append(updated_worker)
+            if health["status"] != "stalled":
+                continue
+            parent_task_payload = dict(tasks_by_id.get(parent_task_id) or {})
+            if not parent_task_payload:
+                continue
+            reconciled.extend(
+                self._repair_stalled_worker_task(
+                    worker_task_payload=updated_worker.model_dump(mode="json"),
+                    parent_task_payload=parent_task_payload,
+                    pending_request=pending_request,
+                )
+            )
+        return reconciled
+
+    def _pending_worker_request_for_task(self, worker_task_id: str) -> dict[str, Any] | None:
+        normalized_task_id = str(worker_task_id or "").strip()
+        if not normalized_task_id:
+            return None
+        matches = [
+            payload
+            for payload in self.db.list_records("communications")
+            if payload.get("intent") == "worker_delegation_request"
+            and payload.get("status") not in {"acknowledged", "resolved"}
+            and str(dict(payload.get("payload") or {}).get("worker_task_id") or "").strip() == normalized_task_id
+        ]
+        if not matches:
+            return None
+        return sorted(
+            matches,
+            key=lambda payload: str(payload.get("created_at") or payload.get("delivered_at") or ""),
+            reverse=True,
+        )[0]
+
+    def _payload_age_hours(self, payload: dict[str, Any]) -> float:
+        timestamp = (
+            str(payload.get("updated_at") or "").strip()
+            or str(payload.get("delivered_at") or "").strip()
+            or str(payload.get("created_at") or "").strip()
+        )
+        if not timestamp:
+            return 0.0
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except Exception:
+            return 0.0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0)
+
+    def _worker_health_snapshot(self, *, pending_request: dict[str, Any] | None) -> dict[str, Any]:
+        if pending_request is None:
+            return {
+                "status": "stalled",
+                "reason": "missing_request",
+                "observed_at": _now_iso(),
+                "request_age_hours": None,
+            }
+        age_hours = self._payload_age_hours(pending_request)
+        if age_hours >= 0.25:
+            return {
+                "status": "stalled",
+                "reason": "request_timeout",
+                "observed_at": _now_iso(),
+                "request_age_hours": round(age_hours, 3),
+            }
+        return {
+            "status": "healthy",
+            "reason": "awaiting_worker",
+            "observed_at": _now_iso(),
+            "request_age_hours": round(age_hours, 3),
+        }
+
+    def _supervision_route_candidates(
+        self,
+        *,
+        current_route: dict[str, Any],
+        parent_task_payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        route_preferences = dict(dict(parent_task_payload.get("completion_policy") or {}).get("route_preferences") or {})
+        preferred_model = str(route_preferences.get("preferred_model") or "").strip() or None
+        cli_order = list(route_preferences.get("preferred_cli_tools") or [])
+        if not cli_order:
+            cli_order = ["kilocode", "gemini-cli", "claude-code"]
+        for cli_tool in ["kilocode", "gemini-cli", "claude-code"]:
+            if cli_tool not in cli_order:
+                cli_order.append(cli_tool)
+        current_cli_tool = str(current_route.get("cli_tool") or "").strip()
+        current_model = str(current_route.get("model") or "").strip() or None
+        candidates: list[dict[str, Any]] = []
+        for cli_tool in cli_order:
+            model_options = [None]
+            if cli_tool == "gemini-cli":
+                model_options = []
+                for model in [preferred_model, "gemini-2.5-flash", "gemini-2.5-pro"]:
+                    if model not in model_options:
+                        model_options.append(model)
+            elif cli_tool == current_cli_tool:
+                continue
+            for model in model_options:
+                if cli_tool == current_cli_tool and (model or None) == current_model:
+                    continue
+                candidates.append(
+                    {
+                        "provider": "cli",
+                        "cli_tool": cli_tool,
+                        "model": model,
+                        "reason": "worker_supervision_reassign",
+                    }
+                )
+        return candidates
+
+    def _repair_stalled_worker_task(
+        self,
+        *,
+        worker_task_payload: dict[str, Any],
+        parent_task_payload: dict[str, Any],
+        pending_request: dict[str, Any] | None,
+    ) -> list[TaskRecord]:
+        worker_task_id = str(worker_task_payload.get("task_id") or "").strip()
+        parent_task_id = str(parent_task_payload.get("task_id") or "").strip()
+        worker_provenance = dict(worker_task_payload.get("provenance") or {})
+        current_route = dict(worker_provenance.get("route") or {})
+        retry_index = int(dict(worker_provenance.get("supervision") or {}).get("retry_index") or 0)
+        route_candidates = self._supervision_route_candidates(
+            current_route=current_route,
+            parent_task_payload=parent_task_payload,
+        )
+        action = "reassign" if route_candidates and retry_index < 2 else "block"
+        selected_route = route_candidates[0] if action == "reassign" else None
+        artifact = ArtifactRecord(
+            artifact_type="worker_supervision",
+            title=f"Worker supervision: {parent_task_payload.get('title') or parent_task_id}",
+            description="Supervisory decision for a delegated worker that stopped making bounded progress.",
+            content_summary=json.dumps(
+                {
+                    "parent_task_id": parent_task_id,
+                    "worker_task_id": worker_task_id,
+                    "current_route": current_route,
+                    "pending_request_id": None if pending_request is None else pending_request.get("communication_id"),
+                    "health": dict(worker_provenance.get("worker_health") or {}),
+                    "retry_index": retry_index,
+                    "action": action,
+                    "selected_route": selected_route,
+                },
+                indent=2,
+            ),
+            provenance={
+                "task_id": parent_task_id,
+                "worker_task_id": worker_task_id,
+                "source": "worker_supervision",
+            },
+            status="degraded" if action == "reassign" else "broken",
+        )
+        self.db.upsert_artifact(artifact)
+        if pending_request is not None and str(pending_request.get("communication_id") or "").strip():
+            self.principal_lane.resolve(str(pending_request.get("communication_id") or "").strip())
+        failed_worker = TaskRecord(
+            **{
+                **dict(worker_task_payload),
+                "status": "failed",
+                "updated_at": _now_iso(),
+                "provenance": {
+                    **worker_provenance,
+                    "supervision": {
+                        **dict(worker_provenance.get("supervision") or {}),
+                        "retry_index": retry_index,
+                        "action": action,
+                        "selected_route": selected_route,
+                        "artifact_id": artifact.artifact_id,
+                        "resolved_at": _now_iso(),
+                    },
+                },
+            }
+        )
+        self.db.upsert_task(failed_worker)
+        parent_update = {
+            **dict(parent_task_payload),
+            "updated_at": _now_iso(),
+            "active_child_ids": [
+                child_id
+                for child_id in list(parent_task_payload.get("active_child_ids") or [])
+                if str(child_id).strip() and str(child_id).strip() != worker_task_id
+            ],
+            "provenance": {
+                **dict(parent_task_payload.get("provenance") or {}),
+                "worker_supervision": {
+                    "action": action,
+                    "worker_task_id": worker_task_id,
+                    "selected_route": selected_route,
+                    "artifact_id": artifact.artifact_id,
+                    "updated_at": _now_iso(),
+                },
+            },
+        }
+        results: list[TaskRecord] = [failed_worker]
+        if action != "reassign" or selected_route is None:
+            blocked_parent = TaskRecord(
+                **{
+                    **parent_update,
+                    "status": "blocked",
+                }
+            )
+            self.db.upsert_task(blocked_parent)
+            results.insert(0, blocked_parent)
+            return results
+        candidate = Loop0TaskCandidate(
+            key=f"retry:{parent_task_id}:worker-supervision",
+            title=str(parent_task_payload.get("title") or parent_task_id),
+            description=str(parent_task_payload.get("description") or ""),
+            expected_paths=(),
+            strategy="message_task",
+            priority=int(parent_task_payload.get("priority") or 0),
+            urgency=int(parent_task_payload.get("urgency") or 0),
+            risk=str(parent_task_payload.get("risk") or "low"),
+            source_task_id=parent_task_id,
+            metadata={
+                **parent_update,
+                "status": "working",
+            },
+        )
+        self._delegate_message_task(
+            candidate,
+            task_payload={
+                **parent_update,
+                "status": "working",
+            },
+            task_id=parent_task_id,
+            route=selected_route,
+            baseline_inspection={
+                "task_record": parent_task_payload,
+                "worker_supervision": {
+                    "stalled_worker_task_id": worker_task_id,
+                    "selected_route": selected_route,
+                },
+            },
+        )
+        refreshed_parent = next(
+            (
+                TaskRecord(**payload)
+                for payload in self.db.list_records("tasks")
+                if str(payload.get("task_id") or "").strip() == parent_task_id
+            ),
+            None,
+        )
+        if refreshed_parent is not None:
+            results.insert(0, refreshed_parent)
+        return results
+
     def _reconcile_pending_tasks(self) -> list[TaskRecord]:
         reconciled: list[TaskRecord] = []
         reconciled.extend(self._reconcile_worker_results())
+        reconciled.extend(self._supervise_worker_tasks())
         for task_payload in self.db.list_records("tasks"):
             if task_payload.get("status") not in {"pending", "working"}:
                 continue

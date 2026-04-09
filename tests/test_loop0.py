@@ -744,3 +744,138 @@ def test_run_steps_dispatches_ready_parallel_children():
         ]
         assert len(worker_children) == 2
         assert {payload["status"] for payload in worker_children} == {"complete"}
+
+
+def test_worker_supervision_reassigns_stalled_child_to_stronger_route():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(
+            TaskRecord(
+                task_id="stalled-parent",
+                title="Inspect runtime posture",
+                description="Inspect the current runtime posture and report the exact mismatch.",
+                priority=7,
+                urgency=4,
+                provenance={"source": "message_intake", "source_communication_id": "msg-stalled"},
+                permissions={},
+                risk="low",
+                status="pending",
+                success_criteria={"message_addressed": True},
+                completion_policy={
+                    "type": "review_or_audit",
+                    "route_preferences": {
+                        "preferred_cli_tools": ["kilocode", "gemini-cli"],
+                        "preferred_model": "gemini-2.5-flash",
+                    },
+                },
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _DeferredCodexProvider(), "cli": _CheapCliProvider()}),
+        )
+        result = runner.run_once()
+        worker_task_id = result["attempt"]["resource_usage"]["implementation"]["worker_task_id"]
+        worker_request = next(
+            payload
+            for payload in db.list_records("communications")
+            if payload.get("intent") == "worker_delegation_request"
+            and str(dict(payload.get("payload") or {}).get("worker_task_id") or "") == worker_task_id
+        )
+        db.upsert_communication(
+            CommunicationRecord(
+                **{
+                    **worker_request,
+                    "created_at": "2026-04-08T00:00:00+00:00",
+                    "delivered_at": "2026-04-08T00:00:00+00:00",
+                }
+            )
+        )
+        runner._reconcile_pending_tasks()
+        parent_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "stalled-parent")
+        assert parent_task["status"] == "working"
+        assert parent_task["provenance"]["worker_supervision"]["action"] == "reassign"
+        new_child_ids = list(parent_task["active_child_ids"])
+        assert len(new_child_ids) == 1
+        old_worker = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == worker_task_id)
+        assert old_worker["status"] == "failed"
+        new_worker = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == new_child_ids[0])
+        assert new_worker["provenance"]["worker_id"] == "worker.gemini-cli.gemini-2-5-flash"
+        supervision_artifacts = [
+            payload for payload in db.list_records("artifacts") if payload.get("artifact_type") == "worker_supervision"
+        ]
+        assert supervision_artifacts
+
+
+def test_worker_supervision_blocks_after_retry_budget_exhausted():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(
+            TaskRecord(
+                task_id="blocked-parent",
+                title="Benchmark runtime posture",
+                description="Benchmark the current runtime posture and report the current envelope.",
+                priority=6,
+                urgency=3,
+                provenance={"source": "message_intake", "source_communication_id": "msg-blocked"},
+                permissions={},
+                risk="low",
+                status="pending",
+                success_criteria={"message_addressed": True},
+                completion_policy={
+                    "type": "review_or_audit",
+                    "route_preferences": {
+                        "preferred_cli_tools": ["gemini-cli"],
+                        "preferred_model": "gemini-2.5-flash",
+                    },
+                },
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _DeferredCodexProvider(), "cli": _CheapCliProvider()}),
+        )
+        result = runner.run_once()
+        worker_task_id = result["attempt"]["resource_usage"]["implementation"]["worker_task_id"]
+        worker_request = next(
+            payload
+            for payload in db.list_records("communications")
+            if payload.get("intent") == "worker_delegation_request"
+            and str(dict(payload.get("payload") or {}).get("worker_task_id") or "") == worker_task_id
+        )
+        db.upsert_communication(
+            CommunicationRecord(
+                **{
+                    **worker_request,
+                    "created_at": "2026-04-08T00:00:00+00:00",
+                    "delivered_at": "2026-04-08T00:00:00+00:00",
+                }
+            )
+        )
+        worker_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == worker_task_id)
+        db.upsert_task(
+            TaskRecord(
+                **{
+                    **worker_task,
+                    "provenance": {
+                        **dict(worker_task.get("provenance") or {}),
+                        "supervision": {"retry_index": 2},
+                    },
+                }
+            )
+        )
+        runner._reconcile_pending_tasks()
+        parent_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "blocked-parent")
+        assert parent_task["status"] == "blocked"
+        assert parent_task["active_child_ids"] == []
+        assert parent_task["provenance"]["worker_supervision"]["action"] == "block"
