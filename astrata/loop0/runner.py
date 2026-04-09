@@ -44,6 +44,7 @@ from astrata.verification.basic import (
     verify_weak_candidate,
 )
 from astrata.verification.review import review_verification
+from astrata.workers.runtime import WorkerRuntime, worker_id_for_route
 
 
 def _now_iso() -> str:
@@ -157,6 +158,7 @@ class Loop0Runner:
         self.planner = Loop0Planner()
         self.prioritizer = WorkPrioritizer()
         self.governance: GovernanceBundle = load_governance_bundle(settings.paths.project_root)
+        self.worker_runtime = WorkerRuntime(settings=settings, db=db, registry=self.registry)
 
     def next_candidate(self) -> Loop0TaskCandidate | None:
         assessment = self.next_candidate_assessment()
@@ -1224,12 +1226,12 @@ class Loop0Runner:
             if (
                 status == "applied"
                 and implementation.get("emitted_communication_id")
-                and implementation.get("generation_mode") == "provider"
+                and implementation.get("generation_mode") in {"provider", "delegated_worker"}
             ):
                 return VerificationResult(
                     result="pass",
                     confidence=0.9,
-                    summary="Inbound task was selected from the unified queue and executed through a routed assistant lane.",
+                    summary="Inbound task was selected from the unified queue and executed through a routed assistant or worker lane.",
                     evidence={"implementation": implementation},
                 )
             if status == "applied" and implementation.get("emitted_communication_id"):
@@ -1347,6 +1349,16 @@ class Loop0Runner:
             )
             if execution_result is not None:
                 return execution_result
+        if self._should_delegate_message_task(candidate, route=route, task_payload=task_payload):
+            delegated = self._delegate_message_task(
+                candidate,
+                task_payload=task_payload,
+                task_id=task_id,
+                route=route,
+                baseline_inspection=baseline_inspection,
+            )
+            if delegated is not None:
+                return delegated
         if provider is None:
             return self._fallback_message_dispatch(
                 candidate,
@@ -1430,6 +1442,123 @@ class Loop0Runner:
             "assistant_output": operator_response,
             "followup_tasks": followup_tasks,
             "derived_artifact": derived_artifact,
+            "emitted_communication_id": notice.communication_id,
+        }
+
+    def _should_delegate_message_task(
+        self,
+        candidate: Loop0TaskCandidate,
+        *,
+        route: dict[str, Any],
+        task_payload: dict[str, Any],
+    ) -> bool:
+        if candidate.strategy != "message_task":
+            return False
+        if self._is_execution_track_message_task(task_payload):
+            return False
+        completion_policy = dict(task_payload.get("completion_policy") or {})
+        prefer_cheap_lanes = bool(completion_policy.get("prefer_cheap_lanes"))
+        provider = str(route.get("provider") or "").strip().lower()
+        cli_tool = str(route.get("cli_tool") or "").strip().lower()
+        if cli_tool in {"kilocode", "gemini-cli", "claude-code"}:
+            return True
+        if prefer_cheap_lanes and provider in {"cli", "google", "custom", "anthropic"}:
+            return True
+        return False
+
+    def _delegate_message_task(
+        self,
+        candidate: Loop0TaskCandidate,
+        *,
+        task_payload: dict[str, Any],
+        task_id: str,
+        route: dict[str, Any],
+        baseline_inspection: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        worker_id = worker_id_for_route(route)
+        request = self.operator_lane.send(
+            sender="prime",
+            recipient=worker_id,
+            conversation_id=self.operator_lane.default_conversation_id(worker_id),
+            kind="delegation",
+            intent="worker_delegation_request",
+            payload={
+                "delegation_kind": "message_task",
+                "task_id": task_id,
+                "title": candidate.title,
+                "description": candidate.description,
+                "message": candidate.description,
+                "task_payload": task_payload,
+                "route": route,
+            },
+            priority=candidate.priority,
+            urgency=candidate.urgency,
+            related_task_ids=[task_id],
+        )
+        delegation_result = self.worker_runtime.handle_message(request)
+        result_message = dict(delegation_result.result_message or {})
+        payload = dict(result_message.get("payload") or {})
+        if str(payload.get("status") or "").strip().lower() != "applied":
+            return self._fallback_message_dispatch(
+                candidate,
+                task_id=task_id,
+                completion_policy=dict(task_payload.get("completion_policy") or {}),
+                route=route,
+                baseline_inspection=baseline_inspection,
+                provider_error=str(payload.get("reason") or "delegated worker did not complete the task"),
+                failure_kind="delegated_worker_failed",
+                degraded_reason=f"worker:{worker_id}",
+            )
+        raw_content = str(payload.get("raw_content") or "")
+        operator_response = self._extract_operator_response(raw_content)
+        followup_tasks = self._extract_followup_tasks(raw_content, task_payload)
+        derived_artifact = self._extract_message_artifact(raw_content, candidate, task_payload)
+        lane_sender, conversation_id = self._message_task_lane_context(task_payload)
+        notice = self.operator_lane.send(
+            sender=lane_sender,
+            recipient="operator",
+            conversation_id=conversation_id,
+            kind="question" if dict(task_payload.get("completion_policy") or {}).get("type") == "request_clarification" else "notice",
+            intent=(
+                "clarification_request"
+                if dict(task_payload.get("completion_policy") or {}).get("type") == "request_clarification"
+                else "message_task_response"
+            ),
+            payload={
+                "task_id": task_id,
+                "title": candidate.title,
+                "description": candidate.description,
+                "completion_policy": dict(task_payload.get("completion_policy") or {}),
+                "assistant_output": operator_response,
+                "provider": payload.get("route", {}).get("provider") or route.get("provider"),
+                "model": payload.get("route", {}).get("model") or route.get("model"),
+                "route": payload.get("route") or route,
+                "followup_tasks": followup_tasks,
+                "derived_artifact": derived_artifact,
+            },
+            priority=candidate.priority,
+            urgency=candidate.urgency,
+            related_task_ids=[task_id],
+        )
+        return {
+            "status": "applied",
+            "reason": "Unified queue delegated the inbound task to a provider-backed worker lane and applied the returned result.",
+            "written_paths": [],
+            "generation_mode": "delegated_worker",
+            "requested_route": route,
+            "resolved_route": payload.get("route") or route,
+            "preflight": {"ok": True, "reason": None},
+            "failure_kind": None,
+            "degraded_reason": None,
+            "provider_error": None,
+            "attempt_count": 1,
+            "baseline_inspection": baseline_inspection,
+            "assistant_output": operator_response,
+            "followup_tasks": followup_tasks,
+            "derived_artifact": derived_artifact,
+            "delegated_via_worker": worker_id,
+            "delegation_request_id": request.communication_id,
+            "delegation_result_id": result_message.get("communication_id"),
             "emitted_communication_id": notice.communication_id,
         }
 

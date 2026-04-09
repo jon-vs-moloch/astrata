@@ -205,9 +205,13 @@ def test_loop0_runner_unifies_pending_message_tasks():
         assert route["provider"] == "cli"
         assert route["cli_tool"] == "kilocode"
         implementation = result["attempt"]["resource_usage"]["implementation"]
-        assert implementation["generation_mode"] == "provider"
+        assert implementation["generation_mode"] == "delegated_worker"
+        assert implementation["delegated_via_worker"] == "worker.kilocode"
         assert implementation["assistant_output"] == "Delegated response from cheap lane."
         communications = db.list_records("communications")
+        worker_results = [payload for payload in communications if payload.get("intent") == "worker_delegation_result"]
+        assert worker_results
+        assert worker_results[-1]["payload"]["worker_id"] == "worker.kilocode"
         delegated = [payload for payload in communications if payload.get("intent") == "message_task_response"]
         assert delegated
         assert delegated[-1]["payload"]["assistant_output"] == "Delegated response from cheap lane."

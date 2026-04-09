@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from astrata.comms.intake import MessageIntake, RequestSpec, materialize_inbound_message
@@ -11,7 +12,6 @@ from astrata.config.settings import Settings
 from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.local.strata_endpoint import StrataEndpointService
-from astrata.loop0.runner import _now_iso
 from astrata.providers.base import CompletionRequest, Message
 from astrata.providers.registry import ProviderRegistry, build_default_registry
 from astrata.records.communications import CommunicationRecord
@@ -20,6 +20,9 @@ from astrata.routing.policy import RouteChooser
 from astrata.scheduling.quota import QuotaPolicy, default_source_limits
 from astrata.storage.db import AstrataDatabase
 
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 @dataclass(frozen=True)
 class LaneTurnResult:
