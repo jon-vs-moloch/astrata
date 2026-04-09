@@ -166,6 +166,32 @@ class _FailingCliProvider(_CheapCliProvider):
         raise RuntimeError("provider_execution_failed")
 
 
+class _QuotaAwareCliProvider(_CheapCliProvider):
+    def get_quota_windows(self, route=None):
+        route = dict(route or {})
+        cli_tool = str(route.get("cli_tool") or "").strip().lower()
+        model = str(route.get("model") or "").strip().lower()
+        if cli_tool == "gemini-cli" and "flash" in model:
+            return [
+                {
+                    "requests_remaining": 0,
+                    "requests_limit": 10,
+                    "reset_time": "2099-01-01T00:00:00+00:00",
+                    "window_duration_seconds": 3600,
+                    "source": "test_flash_exhausted",
+                }
+            ]
+        return [
+            {
+                "requests_remaining": 5,
+                "requests_limit": 10,
+                "reset_time": "2099-01-01T00:00:00+00:00",
+                "window_duration_seconds": 3600,
+                "source": "test_available",
+            }
+        ]
+
+
 def test_loop0_runner_records_coordination_deferral():
     settings = load_settings(Path("/Users/jon/Projects/Astrata"))
     db = AstrataDatabase(settings.paths.data_dir / "test-loop0-coordinator.db")
@@ -879,3 +905,61 @@ def test_worker_supervision_blocks_after_retry_budget_exhausted():
         assert parent_task["status"] == "blocked"
         assert parent_task["active_child_ids"] == []
         assert parent_task["provenance"]["worker_supervision"]["action"] == "block"
+
+
+def test_worker_supervision_skips_quota_exhausted_cheap_route():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(
+            TaskRecord(
+                task_id="quota-parent",
+                title="Benchmark runtime posture",
+                description="Benchmark the current runtime posture and report the current envelope.",
+                priority=6,
+                urgency=3,
+                provenance={"source": "message_intake", "source_communication_id": "msg-quota"},
+                permissions={},
+                risk="low",
+                status="pending",
+                success_criteria={"message_addressed": True},
+                completion_policy={
+                    "type": "review_or_audit",
+                    "route_preferences": {
+                        "preferred_cli_tools": ["kilocode", "gemini-cli"],
+                        "preferred_model": "gemini-2.5-flash",
+                    },
+                },
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _DeferredCodexProvider(), "cli": _QuotaAwareCliProvider()}),
+        )
+        result = runner.run_once()
+        worker_task_id = result["attempt"]["resource_usage"]["implementation"]["worker_task_id"]
+        worker_request = next(
+            payload
+            for payload in db.list_records("communications")
+            if payload.get("intent") == "worker_delegation_request"
+            and str(dict(payload.get("payload") or {}).get("worker_task_id") or "") == worker_task_id
+        )
+        db.upsert_communication(
+            CommunicationRecord(
+                **{
+                    **worker_request,
+                    "created_at": "2026-04-08T00:00:00+00:00",
+                    "delivered_at": "2026-04-08T00:00:00+00:00",
+                }
+            )
+        )
+        runner._reconcile_pending_tasks()
+        parent_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "quota-parent")
+        assert parent_task["status"] == "working"
+        selected_route = parent_task["provenance"]["worker_supervision"]["selected_route"]
+        assert selected_route["cli_tool"] == "gemini-cli"
+        assert selected_route["model"] == "gemini-2.5-pro"

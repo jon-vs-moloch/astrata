@@ -140,6 +140,7 @@ class Loop0Runner:
         limits["custom"] = settings.runtime_limits.custom_requests_per_hour
         health_store = RouteHealthStore(settings.paths.data_dir / "route_health.json")
         quota_policy = QuotaPolicy(db=db, limits_per_source=limits, registry=self.registry)
+        self.quota_policy = quota_policy
         self.procedures = BoundedFileGenerationProcedure(
             registry=self.registry,
             router=self.router,
@@ -418,6 +419,85 @@ class Loop0Runner:
                 )
         return candidates
 
+    def _route_cost_rank(self, route: dict[str, Any]) -> int:
+        cli_tool = str(route.get("cli_tool") or "").strip().lower()
+        model = str(route.get("model") or "").strip().lower()
+        provider = str(route.get("provider") or "").strip().lower()
+        if provider == "cli":
+            if cli_tool == "kilocode":
+                return 1
+            if cli_tool == "gemini-cli":
+                if "flash" in model:
+                    return 2
+                if "pro" in model:
+                    return 4
+                return 3
+            if cli_tool == "claude-code":
+                return 6
+            if cli_tool == "codex-cli":
+                return 7
+        if provider == "google":
+            return 5
+        if provider == "openai":
+            return 8
+        if provider == "anthropic":
+            return 7
+        return 9
+
+    def _quota_snapshot_for_route(self, route: dict[str, Any]) -> dict[str, Any]:
+        decision = self.quota_policy.assess(route)
+        active_window = dict(decision.active_window or {})
+        remaining = int(active_window.get("requests_remaining") or 0)
+        limit = int(active_window.get("requests_limit") or 0)
+        headroom_ratio = (float(remaining) / float(limit)) if limit > 0 else (1.0 if decision.allowed else 0.0)
+        return {
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "usage_last_hour": decision.usage_last_hour,
+            "limit_per_hour": decision.limit_per_hour,
+            "next_allowed_at": decision.next_allowed_at,
+            "active_window": active_window,
+            "headroom_ratio": round(headroom_ratio, 4),
+        }
+
+    def _select_supervision_route(
+        self,
+        *,
+        current_route: dict[str, Any],
+        parent_task_payload: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        candidates = self._supervision_route_candidates(
+            current_route=current_route,
+            parent_task_payload=parent_task_payload,
+        )
+        scored: list[dict[str, Any]] = []
+        for route in candidates:
+            quota = self._quota_snapshot_for_route(route)
+            scored.append(
+                {
+                    "route": route,
+                    "quota": quota,
+                    "cost_rank": self._route_cost_rank(route),
+                }
+            )
+        allowed = [item for item in scored if item["quota"]["allowed"]]
+        allowed.sort(
+            key=lambda item: (
+                int(item["cost_rank"]),
+                -float(item["quota"]["headroom_ratio"]),
+                int(item["quota"]["usage_last_hour"]),
+            )
+        )
+        if allowed:
+            return dict(allowed[0]["route"]), scored
+        scored.sort(
+            key=lambda item: (
+                item["quota"]["next_allowed_at"] or "",
+                int(item["cost_rank"]),
+            )
+        )
+        return None, scored
+
     def _repair_stalled_worker_task(
         self,
         *,
@@ -430,12 +510,11 @@ class Loop0Runner:
         worker_provenance = dict(worker_task_payload.get("provenance") or {})
         current_route = dict(worker_provenance.get("route") or {})
         retry_index = int(dict(worker_provenance.get("supervision") or {}).get("retry_index") or 0)
-        route_candidates = self._supervision_route_candidates(
+        selected_route, scored_candidates = self._select_supervision_route(
             current_route=current_route,
             parent_task_payload=parent_task_payload,
         )
-        action = "reassign" if route_candidates and retry_index < 2 else "block"
-        selected_route = route_candidates[0] if action == "reassign" else None
+        action = "reassign" if selected_route is not None and retry_index < 2 else "block"
         artifact = ArtifactRecord(
             artifact_type="worker_supervision",
             title=f"Worker supervision: {parent_task_payload.get('title') or parent_task_id}",
@@ -450,6 +529,7 @@ class Loop0Runner:
                     "retry_index": retry_index,
                     "action": action,
                     "selected_route": selected_route,
+                    "route_candidates": scored_candidates,
                 },
                 indent=2,
             ),
