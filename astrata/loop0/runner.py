@@ -171,16 +171,7 @@ class Loop0Runner:
         work_items: list[ScheduledWorkItem] = []
         for candidate in self._pending_message_task_candidates():
             scheduling_metadata = self._scheduling_metadata_for_task_payload(dict(candidate.metadata or {}))
-            assessment = Loop0CandidateAssessment(
-                candidate=candidate,
-                inspection={"task_record": dict(candidate.metadata or {})},
-                verification=VerificationResult(
-                    result="pass",
-                    confidence=0.8,
-                    summary="Inbound task is pending and eligible for unified scheduling.",
-                    evidence={"task_record": dict(candidate.metadata or {})},
-                ),
-            )
+            assessment = self._message_task_assessment(candidate)
             work_items.append(
                 ScheduledWorkItem.from_assessment(
                     assessment,
@@ -276,6 +267,18 @@ class Loop0Runner:
             candidate=selection.item.candidate,
             inspection=selection.item.inspection,
             verification=selection.item.verification,
+        )
+
+    def _message_task_assessment(self, candidate: Loop0TaskCandidate) -> Loop0CandidateAssessment:
+        return Loop0CandidateAssessment(
+            candidate=candidate,
+            inspection={"task_record": dict(candidate.metadata or {})},
+            verification=VerificationResult(
+                result="pass",
+                confidence=0.8,
+                summary="Inbound task is pending and eligible for unified scheduling.",
+                evidence={"task_record": dict(candidate.metadata or {})},
+            ),
         )
 
     def _reconcile_pending_tasks(self) -> list[TaskRecord]:
@@ -399,7 +402,21 @@ class Loop0Runner:
             urgency=int(payload.get("urgency") or 0),
             related_task_ids=[str(payload.get("task_id") or "")],
         )
-        if followup_tasks:
+        if isinstance(derived_artifact, dict) and derived_artifact.get("artifact_type"):
+            self.db.upsert_artifact(
+                ArtifactRecord(
+                    artifact_type=str(derived_artifact.get("artifact_type") or "message_analysis"),
+                    title=str(derived_artifact.get("title") or payload.get("title") or payload.get("task_id")),
+                    description=str(derived_artifact.get("description") or ""),
+                    content_summary=json.dumps(derived_artifact, indent=2),
+                    provenance={
+                        "task_id": str(payload.get("task_id") or ""),
+                        "source_communication_id": str(message_payload.get("source_communication_id") or ""),
+                    },
+                    status=str(derived_artifact.get("status") or "good"),
+                )
+            )
+        if followup_tasks or derived_artifact:
             parent_task = TaskRecord(**payload)
             self._materialize_followup_tasks(
                 candidate=Loop0TaskCandidate(
@@ -662,6 +679,14 @@ class Loop0Runner:
             ):
                 return True
             if parent_task_id and str(other_prov.get("parent_task_id") or "").strip() == parent_task_id:
+                if source == "message_task_followup":
+                    other_title = str(other.get("title") or "").strip().lower()
+                    other_description = str(other.get("description") or "").strip().lower()
+                    if title and title == other_title:
+                        return True
+                    if description and description == other_description:
+                        return True
+                    continue
                 return True
             if title and title == str(other.get("title") or "").strip().lower():
                 return True
@@ -1188,8 +1213,10 @@ class Loop0Runner:
                 payload={"status": "complete", "message": "No missing or weak Loop 0 candidate paths found."},
             )
             return {"status": "complete", "message": "No missing Loop 0 candidate paths found."}
-        candidate = assessment.candidate
+        return self._execute_assessment(assessment)
 
+    def _execute_assessment(self, assessment: Loop0CandidateAssessment) -> dict[str, Any]:
+        candidate = assessment.candidate
         recommendation = self.recommend_next_step(assessment)
         coordination = recommendation.get("coordination") or self.coordinate_candidate(candidate)
         implementation = self._apply_candidate(candidate, coordination=coordination)
@@ -1412,8 +1439,16 @@ class Loop0Runner:
     def run_steps(self, max_steps: int) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         for _ in range(max_steps):
+            child_results = self._dispatch_additional_ready_child_tasks(max_tasks=3)
+            if child_results:
+                results.extend(child_results)
+                self._process_all_pending_worker_turns(limit_per_worker=5)
+                self._reconcile_pending_tasks()
+                continue
             result = self.run_once()
             results.append(result)
+            self._process_all_pending_worker_turns(limit_per_worker=5)
+            self._reconcile_pending_tasks()
             if result.get("status") == "complete":
                 break
             implementation = result.get("implementation_report", {})
@@ -1422,6 +1457,68 @@ class Loop0Runner:
                 break
         final_status = results[-1]["status"] if results else "complete"
         return {"status": final_status, "steps": results}
+
+    def _dispatch_additional_ready_child_tasks(self, *, max_tasks: int = 3) -> list[dict[str, Any]]:
+        dispatched: list[dict[str, Any]] = []
+        seen_task_ids: set[str] = set()
+        for _ in range(max(0, max_tasks)):
+            candidates = [
+                candidate
+                for candidate in self._pending_message_task_candidates()
+                if (
+                    str(dict(candidate.metadata or {}).get("parent_task_id") or "").strip()
+                    or str(dict(dict(candidate.metadata or {}).get("provenance") or {}).get("parent_task_id") or "").strip()
+                )
+                and candidate.source_task_id not in seen_task_ids
+            ]
+            if not candidates:
+                break
+            work_items = [
+                ScheduledWorkItem.from_assessment(
+                    self._message_task_assessment(candidate),
+                    source_kind="message_task",
+                    created_at=str(dict(candidate.metadata or {}).get("created_at") or ""),
+                    metadata={
+                        "strategy": candidate.strategy,
+                        **self._scheduling_metadata_for_task_payload(dict(candidate.metadata or {})),
+                    },
+                )
+                for candidate in candidates
+            ]
+            selection = self.prioritizer.select(work_items)
+            if selection is None:
+                break
+            assessment = Loop0CandidateAssessment(
+                candidate=selection.item.candidate,
+                inspection=selection.item.inspection,
+                verification=selection.item.verification,
+            )
+            seen_task_ids.add(str(assessment.candidate.source_task_id or ""))
+            dispatched.append(self._execute_assessment(assessment))
+        return dispatched
+
+    def _process_all_pending_worker_turns(self, *, limit_per_worker: int = 5) -> list[dict[str, Any]]:
+        pending_by_worker: dict[str, int] = {}
+        for payload in self.db.list_records("communications"):
+            if payload.get("channel") != self.operator_lane.channel:
+                continue
+            if payload.get("intent") != "worker_delegation_request":
+                continue
+            if payload.get("status") in {"acknowledged", "resolved"}:
+                continue
+            worker_id = str(payload.get("recipient") or "").strip()
+            if not worker_id:
+                continue
+            pending_by_worker[worker_id] = pending_by_worker.get(worker_id, 0) + 1
+        processed: list[dict[str, Any]] = []
+        for worker_id in sorted(pending_by_worker):
+            processed.extend(
+                self.worker_runtime.process_pending(
+                    worker_id=worker_id,
+                    limit=min(limit_per_worker, pending_by_worker[worker_id]),
+                )
+            )
+        return processed
 
     def _task_record_for_candidate(
         self,

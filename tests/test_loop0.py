@@ -130,6 +130,25 @@ class _DecompositionCliProvider(_CheapCliProvider):
         )
 
 
+class _ParallelDecompositionCliProvider(_CheapCliProvider):
+    def _content_for_request(self, request: CompletionRequest) -> str:
+        rendered = "\n".join(message.content or "" for message in request.messages)
+        if "'files'" in rendered or '"files"' in rendered:
+            return '{"files":{"astrata/comms/intake.py":"# strengthened\\n"}}'
+        if "split it into parallel bounded worker tasks" not in rendered.lower():
+            return (
+                '{"operator_response":"Leaf review complete.","followup_tasks":[],"artifact":'
+                '{"title":"Leaf review artifact","summary":"Executed delegated leaf review.",'
+                '"confidence":0.88,"findings":[]}}'
+            )
+        return (
+            '{"operator_response":"This should fan out into parallel leaf tasks.","followup_tasks":['
+            '{"task_id_hint":"inspect","title":"Inspect runtime posture","description":"Inspect the current runtime posture and record the exact mismatch.","priority":5,"urgency":3,"risk":"low","completion_type":"review_or_audit","parallelizable":true},'
+            '{"task_id_hint":"benchmark","title":"Benchmark runtime posture","description":"Benchmark the current runtime posture and record the current performance envelope.","priority":5,"urgency":3,"risk":"low","completion_type":"review_or_audit","parallelizable":true,"route_preferences":{"preferred_cli_tools":["gemini-cli"],"preferred_model":"gemini-2.5-flash"}}'
+            '],"artifact":{"title":"Runtime posture parallel decomposition","summary":"Split into two independent review tasks.","confidence":0.9,"findings":[]}}'
+        )
+
+
 class _FileCodexProvider(_DeferredCodexProvider):
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         rendered = "\n".join(message.content or "" for message in request.messages)
@@ -674,3 +693,54 @@ def test_loop0_worker_failure_decomposes_multistage_task():
         ]
         assert followups
         assert followups[-1]["title"].startswith("Decompose:")
+
+
+def test_run_steps_dispatches_ready_parallel_children():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(
+            TaskRecord(
+                task_id="parallel-parent",
+                title="Runtime posture needs parallel decomposition",
+                description="Figure out the runtime posture issue and split it into parallel bounded worker tasks.",
+                priority=9,
+                urgency=7,
+                provenance={"source": "message_intake", "source_communication_id": "msg-parallel"},
+                permissions={},
+                risk="low",
+                status="pending",
+                success_criteria={"message_addressed": True},
+                completion_policy={
+                    "type": "review_or_audit",
+                    "route_preferences": {"preferred_cli_tools": ["kilocode"]},
+                },
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _DeferredCodexProvider(), "cli": _ParallelDecompositionCliProvider()}),
+        )
+        assessment = runner.next_candidate_assessment()
+        assert assessment is not None
+        assert assessment.candidate.source_task_id == "parallel-parent"
+        result = runner.run_steps(2)
+        assert result["status"] == "ok"
+        followups = [
+            payload
+            for payload in db.list_records("tasks")
+            if payload.get("provenance", {}).get("source") == "message_task_followup"
+        ]
+        assert len(followups) == 2
+        worker_children = [
+            payload
+            for payload in db.list_records("tasks")
+            if payload.get("provenance", {}).get("source") == "worker_delegation"
+            and payload.get("parent_task_id") in {task["task_id"] for task in followups}
+        ]
+        assert len(worker_children) == 2
+        assert {payload["status"] for payload in worker_children} == {"complete"}
