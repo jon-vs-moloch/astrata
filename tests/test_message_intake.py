@@ -87,3 +87,18 @@ def test_normalize_derived_task_proposal_classifies_spec_work():
     assert proposal.route_preferences["preferred_cli_tools"][0] == "kilocode"
     assert proposal.provenance["derived_request_kind"] == "spec_hardening"
     assert proposal.provenance["delta_kind"] == "input_vs_spec"
+
+
+def test_normalize_derived_task_proposal_preserves_dependency_hints():
+    proposal = normalize_derived_task_proposal(
+        title="Persist runtime posture",
+        description="Write the inspected posture into persisted settings.",
+        parent_provenance={"source": "message_task_followup"},
+        suggested_completion_type="respond_or_execute",
+        task_id_hint="persist",
+        depends_on=["inspect"],
+        parallelizable=False,
+    )
+    assert proposal.task_id_hint == "persist"
+    assert proposal.depends_on == ["inspect"]
+    assert proposal.parallelizable is False

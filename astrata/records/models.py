@@ -23,6 +23,7 @@ class TaskRecord(BaseModel):
     permissions: dict[str, Any] = Field(default_factory=dict)
     risk: str = "moderate"
     status: Literal["pending", "working", "blocked", "complete", "failed", "satisfied", "superseded"] = "pending"
+    dependencies: list[str] = Field(default_factory=list)
     success_criteria: dict[str, Any] = Field(default_factory=dict)
     completion_policy: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=_now_iso)

@@ -117,6 +117,19 @@ class _ArtifactOnlyCliProvider(_CheapCliProvider):
         )
 
 
+class _DecompositionCliProvider(_CheapCliProvider):
+    def _content_for_request(self, request: CompletionRequest) -> str:
+        rendered = "\n".join(message.content or "" for message in request.messages)
+        if "'files'" in rendered or '"files"' in rendered:
+            return '{"files":{"astrata/comms/intake.py":"# strengthened\\n"}}'
+        return (
+            '{"operator_response":"This should be split into bounded worker tasks.","followup_tasks":['
+            '{"task_id_hint":"inspect","title":"Inspect runtime posture","description":"Inspect the current runtime posture and record the exact mismatch.","priority":5,"urgency":3,"risk":"low","completion_type":"review_or_audit","parallelizable":true},'
+            '{"task_id_hint":"persist","title":"Persist runtime posture","description":"Apply the bounded runtime posture fix once the mismatch is confirmed.","priority":5,"urgency":3,"risk":"low","completion_type":"respond_or_execute","depends_on":["inspect"],"route_preferences":{"preferred_cli_tools":["gemini-cli"],"preferred_model":"gemini-2.5-flash"}}'
+            '],"artifact":{"title":"Runtime posture decomposition","summary":"Split into inspect and persist leaf tasks.","confidence":0.9,"findings":[]}}'
+        )
+
+
 class _FileCodexProvider(_DeferredCodexProvider):
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         rendered = "\n".join(message.content or "" for message in request.messages)
@@ -485,3 +498,63 @@ def test_loop0_runner_promotes_artifact_findings_into_followup_tasks():
         assert followup_tasks
         assert followup_tasks[-1]["provenance"]["source"] == "message_task_followup"
         assert followup_tasks[-1]["completion_policy"]["type"] == "respond_or_execute"
+
+
+def test_loop0_runner_materializes_dependency_aware_decomposition_followups():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(
+            TaskRecord(
+                task_id="message-task-decomposition",
+                title="Runtime posture needs decomposition",
+                description="Figure out the runtime posture repair path and split it into bounded worker steps.",
+                priority=6,
+                urgency=3,
+                provenance={"source": "message_intake", "source_communication_id": "msg-5"},
+                permissions={},
+                risk="low",
+                status="pending",
+                success_criteria={"message_addressed": True},
+                completion_policy={"type": "respond_or_execute"},
+                created_at="2026-04-08T00:00:00+00:00",
+                updated_at="2026-04-08T00:00:00+00:00",
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _DeferredCodexProvider(), "cli": _DecompositionCliProvider()}),
+        )
+        result = runner.run_once()
+        assert result["status"] == "ok"
+        runner.worker_runtime.process_pending(worker_id="worker.kilocode")
+        runner._reconcile_pending_tasks()
+        followup_tasks = [
+            payload
+            for payload in db.list_records("tasks")
+            if payload.get("provenance", {}).get("source") == "message_task_followup"
+        ]
+        assert len(followup_tasks) == 2
+        by_title = {payload["title"]: payload for payload in followup_tasks}
+        inspect_task = by_title["Inspect runtime posture"]
+        persist_task = by_title["Persist runtime posture"]
+        assert inspect_task["dependencies"] == []
+        assert persist_task["dependencies"] == [inspect_task["task_id"]]
+        assert inspect_task["provenance"]["decomposition"]["parallelizable"] is True
+        assert persist_task["completion_policy"]["route_preferences"]["preferred_cli_tools"] == ["gemini-cli"]
+        assert persist_task["completion_policy"]["route_preferences"]["preferred_model"] == "gemini-2.5-flash"
+        artifacts = db.list_records("artifacts")
+        decomposition_artifact = next(
+            (payload for payload in artifacts if payload.get("artifact_type") == "task_decomposition"),
+            None,
+        )
+        assert decomposition_artifact is not None
+        draft_procedure = next(
+            (payload for payload in artifacts if payload.get("artifact_type") == "draft_procedure"),
+            None,
+        )
+        assert draft_procedure is not None

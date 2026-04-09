@@ -185,6 +185,40 @@ def build_default_procedure_registry() -> ProcedureRegistry:
             metadata={"task_class": "execution"},
         )
     )
+    registry.register(
+        ProcedureTemplate(
+            procedure_id="task-decomposition",
+            title="Task Decomposition",
+            description=(
+                "Break a non-oneshottable task into bounded, dependency-aware leaf work and "
+                "preserve the resulting workflow structure as a reusable draft procedure candidate."
+            ),
+            expected_outputs=["subtask_dag", "draft_procedure_candidate"],
+            default_variant_id="careful_decomposition",
+            variants=[
+                ProcedureVariantTemplate(
+                    variant_id="careful_decomposition",
+                    title="Careful Decomposition",
+                    description="Conservative decomposition path that favors explicit leaf tasks and clear dependency edges.",
+                    min_capability="basic",
+                    execution_mode="careful",
+                    preferred_cli_tools=["kilocode", "gemini-cli"],
+                    metadata={"shortcut_allowed": False, "preserve_workflow": True},
+                ),
+                ProcedureVariantTemplate(
+                    variant_id="direct_decomposition",
+                    title="Direct Decomposition",
+                    description="Permit stronger actors to produce a compact leaf-task DAG directly and capture the shortcut used.",
+                    min_capability="strong",
+                    execution_mode="shortcut",
+                    preferred_providers=["codex", "openai", "google"],
+                    preferred_cli_tools=["codex-cli", "claude-code", "gemini-cli"],
+                    metadata={"shortcut_allowed": True, "capture_shortcut_candidate": True, "preserve_workflow": True},
+                ),
+            ],
+            metadata={"task_class": "decomposition"},
+        )
+    )
     return registry
 
 

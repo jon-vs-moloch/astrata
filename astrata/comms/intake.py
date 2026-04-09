@@ -44,6 +44,9 @@ class TaskProposal(BaseModel):
     completion_policy: dict[str, Any] = Field(default_factory=dict)
     provenance: dict[str, Any] = Field(default_factory=dict)
     route_preferences: dict[str, Any] = Field(default_factory=dict)
+    task_id_hint: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    parallelizable: bool = False
 
 
 class MessageIntake:
@@ -175,6 +178,7 @@ class MessageIntake:
             priority=proposal.priority,
             urgency=proposal.urgency,
             risk=proposal.risk,
+            dependencies=list(proposal.depends_on),
             provenance=proposal.provenance,
             success_criteria=proposal.success_criteria,
             completion_policy={
@@ -229,6 +233,9 @@ def normalize_derived_task_proposal(
     route_preferences: dict[str, Any] | None = None,
     delta_kind: str | None = None,
     delta_summary: str | None = None,
+    task_id_hint: str | None = None,
+    depends_on: list[str] | None = None,
+    parallelizable: bool = False,
 ) -> TaskProposal:
     normalized_title = title.strip() or _title_from_summary(description)
     normalized_description = description.strip() or normalized_title
@@ -261,6 +268,9 @@ def normalize_derived_task_proposal(
             "domains": _classify_domains(f"{normalized_title}. {normalized_description}"),
         },
         route_preferences=normalized_route_preferences,
+        task_id_hint=str(task_id_hint or "").strip() or None,
+        depends_on=[str(item).strip() for item in list(depends_on or []) if str(item).strip()],
+        parallelizable=bool(parallelizable),
     )
 
 

@@ -185,7 +185,9 @@ class WorkerRuntime:
                     "You are a delegated Astrata worker. "
                     "Return strict JSON with top-level keys `operator_response`, `followup_tasks`, and `artifact`. "
                     "`operator_response` must be a concise message for the operator. "
-                    "`followup_tasks` should be an array of at most 2 concrete governed tasks only when genuinely helpful. "
+                    "`followup_tasks` should be an array of at most 4 concrete governed tasks only when genuinely helpful. "
+                    "When a task needs decomposition, prefer multiple oneshottable leaf tasks with optional `task_id_hint`, "
+                    "`depends_on`, `parallelizable`, and `route_preferences` fields rather than one oversized task. "
                     "`artifact` should be null or a compact object with `title`, `summary`, optional `confidence`, and optional `findings`."
                 ),
             ),

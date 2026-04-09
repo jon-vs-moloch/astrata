@@ -19,6 +19,7 @@ from astrata.governance.documents import GovernanceBundle, load_governance_bundl
 from astrata.loop0.planner import Loop0Planner, PlannerSnapshot
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
 from astrata.procedures.health import RouteHealthStore
+from astrata.procedures.models import ProcedureRecord, ProcedureStructure, ProcedureTaskNode
 from astrata.procedures.registry import (
     ResolvedProcedure,
     build_default_procedure_registry,
@@ -1799,9 +1800,11 @@ class Loop0Runner:
             "Respond concisely and usefully. Return strict JSON with keys "
             "`operator_response`, `followup_tasks`, and `artifact`. "
             "`operator_response` should be the bounded next response or question for the operator. "
-            "`followup_tasks` should be a short list of at most 2 governed tasks only when genuinely helpful. "
+            "`followup_tasks` should be a short list of at most 4 governed tasks only when genuinely helpful. "
             "Each follow-up task should include: title, description, priority, urgency, risk, completion_type, "
             "and, when clear, delta_kind (`input_vs_spec` or `spec_vs_reality`) plus delta_summary. "
+            "When the work is too broad for one leaf task, decompose it into multiple oneshottable leaf tasks. "
+            "For decompositions, you may also include `task_id_hint`, `depends_on`, `parallelizable`, and `route_preferences`. "
             "`artifact` should summarize the durable knowledge produced by this step, with keys: "
             "title, summary, confidence, findings. "
             "If no follow-up work is needed, return an empty list. "
@@ -1839,7 +1842,7 @@ class Loop0Runner:
         if not isinstance(raw_tasks, list):
             return []
         normalized: list[dict[str, Any]] = []
-        for item in raw_tasks[:2]:
+        for item in raw_tasks[:4]:
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title") or "").strip()
@@ -1857,9 +1860,17 @@ class Loop0Runner:
                     "success_criteria": dict(item.get("success_criteria") or {"message_addressed": True}),
                     "delta_kind": str(item.get("delta_kind") or "").strip() or None,
                     "delta_summary": str(item.get("delta_summary") or "").strip() or None,
-                    "route_preferences": dict(
-                        dict(task_payload.get("completion_policy") or {}).get("route_preferences") or {}
-                    ),
+                    "route_preferences": {
+                        **dict(dict(task_payload.get("completion_policy") or {}).get("route_preferences") or {}),
+                        **dict(item.get("route_preferences") or {}),
+                    },
+                    "task_id_hint": str(item.get("task_id_hint") or "").strip() or None,
+                    "depends_on": [
+                        str(dependency).strip()
+                        for dependency in list(item.get("depends_on") or [])
+                        if str(dependency).strip()
+                    ],
+                    "parallelizable": bool(item.get("parallelizable")),
                 }
             )
         return normalized
@@ -1918,8 +1929,12 @@ class Loop0Runner:
                 candidate=candidate,
                 implementation=implementation,
             )
+        if not specs:
+            return []
+        prepared: list[tuple[dict[str, Any], Any]] = []
+        hint_to_task_id: dict[str, str] = {}
         materialized: list[TaskRecord] = []
-        for spec in specs[:2]:
+        for spec in specs[:4]:
             if not isinstance(spec, dict):
                 continue
             proposal = normalize_derived_task_proposal(
@@ -1939,13 +1954,19 @@ class Loop0Runner:
                 route_preferences=dict(spec.get("route_preferences") or {}),
                 delta_kind=str(spec.get("delta_kind") or "").strip() or None,
                 delta_summary=str(spec.get("delta_summary") or "").strip() or None,
+                task_id_hint=str(spec.get("task_id_hint") or "").strip() or None,
+                depends_on=list(spec.get("depends_on") or []),
+                parallelizable=bool(spec.get("parallelizable")),
             )
+            prepared.append((spec, proposal))
+        for spec, proposal in prepared:
             task = TaskRecord(
                 title=proposal.title,
                 description=proposal.description,
                 priority=proposal.priority,
                 urgency=proposal.urgency,
                 risk=proposal.risk,
+                dependencies=[],
                 provenance=proposal.provenance,
                 success_criteria=proposal.success_criteria,
                 completion_policy={
@@ -1955,7 +1976,127 @@ class Loop0Runner:
             )
             self.db.upsert_task(task)
             materialized.append(task)
+            if proposal.task_id_hint:
+                hint_to_task_id[proposal.task_id_hint] = task.task_id
+            hint_to_task_id[proposal.title] = task.task_id
+        for task, (spec, proposal) in zip(materialized, prepared, strict=False):
+            dependencies = [
+                hint_to_task_id[dependency]
+                for dependency in proposal.depends_on
+                if dependency in hint_to_task_id and hint_to_task_id[dependency] != task.task_id
+            ]
+            if dependencies or proposal.parallelizable or proposal.task_id_hint:
+                task.dependencies = dependencies
+                task.provenance = {
+                    **dict(task.provenance),
+                    "decomposition": {
+                        "task_id_hint": proposal.task_id_hint,
+                        "depends_on": list(proposal.depends_on),
+                        "parallelizable": proposal.parallelizable,
+                    },
+                }
+                self.db.upsert_task(task)
+        self._record_followup_decomposition(
+            candidate=candidate,
+            parent_task=parent_task,
+            materialized=materialized,
+            specs=[spec for spec, _ in prepared],
+        )
         return materialized
+
+    def _record_followup_decomposition(
+        self,
+        *,
+        candidate: Loop0TaskCandidate,
+        parent_task: TaskRecord,
+        materialized: list[TaskRecord],
+        specs: list[dict[str, Any]],
+    ) -> None:
+        if len(materialized) < 2:
+            return
+        dependency_edges = [
+            {"task_id": task.task_id, "depends_on": list(task.dependencies)}
+            for task in materialized
+            if task.dependencies
+        ]
+        if not dependency_edges and not any(bool(spec.get("parallelizable")) for spec in specs):
+            return
+        decomposition_artifact = ArtifactRecord(
+            artifact_type="task_decomposition",
+            title=f"Task decomposition: {candidate.title}",
+            description="Dependency-aware follow-up DAG derived from a completed message task.",
+            content_summary=json.dumps(
+                {
+                    "parent_task_id": parent_task.task_id,
+                    "candidate_key": candidate.key,
+                    "tasks": [task.model_dump(mode="json") for task in materialized],
+                    "dependency_edges": dependency_edges,
+                    "parallelizable_task_count": sum(1 for spec in specs if bool(spec.get("parallelizable"))),
+                },
+                indent=2,
+            ),
+            provenance={"task_id": parent_task.task_id, "source": "message_task_followup"},
+        )
+        self.db.upsert_artifact(decomposition_artifact)
+        procedure = ProcedureRecord(
+            procedure_id=f"draft-followup-{parent_task.task_id}",
+            title=f"Draft Follow-up Procedure: {candidate.title}",
+            description="Draft procedure candidate captured from a successful follow-up task decomposition.",
+            provenance={
+                "source": "message_task_followup",
+                "parent_task_id": parent_task.task_id,
+                "candidate_key": candidate.key,
+            },
+            lifecycle_state="draft",
+            install_state="proposed",
+            structure=ProcedureStructure(
+                entry_node_id=materialized[0].task_id,
+                nodes=[
+                    ProcedureTaskNode(
+                        node_id=task.task_id,
+                        task_title=task.title,
+                        description=task.description,
+                        kind="leaf",
+                        next_nodes=[
+                            downstream.task_id
+                            for downstream in materialized
+                            if task.task_id in set(downstream.dependencies)
+                        ],
+                        metadata={
+                            "priority": task.priority,
+                            "urgency": task.urgency,
+                            "risk": task.risk,
+                            "completion_policy": dict(task.completion_policy),
+                            "parallelizable": bool(
+                                dict(task.provenance or {}).get("decomposition", {}).get("parallelizable")
+                            ),
+                        },
+                    )
+                    for task in materialized
+                ],
+                metadata={
+                    "captured_from": "message_task_followup",
+                    "parent_task_id": parent_task.task_id,
+                    "dependency_edge_count": len(dependency_edges),
+                },
+            ),
+            success_contract={
+                "deliverables": ["bounded_subtask_dag", "draft_procedure_candidate"],
+            },
+            notes=["Captured from delegated follow-up decomposition for later evaluation."],
+        )
+        procedure_artifact = ArtifactRecord(
+            artifact_type="draft_procedure",
+            title=procedure.title,
+            description=procedure.description,
+            content_summary=procedure.model_dump_json(indent=2),
+            provenance={
+                "task_id": parent_task.task_id,
+                "source": "message_task_followup",
+                "decomposition_artifact_id": decomposition_artifact.artifact_id,
+            },
+        )
+        self.db.upsert_artifact(procedure_artifact)
 
     def _promote_followups_from_artifact(
         self,
