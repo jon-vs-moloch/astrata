@@ -248,6 +248,35 @@ def test_loop0_blocks_unproven_governance_surface_edits():
         assert "astrata/governance/constitution.py" in result["baseline_inspection"]["protected_paths"]
 
 
+def test_loop0_records_unauthorized_governance_drift():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "spec.md").write_text("# Spec\n")
+        (root / "astrata/governance").mkdir(parents=True, exist_ok=True)
+        target = root / "astrata/governance/constitution.py"
+        target.write_text('"""Constitution loading helpers."""\n')
+
+        settings = load_settings(root)
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        runner = Loop0Runner(settings=settings, db=db)
+        runner._record_governance_drift_if_any()  # noqa: SLF001
+
+        target.write_text('"""Constitution loading and parsing helpers."""\n')
+        drift = runner._record_governance_drift_if_any()  # noqa: SLF001
+
+        assert drift is not None
+        assert drift["status"] == "drifted"
+        artifact_types = {record["artifact_type"] for record in db.list_records("artifacts")}
+        assert "governance_drift_alert" in artifact_types
+        alerts = [
+            record
+            for record in db.list_records("communications")
+            if record.get("intent") == "governance_drift_alert"
+        ]
+        assert alerts
+
+
 def test_loop0_runner_unifies_pending_message_tasks():
     with TemporaryDirectory() as tmp:
         settings = load_settings(Path("/Users/jon/Projects/Astrata"))

@@ -17,7 +17,11 @@ from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
-from astrata.governance.policy import governance_change_is_authorized, protected_governance_paths
+from astrata.governance.policy import (
+    GovernanceDriftMonitor,
+    governance_change_is_authorized,
+    protected_governance_paths,
+)
 from astrata.loop0.planner import Loop0Planner, PlannerSnapshot
 from astrata.loop0.resolution import determine_task_resolution
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
@@ -163,6 +167,9 @@ class Loop0Runner:
         self.planner = Loop0Planner()
         self.prioritizer = WorkPrioritizer()
         self.governance: GovernanceBundle = load_governance_bundle(settings.paths.project_root)
+        self.governance_drift_monitor = GovernanceDriftMonitor(
+            settings.paths.data_dir / "governance_drift_state.json"
+        )
         self.worker_runtime = WorkerRuntime(settings=settings, db=db, registry=self.registry)
 
     def next_candidate(self) -> Loop0TaskCandidate | None:
@@ -1601,6 +1608,7 @@ class Loop0Runner:
         return "general"
 
     def run_once(self) -> dict[str, Any]:
+        self._record_governance_drift_if_any()
         assessment = self.next_candidate_assessment()
         if assessment is None:
             self.principal_lane.send(
@@ -1612,11 +1620,62 @@ class Loop0Runner:
             return {"status": "complete", "message": "No missing Loop 0 candidate paths found."}
         return self._execute_assessment(assessment)
 
+    def _record_governance_drift_if_any(self) -> dict[str, Any] | None:
+        drift = self.governance_drift_monitor.scan(self.settings.paths.project_root)
+        if drift.get("status") != "drifted":
+            return drift
+        newly_reported_paths = list(drift.get("newly_reported_paths") or [])
+        if not newly_reported_paths:
+            return drift
+        artifact = ArtifactRecord(
+            artifact_type="governance_drift_alert",
+            title="Protected governance drift detected",
+            description="Protected governance surfaces changed without approved principal provenance.",
+            content_summary=json.dumps(drift, indent=2),
+            provenance={"source": "governance_drift_monitor"},
+            status="broken",
+        )
+        self.db.upsert_artifact(artifact)
+        self.principal_lane.send(
+            sender="astrata.loop0",
+            kind="notice",
+            intent="governance_drift_alert",
+            payload={
+                "status": "drifted",
+                "drifted_paths": drift.get("drifted_paths") or [],
+                "newly_reported_paths": newly_reported_paths,
+                "artifact_id": artifact.artifact_id,
+                "message": "Protected governance surfaces changed without approved principal provenance.",
+            },
+            priority=9,
+            urgency=9,
+        )
+        return drift
+
+    def _approve_governance_baseline_if_authorized(
+        self,
+        *,
+        candidate: Loop0TaskCandidate,
+        implementation: dict[str, Any],
+    ) -> None:
+        if implementation.get("status") != "applied":
+            return
+        if not protected_governance_paths(list(candidate.expected_paths)):
+            return
+        provenance = dict(candidate.metadata or {}).get("provenance") or {}
+        if not governance_change_is_authorized(dict(provenance)):
+            return
+        self.governance_drift_monitor.approve_current(self.settings.paths.project_root)
+
     def _execute_assessment(self, assessment: Loop0CandidateAssessment) -> dict[str, Any]:
         candidate = assessment.candidate
         recommendation = self.recommend_next_step(assessment)
         coordination = recommendation.get("coordination") or self.coordinate_candidate(candidate)
         implementation = self._apply_candidate(candidate, coordination=coordination)
+        self._approve_governance_baseline_if_authorized(
+            candidate=candidate,
+            implementation=implementation,
+        )
         verification_preview = self._verification_result(candidate, implementation)
         task = self._task_record_for_candidate(
             candidate=candidate,
