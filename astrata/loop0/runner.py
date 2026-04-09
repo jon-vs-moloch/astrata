@@ -11,7 +11,7 @@ from typing import Any
 
 from astrata.config.settings import Settings
 from astrata.comms.intake import normalize_derived_task_proposal
-from astrata.comms.lanes import HandoffLane, OperatorMessageLane
+from astrata.comms.lanes import HandoffLane, PrincipalMessageLane
 from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
@@ -156,7 +156,7 @@ class Loop0Runner:
             health_store=health_store,
         )
         self.handoff_lane = HandoffLane()
-        self.operator_lane = OperatorMessageLane(db=self.db)
+        self.principal_lane = PrincipalMessageLane(db=self.db)
         self.planner = Loop0Planner()
         self.prioritizer = WorkPrioritizer()
         self.governance: GovernanceBundle = load_governance_bundle(settings.paths.project_root)
@@ -335,25 +335,25 @@ class Loop0Runner:
 
     def _reconcile_worker_results(self) -> list[TaskRecord]:
         reconciled: list[TaskRecord] = []
-        for message in self.operator_lane.list_messages(recipient="astrata", include_acknowledged=False):
+        for message in self.principal_lane.list_messages(recipient="astrata", include_acknowledged=False):
             if message.intent != "worker_delegation_result":
                 continue
             payload = dict(message.payload or {})
             task_id = str(payload.get("task_id") or "").strip()
             if not task_id:
-                self.operator_lane.acknowledge(message.communication_id)
+                self.principal_lane.acknowledge(message.communication_id)
                 continue
             task_payload = next(
                 (item for item in self.db.list_records("tasks") if str(item.get("task_id") or "").strip() == task_id),
                 None,
             )
             if not task_payload:
-                self.operator_lane.acknowledge(message.communication_id)
+                self.principal_lane.acknowledge(message.communication_id)
                 continue
             task = self._task_from_worker_result(task_payload, message_payload=payload)
             self.db.upsert_task(task)
             self._record_worker_completion_attempt(task=task, message_payload=payload)
-            self.operator_lane.acknowledge(message.communication_id)
+            self.principal_lane.acknowledge(message.communication_id)
             reconciled.append(task)
         return reconciled
 
@@ -365,7 +365,7 @@ class Loop0Runner:
     ) -> TaskRecord:
         payload = dict(task_payload)
         raw_content = str(message_payload.get("raw_content") or "")
-        operator_response = self._extract_operator_response(raw_content)
+        principal_response = self._extract_principal_response(raw_content)
         followup_tasks = self._extract_followup_tasks(raw_content, payload)
         derived_artifact = self._extract_message_artifact(
             raw_content,
@@ -380,9 +380,9 @@ class Loop0Runner:
             payload,
         )
         lane_sender, conversation_id = self._message_task_lane_context(payload)
-        notice = self.operator_lane.send(
+        notice = self.principal_lane.send(
             sender=lane_sender,
-            recipient="operator",
+            recipient="principal",
             conversation_id=conversation_id,
             kind="notice",
             intent="message_task_response",
@@ -391,7 +391,7 @@ class Loop0Runner:
                 "title": payload.get("title"),
                 "description": payload.get("description"),
                 "completion_policy": dict(payload.get("completion_policy") or {}),
-                "assistant_output": operator_response,
+                "assistant_output": principal_response,
                 "provider": message_payload.get("route", {}).get("provider"),
                 "model": message_payload.get("route", {}).get("model"),
                 "route": message_payload.get("route") or {},
@@ -431,7 +431,7 @@ class Loop0Runner:
                 implementation={
                     "followup_tasks": followup_tasks,
                     "derived_artifact": derived_artifact,
-                    "assistant_output": operator_response,
+                    "assistant_output": principal_response,
                 },
             )
         if str(message_payload.get("status") or "") == "applied":
@@ -467,12 +467,12 @@ class Loop0Runner:
                             "artifact_type": "task_resolution",
                             "title": f"Resolution for {payload.get('title') or payload.get('task_id')}",
                             "description": str(payload.get("description") or ""),
-                            "summary": resolution.reason,
+                        "summary": resolution.reason,
                             "confidence": resolution.confidence,
                             "findings": [resolution.kind],
                             "status": "degraded",
                         },
-                        "assistant_output": operator_response,
+                        "assistant_output": principal_response,
                     },
                 )
             self.db.upsert_artifact(
@@ -545,7 +545,7 @@ class Loop0Runner:
             },
             attempt_reason="worker delegation result reconciled by loop0",
             outcome="succeeded" if status == "applied" else ("blocked" if status == "blocked" else "failed"),
-            result_summary=self._extract_operator_response(raw_content) or "Worker result reconciled.",
+            result_summary=self._extract_principal_response(raw_content) or "Worker result reconciled.",
             failure_kind=None if status == "applied" else str(message_payload.get("detail") or "").strip() or status,
             degraded_reason=None if status == "applied" else str(message_payload.get("reason") or "").strip() or status,
             verification_status="passed" if status == "applied" else "uncertain",
@@ -984,6 +984,7 @@ class Loop0Runner:
             return True
         low_signal_phrases = {
             "hello",
+            "hello from principal",
             "hello from operator",
             "hi",
             "hey",
@@ -1206,7 +1207,7 @@ class Loop0Runner:
     def run_once(self) -> dict[str, Any]:
         assessment = self.next_candidate_assessment()
         if assessment is None:
-            self.operator_lane.send(
+            self.principal_lane.send(
                 sender="astrata.loop0",
                 kind="notice",
                 intent="loop0_status",
@@ -1399,7 +1400,7 @@ class Loop0Runner:
 
         self.db.upsert_verification(verification)
 
-        operator_message = self.operator_lane.send(
+        principal_message = self.principal_lane.send(
             sender="astrata.loop0",
             kind="status",
             intent="loop0_result",
@@ -1433,7 +1434,8 @@ class Loop0Runner:
             "followup_tasks": [followup.model_dump(mode="json") for followup in followup_tasks],
             "verification_review": review_artifact.model_dump(mode="json"),
             "verification": verification.model_dump(mode="json"),
-            "operator_message": operator_message.model_dump(mode="json"),
+            "principal_message": principal_message.model_dump(mode="json"),
+            "operator_message": principal_message.model_dump(mode="json"),
         }
 
     def run_steps(self, max_steps: int) -> dict[str, Any]:
@@ -1500,7 +1502,7 @@ class Loop0Runner:
     def _process_all_pending_worker_turns(self, *, limit_per_worker: int = 5) -> list[dict[str, Any]]:
         pending_by_worker: dict[str, int] = {}
         for payload in self.db.list_records("communications"):
-            if payload.get("channel") != self.operator_lane.channel:
+            if payload.get("channel") not in {self.principal_lane.channel, "operator"}:
                 continue
             if payload.get("intent") != "worker_delegation_request":
                 continue
@@ -1612,7 +1614,7 @@ class Loop0Runner:
                 return VerificationResult(
                     result="uncertain",
                     confidence=0.6,
-                    summary="Inbound task emitted an operator message, but the assistant lane did not complete the work path cleanly.",
+                    summary="Inbound task emitted an principal message, but the assistant lane did not complete the work path cleanly.",
                     evidence={"implementation": implementation},
                 )
             if status == "delegated" and implementation.get("delegated_via_worker"):
@@ -1774,12 +1776,12 @@ class Loop0Runner:
                 degraded_reason="provider:execution_failed",
             )
 
-        operator_response = self._extract_operator_response(response.content)
+        principal_response = self._extract_principal_response(response.content)
         followup_tasks = self._extract_followup_tasks(response.content, task_payload)
         derived_artifact = self._extract_message_artifact(response.content, candidate, task_payload)
-        notice = self.operator_lane.send(
+        notice = self.principal_lane.send(
             sender=lane_sender,
-            recipient="operator",
+            recipient="principal",
             conversation_id=conversation_id,
             kind="question" if completion_policy.get("type") == "request_clarification" else "notice",
             intent=(
@@ -1792,7 +1794,7 @@ class Loop0Runner:
                 "title": candidate.title,
                 "description": candidate.description,
                 "completion_policy": completion_policy,
-                "assistant_output": operator_response,
+                "assistant_output": principal_response,
                 "provider": response.provider,
                 "model": response.model,
                 "route": route,
@@ -1820,7 +1822,7 @@ class Loop0Runner:
             "provider_error": None,
             "attempt_count": 1,
             "baseline_inspection": baseline_inspection,
-            "assistant_output": operator_response,
+            "assistant_output": principal_response,
             "followup_tasks": followup_tasks,
             "derived_artifact": derived_artifact,
             "emitted_communication_id": notice.communication_id,
@@ -1876,10 +1878,10 @@ class Loop0Runner:
             completion_policy={"type": "worker_execution", "route_preferences": dict(task_payload.get("completion_policy", {}).get("route_preferences") or {})},
         )
         self.db.upsert_task(worker_task)
-        request = self.operator_lane.send(
+        request = self.principal_lane.send(
             sender="prime",
             recipient=worker_id,
-            conversation_id=self.operator_lane.default_conversation_id(worker_id),
+            conversation_id=self.principal_lane.default_conversation_id(worker_id),
             kind="delegation",
             intent="worker_delegation_request",
             payload={
@@ -1964,9 +1966,9 @@ class Loop0Runner:
         payload["baseline_inspection"] = baseline_inspection
         if result.status != "applied":
             return None
-        notice = self.operator_lane.send(
+        notice = self.principal_lane.send(
             sender=self._message_task_lane_context(task_payload)[0],
-            recipient="operator",
+            recipient="principal",
             conversation_id=self._message_task_lane_context(task_payload)[1],
             kind="notice",
             intent="message_task_execution_result",
@@ -2003,9 +2005,9 @@ class Loop0Runner:
     ) -> dict[str, Any]:
         lane_sender, conversation_id = self._message_task_lane_context(candidate.metadata or {})
         if completion_policy.get("type") == "request_clarification":
-            notice = self.operator_lane.send(
+            notice = self.principal_lane.send(
                 sender=lane_sender,
-                recipient="operator",
+                recipient="principal",
                 conversation_id=conversation_id,
                 kind="question",
                 intent="clarification_request",
@@ -2019,9 +2021,9 @@ class Loop0Runner:
                 related_task_ids=[task_id],
             )
         else:
-            notice = self.operator_lane.send(
+            notice = self.principal_lane.send(
                 sender=lane_sender,
-                recipient="operator",
+                recipient="principal",
                 conversation_id=conversation_id,
                 kind="notice",
                 intent="inbound_task_selected",
@@ -2030,7 +2032,7 @@ class Loop0Runner:
                     "title": candidate.title,
                     "description": candidate.description,
                     "completion_policy": completion_policy,
-                    "message": "Astrata selected this inbound task, but the assistant lane degraded and fell back to a bounded operator notice.",
+                    "message": "Astrata selected this inbound task, but the assistant lane degraded and fell back to a bounded principal notice.",
                     "provider_error": provider_error,
                 },
                 priority=candidate.priority,
@@ -2039,7 +2041,7 @@ class Loop0Runner:
             )
         return {
             "status": "applied",
-            "reason": "Unified queue selected an inbound task, but assistant execution degraded to a bounded operator-lane fallback.",
+            "reason": "Unified queue selected an inbound task, but assistant execution degraded to a bounded principal-lane fallback.",
             "written_paths": [],
             "generation_mode": "message_dispatch_fallback",
             "requested_route": route,
@@ -2062,7 +2064,7 @@ class Loop0Runner:
             lane = "astrata.assistant"
         conversation_id = str(provenance.get("source_conversation_id") or "").strip()
         if not conversation_id:
-            conversation_id = self.operator_lane.default_conversation_id(lane if lane in {"prime", "local"} else "system")
+            conversation_id = self.principal_lane.default_conversation_id(lane if lane in {"prime", "local"} else "system")
         return lane, conversation_id
 
     def _message_task_prompt(
@@ -2074,10 +2076,10 @@ class Loop0Runner:
         provenance = dict(task_payload.get("provenance") or {})
         success_criteria = dict(task_payload.get("success_criteria") or {})
         system_prompt = (
-            "You are Astrata handling an inbound operator-derived task. "
+            "You are Astrata handling an inbound principal-derived task. "
             "Respond concisely and usefully. Return strict JSON with keys "
-            "`operator_response`, `followup_tasks`, and `artifact`. "
-            "`operator_response` should be the bounded next response or question for the operator. "
+            "`principal_response`, `followup_tasks`, and `artifact`. "
+            "`principal_response` should be the bounded next response or question for the principal. "
             "`followup_tasks` should be a short list of at most 4 governed tasks only when genuinely helpful. "
             "Each follow-up task should include: title, description, priority, urgency, risk, completion_type, "
             "and, when clear, delta_kind (`input_vs_spec` or `spec_vs_reality`) plus delta_summary. "
@@ -2153,12 +2155,12 @@ class Loop0Runner:
             )
         return normalized
 
-    def _extract_operator_response(self, response_text: str) -> str:
+    def _extract_principal_response(self, response_text: str) -> str:
         parsed = _try_parse_json(response_text) or {}
-        operator_response = str(
-            parsed.get("operator_response") or parsed.get("response") or response_text
+        principal_response = str(
+            parsed.get("principal_response") or parsed.get("operator_response") or parsed.get("response") or response_text
         ).strip()
-        return operator_response or response_text.strip()
+        return principal_response or response_text.strip()
 
     def _extract_message_artifact(
         self,
@@ -2169,7 +2171,7 @@ class Loop0Runner:
         parsed = _try_parse_json(response_text) or {}
         artifact = parsed.get("artifact")
         completion_type = str(dict(task_payload.get("completion_policy") or {}).get("type") or "").strip()
-        operator_response = self._extract_operator_response(response_text)
+        principal_response = self._extract_principal_response(response_text)
         if not isinstance(artifact, dict) and completion_type not in {"review_or_rewrite_spec", "review_or_audit"}:
             return None
         artifact = dict(artifact or {})
@@ -2186,7 +2188,7 @@ class Loop0Runner:
             "artifact_type": self._artifact_type_for_completion_type(completion_type),
             "title": str(artifact.get("title") or f"{candidate.title} artifact"),
             "description": candidate.description,
-            "summary": str(artifact.get("summary") or operator_response),
+            "summary": str(artifact.get("summary") or principal_response),
             "confidence": normalized_confidence,
             "findings": findings[:3],
             "status": status,

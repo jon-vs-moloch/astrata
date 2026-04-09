@@ -159,13 +159,13 @@ def build_default_procedure_registry() -> ProcedureRegistry:
                 "Execute inbound bounded implementation work while preserving the safe-path option "
                 "for weaker actors and a shortcut path for stronger ones."
             ),
-            expected_outputs=["code_artifact", "operator_notice"],
+            expected_outputs=["code_artifact", "principal_notice"],
             default_variant_id="careful_execution",
             variants=[
                 ProcedureVariantTemplate(
                     variant_id="careful_execution",
                     title="Careful Execution",
-                    description="Conservative execution path for bounded operator-derived implementation tasks.",
+                    description="Conservative execution path for bounded principal-derived implementation tasks.",
                     min_capability="basic",
                     execution_mode="careful",
                     preferred_cli_tools=["kilocode", "gemini-cli"],

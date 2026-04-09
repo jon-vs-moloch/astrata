@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from astrata.comms.intake import MessageIntake, RequestSpec, materialize_inbound_message
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.config.settings import Settings
 from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
@@ -65,7 +65,7 @@ class LaneRuntime:
         self.db = db
         self.registry = registry or build_default_registry()
         self.intake = MessageIntake(project_root=settings.paths.project_root)
-        self.operator_lane = OperatorMessageLane(db=db)
+        self.principal_lane = PrincipalMessageLane(db=db)
         self.router = RouteChooser(self.registry)
         limits = default_source_limits()
         limits["codex"] = settings.runtime_limits.codex_requests_per_hour
@@ -90,11 +90,11 @@ class LaneRuntime:
             return []
         pending = [
             message
-            for message in self.operator_lane.list_messages(
+            for message in self.principal_lane.list_messages(
                 recipient=normalized_lane,
                 include_acknowledged=False,
             )
-            if message.sender == "operator" and message.status in {"queued", "delivered"}
+            if message.sender in {"principal", "operator"} and message.status in {"queued", "delivered"}
         ][: max(1, limit)]
         return [self.handle_message(message).as_dict() for message in pending]
 
@@ -133,7 +133,7 @@ class LaneRuntime:
         return self._handle_prime_reply(message)
 
     def _handle_prime_reply(self, message: CommunicationRecord) -> LaneTurnResult:
-        conversation_id = str(message.conversation_id or self.operator_lane.default_conversation_id("prime"))
+        conversation_id = str(message.conversation_id or self.principal_lane.default_conversation_id("prime"))
         envelope = ControllerEnvelope(
             controller_id="lane-runtime:prime",
             task_id=f"lane-turn:{message.communication_id}",
@@ -175,7 +175,7 @@ class LaneRuntime:
                 Message(
                     role="system",
                     content=(
-                        "You are Prime, the user-facing conversational interface for Astrata. "
+                        "You are Prime, the principal-facing conversational interface for Astrata. "
                         "Reply naturally and concisely. Preserve continuity with the ongoing conversation. "
                         "If the user is asking for execution or system changes, do not fabricate completion."
                     ),
@@ -201,7 +201,7 @@ class LaneRuntime:
         )
 
     def _handle_local_reply(self, message: CommunicationRecord) -> LaneTurnResult:
-        conversation_id = str(message.conversation_id or self.operator_lane.default_conversation_id("local"))
+        conversation_id = str(message.conversation_id or self.principal_lane.default_conversation_id("local"))
         try:
             reply = self.local_endpoint.chat(
                 content=str(message.payload.get("message") or ""),
@@ -237,10 +237,10 @@ class LaneRuntime:
         detail: str,
         coordination: dict[str, Any] | None = None,
     ) -> LaneTurnResult:
-        conversation_id = str(message.conversation_id or self.operator_lane.default_conversation_id(lane))
-        reply = self.operator_lane.send(
+        conversation_id = str(message.conversation_id or self.principal_lane.default_conversation_id(lane))
+        reply = self.principal_lane.send(
             sender=lane,
-            recipient="operator",
+            recipient="principal",
             conversation_id=conversation_id,
             kind="response",
             intent="lane_runtime_reply",
@@ -254,7 +254,7 @@ class LaneRuntime:
             related_task_ids=list(message.related_task_ids or []),
             related_attempt_ids=list(message.related_attempt_ids or []),
         )
-        self.operator_lane.resolve(message.communication_id)
+        self.principal_lane.resolve(message.communication_id)
         return LaneTurnResult(
             status="ok",
             lane=lane,

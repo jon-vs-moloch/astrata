@@ -1,7 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.storage.db import AstrataDatabase
 
 
@@ -9,12 +9,12 @@ def test_operator_message_lane_round_trip(tmp_path: Path | None = None):
     def _run(base: Path) -> None:
         db = AstrataDatabase(base / "astrata.db")
         db.initialize()
-        lane = OperatorMessageLane(db=db)
+        lane = PrincipalMessageLane(db=db)
         sent = lane.send(
-            sender="operator",
+            sender="principal",
             recipient="astrata",
             kind="request",
-            intent="operator_message",
+            intent="principal_message",
             payload={"message": "hello"},
         )
         inbox = lane.list_messages(recipient="astrata")

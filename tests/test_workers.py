@@ -1,7 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.config.settings import load_settings
 from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
 from astrata.providers.registry import ProviderRegistry
@@ -41,7 +41,7 @@ def test_worker_runtime_executes_delegated_message_task():
         settings = load_settings(root)
         db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
         db.initialize()
-        lane = OperatorMessageLane(db=db)
+        lane = PrincipalMessageLane(db=db)
         route = {"provider": "cli", "cli_tool": "kilocode", "model": None, "reason": "preferred_cli_tool"}
         worker_id = worker_id_for_route(route)
         inbound = lane.send(

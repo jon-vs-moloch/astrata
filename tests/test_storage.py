@@ -16,7 +16,7 @@ def test_database_initializes_and_accepts_records(tmp_path: Path | None = None):
         attempt = AttemptRecord(task_id=task.task_id, actor="test-runner")
         artifact = ArtifactRecord(artifact_type="note", title="Bootstrap artifact")
         verification = VerificationRecord(target_kind="task", target_id=task.task_id, verifier="pytest")
-        communication = CommunicationRecord(channel="operator", sender="operator", recipient="astrata")
+        communication = CommunicationRecord(channel="operator", sender="principal", recipient="astrata")
 
         db.upsert_task(task)
         db.upsert_attempt(attempt)

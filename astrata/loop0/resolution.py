@@ -42,14 +42,14 @@ def determine_task_resolution(
     if _looks_like_clarification_task(title=title, description=description):
         return TaskResolution(
             kind="clarify",
-            reason="The task reads like it needs operator clarification rather than more autonomous retries.",
+            reason="The task reads like it needs principal clarification rather than more autonomous retries.",
             confidence=0.85,
             next_status="blocked",
             followup_specs=[
                 {
                     "title": f"Clarify: {title or 'blocked task'}",
                     "description": (
-                        f"Ask the operator to clarify or decide the blocked work: {description or title}."
+                        f"Ask the principal to clarify or decide the blocked work: {description or title}."
                     ),
                     "priority": int(task_payload.get("priority") or 4),
                     "urgency": max(1, int(task_payload.get("urgency") or 0)),
@@ -141,7 +141,7 @@ def _looks_like_clarification_task(*, title: str, description: str) -> bool:
         "preference",
         "needs your input",
         "what should i",
-        "operator",
+        "principal",
     ]
     return any(hint in text for hint in hints)
 

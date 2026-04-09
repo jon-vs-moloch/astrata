@@ -1,7 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
 from astrata.config.settings import AstrataPaths, LocalRuntimeSettings, RuntimeLimits, Settings
 from astrata.local.strata_endpoint import StrataEndpointReply
@@ -78,13 +78,13 @@ def test_lane_runtime_replies_directly_in_conversation():
         settings = _settings(root)
         db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
         db.initialize()
-        lane = OperatorMessageLane(db=db)
+        lane = PrincipalMessageLane(db=db)
         inbound = lane.send(
-            sender="operator",
+            sender="principal",
             recipient="prime",
             conversation_id="lane:prime:default",
             kind="request",
-            intent="operator_message",
+            intent="principal_message",
             payload={"message": "Hello Prime"},
         )
         runtime = LaneRuntime(
@@ -110,13 +110,13 @@ def test_lane_runtime_materializes_work_for_execution_requests():
         settings = _settings(root)
         db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
         db.initialize()
-        lane = OperatorMessageLane(db=db)
+        lane = PrincipalMessageLane(db=db)
         inbound = lane.send(
-            sender="operator",
+            sender="principal",
             recipient="prime",
             conversation_id="lane:prime:default",
             kind="request",
-            intent="operator_message",
+            intent="principal_message",
             payload={"message": "Implement the intake path in intake.py and review the spec."},
         )
         runtime = LaneRuntime(
@@ -141,13 +141,13 @@ def test_lane_runtime_uses_local_endpoint_for_local_lane():
         settings = _settings(root)
         db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
         db.initialize()
-        lane = OperatorMessageLane(db=db)
+        lane = PrincipalMessageLane(db=db)
         inbound = lane.send(
-            sender="operator",
+            sender="principal",
             recipient="local",
             conversation_id="lane:local:default",
             kind="request",
-            intent="operator_message",
+            intent="principal_message",
             payload={"message": "What do you think?"},
         )
         runtime = LaneRuntime(

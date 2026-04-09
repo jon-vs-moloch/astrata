@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.config.settings import Settings
 from astrata.providers.base import CompletionRequest, Message
 from astrata.providers.registry import ProviderRegistry, build_default_registry
@@ -49,12 +49,12 @@ class WorkerRuntime:
         self.settings = settings
         self.db = db
         self.registry = registry or build_default_registry()
-        self.operator_lane = OperatorMessageLane(db=db)
+        self.principal_lane = PrincipalMessageLane(db=db)
 
     def process_pending(self, *, worker_id: str, limit: int = 5) -> list[dict[str, Any]]:
         pending = [
             message
-            for message in self.operator_lane.list_messages(
+            for message in self.principal_lane.list_messages(
                 recipient=worker_id,
                 include_acknowledged=False,
             )
@@ -149,10 +149,10 @@ class WorkerRuntime:
         detail: str,
         payload: dict[str, Any],
     ) -> WorkerDelegationResult:
-        result = self.operator_lane.send(
+        result = self.principal_lane.send(
             sender=worker_id,
             recipient="astrata",
-            conversation_id=str(message.conversation_id or self.operator_lane.default_conversation_id(worker_id)),
+            conversation_id=str(message.conversation_id or self.principal_lane.default_conversation_id(worker_id)),
             kind="result",
             intent="worker_delegation_result",
             payload={
@@ -164,7 +164,7 @@ class WorkerRuntime:
             related_task_ids=list(message.related_task_ids or []),
             related_attempt_ids=list(message.related_attempt_ids or []),
         )
-        self.operator_lane.resolve(message.communication_id)
+        self.principal_lane.resolve(message.communication_id)
         return WorkerDelegationResult(
             status="ok",
             worker_id=worker_id,
@@ -187,8 +187,8 @@ class WorkerRuntime:
                 role="system",
                 content=(
                     "You are a delegated Astrata worker. "
-                    "Return strict JSON with top-level keys `operator_response`, `followup_tasks`, and `artifact`. "
-                    "`operator_response` must be a concise message for the operator. "
+                    "Return strict JSON with top-level keys `principal_response`, `followup_tasks`, and `artifact`. "
+                    "`principal_response` must be a concise message for the principal. "
                     "`followup_tasks` should be an array of at most 4 concrete governed tasks only when genuinely helpful. "
                     "When a task needs decomposition, prefer multiple oneshottable leaf tasks with optional `task_id_hint`, "
                     "`depends_on`, `parallelizable`, and `route_preferences` fields rather than one oversized task. "

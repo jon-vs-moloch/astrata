@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.records.communications import CommunicationRecord
 from astrata.records.models import ArtifactRecord
 from astrata.records.models import TaskRecord
@@ -88,9 +88,9 @@ class MessageIntake:
         if request_spec.needs_clarification:
             return [
                 TaskProposal(
-                    title="Clarify inbound operator request",
+                    title="Clarify inbound principal request",
                     description=(
-                        "Ask a narrower follow-up question before creating execution work from the inbound operator message."
+                        "Ask a narrower follow-up question before creating execution work from the inbound principal message."
                     ),
                     priority=4,
                     urgency=3,
@@ -142,12 +142,12 @@ class MessageIntake:
                         title_prefix="Execute",
                     )
                 )
-            if "communication" in request_spec.domains or "operator" in request_spec.domains:
+            if "communication" in request_spec.domains or "principal" in request_spec.domains or "operator" in request_spec.domains:
                 proposals.append(
                     TaskProposal(
                         title="Review communication/task translation path",
                         description=(
-                            "Inspect whether the inbound operator request should also improve Astrata's communication-to-task intake path."
+                            "Inspect whether the inbound principal request should also improve Astrata's communication-to-task intake path."
                         ),
                         priority=4,
                         urgency=2,
@@ -281,7 +281,7 @@ def process_inbound_messages(
     recipient: str = "astrata",
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    lane = OperatorMessageLane(db=db)
+    lane = PrincipalMessageLane(db=db)
     intake = MessageIntake(project_root=project_root)
     messages = lane.list_messages(recipient=recipient, include_acknowledged=False)[: max(1, limit)]
     created_tasks = []
@@ -351,7 +351,7 @@ def materialize_inbound_message(
 def _summarize_message(message: str) -> str:
     collapsed = " ".join(message.split())
     if not collapsed:
-        return "Review the inbound operator message and determine the next bounded action."
+        return "Review the inbound principal message and determine the next bounded action."
     first_sentence = collapsed.split(".", 1)[0].strip()
     return first_sentence or collapsed[:160]
 
@@ -359,7 +359,7 @@ def _summarize_message(message: str) -> str:
 def _title_from_summary(summary: str) -> str:
     cleaned = summary.strip().rstrip(".")
     if not cleaned:
-        return "Process inbound operator request"
+        return "Process inbound principal request"
     if len(cleaned) <= 72:
         return cleaned
     return cleaned[:69].rstrip() + "..."
@@ -394,7 +394,7 @@ def _infer_delta(message: str, *, request_kind: str, summary: str) -> dict[str, 
     if request_kind == "spec_hardening":
         return {
             "delta_kind": "input_vs_spec",
-            "delta_summary": f"Bring governing docs into alignment with operator intent: {summary}",
+            "delta_summary": f"Bring governing docs into alignment with principal intent: {summary}",
         }
     if request_kind == "review" and any(token in lowered for token in spec_tokens):
         return {
@@ -410,7 +410,7 @@ def _infer_delta(message: str, *, request_kind: str, summary: str) -> dict[str, 
 def _classify_domains(message: str) -> list[str]:
     lowered = message.lower()
     domains: list[str] = []
-    if any(token in lowered for token in ("message", "inbox", "comms", "communication", "operator")):
+    if any(token in lowered for token in ("message", "inbox", "comms", "communication", "principal", "operator")):
         domains.append("communication")
     if any(token in lowered for token in ("task", "queue", "scheduler", "priority")):
         domains.append("tasking")
@@ -424,7 +424,7 @@ def _classify_domains(message: str) -> list[str]:
 def _task_fragments(message: str) -> list[str]:
     collapsed = " ".join(message.split())
     if not collapsed:
-        return ["Review the inbound operator message and determine the next bounded action."]
+        return ["Review the inbound principal message and determine the next bounded action."]
     parts = [
         part.strip(" ,.")
         for part in re.split(r"\b(?:and|then)\b|[.;]", collapsed, maxsplit=3)

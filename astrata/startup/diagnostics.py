@@ -12,7 +12,7 @@ import sys
 from typing import Any
 from urllib.parse import urlparse
 
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.config.settings import Settings, load_settings
 from astrata.local.backends.llama_cpp import LlamaCppBackend, LlamaCppLaunchConfig
 from astrata.local.hardware import probe_thermal_state
@@ -199,7 +199,7 @@ def run_startup_reflection(
     already_announced = prior_state.get("last_fingerprint") == fingerprint
     task_created = False
     message_sent = False
-    lane = OperatorMessageLane(db=db)
+    lane = PrincipalMessageLane(db=db)
 
     if report["issues"] and not already_announced:
         task = TaskRecord(

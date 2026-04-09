@@ -1,2 +1,1 @@
-"""Astrata user and operator surfaces."""
-
+"""Astrata user and principal surfaces."""

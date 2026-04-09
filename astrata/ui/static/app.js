@@ -209,8 +209,8 @@ function renderSummary(summary) {
   );
 
   renderList(
-    document.getElementById("operatorInbox"),
-    summary.communications.operator_inbox || [],
+    document.getElementById("principalInbox"),
+    summary.communications.principal_inbox || [],
     (message) => {
       const actions = [];
       if (message.status !== "acknowledged") {

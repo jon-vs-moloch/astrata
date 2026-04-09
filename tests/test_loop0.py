@@ -203,8 +203,8 @@ def test_loop0_runner_unifies_pending_message_tasks():
         db.initialize()
         inbound_task = {
             "task_id": "message-task-1",
-            "title": "Execute operator request",
-            "description": "Process the inbound operator request through the unified queue.",
+            "title": "Execute principal request",
+            "description": "Process the inbound principal request through the unified queue.",
             "priority": 8,
             "urgency": 4,
             "provenance": {"source": "message_intake", "source_communication_id": "msg-1"},
@@ -414,7 +414,7 @@ def test_loop0_runner_executes_file_shaped_message_task():
             TaskRecord(
                 task_id="message-task-file",
                 title="Execute: update intake.py",
-                description="Update intake.py to strengthen validation for inbound operator messages.",
+                description="Update intake.py to strengthen validation for inbound principal messages.",
                 priority=8,
                 urgency=4,
                 provenance={"source": "message_intake", "source_communication_id": "msg-2"},
@@ -459,7 +459,7 @@ def test_loop0_runner_allows_direct_variant_for_strong_file_execution_route():
             TaskRecord(
                 task_id="message-task-file-direct",
                 title="Execute: update intake.py directly",
-                description="Update intake.py to strengthen validation for inbound operator messages.",
+                description="Update intake.py to strengthen validation for inbound principal messages.",
                 priority=8,
                 urgency=4,
                 provenance={"source": "message_intake", "source_communication_id": "msg-4"},

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from astrata.comms.intake import process_inbound_messages
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
 from astrata.config.settings import Settings, load_settings
 from astrata.governance.documents import load_governance_bundle
@@ -42,7 +42,7 @@ class MessageDraft:
     message: str
     recipient: str = "prime"
     conversation_id: str = ""
-    intent: str = "operator_message"
+    intent: str = "principal_message"
     kind: str = "request"
 
 
@@ -64,11 +64,11 @@ class AstrataUIService:
         attempts = self._attempts(db)
         artifacts = self._artifacts(db)
         verifications = self._verifications(db)
-        operator_lane = OperatorMessageLane(db=db)
-        operator_messages = list(reversed(operator_lane.list_messages(recipient="operator")))[:8]
-        astrata_messages = list(reversed(operator_lane.list_messages(recipient="astrata")))[:8]
-        prime_messages = list(reversed(operator_lane.list_messages(recipient="prime")))[:8]
-        local_messages = list(reversed(operator_lane.list_messages(recipient="local")))[:8]
+        principal_lane = PrincipalMessageLane(db=db)
+        principal_messages = list(reversed(principal_lane.list_messages(recipient="principal")))[:8]
+        astrata_messages = list(reversed(principal_lane.list_messages(recipient="astrata")))[:8]
+        prime_messages = list(reversed(principal_lane.list_messages(recipient="prime")))[:8]
+        local_messages = list(reversed(principal_lane.list_messages(recipient="local")))[:8]
         default_route = None
         try:
             default_route = chooser.choose(priority=0, urgency=0, risk="moderate").__dict__
@@ -82,7 +82,7 @@ class AstrataUIService:
             "generated_at": _now_iso(),
             "product": {
                 "name": "Astrata",
-                "tagline": "local-first recursive operator harness",
+                "tagline": "local-first recursive principal harness",
             },
             "governance": {
                 "constitution_path": bundle.constitution.path,
@@ -108,17 +108,19 @@ class AstrataUIService:
                 "recent_attempts": [self._attempt_summary(attempt) for attempt in attempts[:8]],
             },
             "communications": {
-                "operator_inbox": [self._message_summary(message) for message in operator_messages],
+                "principal_inbox": [self._message_summary(message) for message in principal_messages],
+                "operator_inbox": [self._message_summary(message) for message in principal_messages],
                 "astrata_inbox": [self._message_summary(message) for message in astrata_messages],
                 "prime_inbox": [self._message_summary(message) for message in prime_messages],
                 "local_inbox": [self._message_summary(message) for message in local_messages],
                 "prime_conversation": [self._message_summary(message) for message in self.lane_conversation("prime", db=db)[-16:]],
                 "local_conversation": [self._message_summary(message) for message in self.lane_conversation("local", db=db)[-16:]],
                 "lane_counts": {
-                    "operator": self._lane_count(operator_lane, "operator"),
-                    "astrata": self._lane_count(operator_lane, "astrata"),
-                    "prime": self._lane_count(operator_lane, "prime"),
-                    "local": self._lane_count(operator_lane, "local"),
+                    "principal": self._lane_count(principal_lane, "principal"),
+                    "operator": self._lane_count(principal_lane, "principal"),
+                    "astrata": self._lane_count(principal_lane, "astrata"),
+                    "prime": self._lane_count(principal_lane, "prime"),
+                    "local": self._lane_count(principal_lane, "local"),
                 },
             },
             "artifacts": {
@@ -133,9 +135,9 @@ class AstrataUIService:
 
     def send_message(self, draft: MessageDraft) -> dict[str, Any]:
         db = self._db()
-        lane = OperatorMessageLane(db=db)
+        lane = PrincipalMessageLane(db=db)
         record = lane.send(
-            sender="operator",
+            sender="principal",
             recipient=draft.recipient,
             conversation_id=draft.conversation_id or lane.default_conversation_id(draft.recipient),
             kind=draft.kind,
@@ -175,7 +177,7 @@ class AstrataUIService:
         if not lane_name:
             return []
         db = db or self._db()
-        default_conversation_id = OperatorMessageLane(db=db).default_conversation_id(lane_name)
+        default_conversation_id = PrincipalMessageLane(db=db).default_conversation_id(lane_name)
         messages = []
         for record in self._communications(db):
             sender = str(record.sender or "").strip().lower()
@@ -193,7 +195,7 @@ class AstrataUIService:
 
     def acknowledge_message(self, communication_id: str) -> dict[str, Any]:
         db = self._db()
-        lane = OperatorMessageLane(db=db)
+        lane = PrincipalMessageLane(db=db)
         updated = lane.acknowledge(communication_id)
         if updated is None:
             return {"status": "not_found", "communication_id": communication_id}
@@ -399,7 +401,7 @@ class AstrataUIService:
             "detail": status.detail,
         }
 
-    def _lane_count(self, lane: OperatorMessageLane, recipient: str) -> int:
+    def _lane_count(self, lane: PrincipalMessageLane, recipient: str) -> int:
         return len(lane.list_messages(recipient=recipient))
 
     def _messages_for_task(self, db: AstrataDatabase, task_id: str) -> list[CommunicationRecord]:

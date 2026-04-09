@@ -69,8 +69,8 @@ def test_prioritizer_prefers_pending_message_task_over_planner_candidate():
         db.upsert_task(
             TaskRecord(
                 task_id="message-task-priority",
-                title="Execute operator request",
-                description="Process the inbound operator request through the unified queue.",
+                title="Execute principal request",
+                description="Process the inbound principal request through the unified queue.",
                 priority=8,
                 urgency=4,
                 provenance={"source": "message_intake", "source_communication_id": "msg-priority"},
@@ -245,7 +245,7 @@ def test_runner_exposes_system_change_metadata_for_file_task():
         task = TaskRecord(
             task_id="metadata-task",
             title="Execute: update intake.py",
-            description="Update intake.py to strengthen validation for inbound operator messages.",
+            description="Update intake.py to strengthen validation for inbound principal messages.",
             priority=5,
             urgency=3,
             provenance={"source": "message_intake", "source_communication_id": "msg-meta"},
@@ -331,8 +331,8 @@ def test_runner_marks_pending_task_likely_satisfied_when_sibling_completed():
         db.initialize()
         completed = TaskRecord(
             task_id="complete-sibling",
-            title="Execute operator request",
-            description="Process the inbound operator request through the unified queue.",
+            title="Execute principal request",
+            description="Process the inbound principal request through the unified queue.",
             priority=5,
             urgency=3,
             provenance={"source": "message_intake", "source_communication_id": "msg-shared"},
@@ -347,7 +347,7 @@ def test_runner_marks_pending_task_likely_satisfied_when_sibling_completed():
         pending = TaskRecord(
             task_id="pending-sibling",
             title="Review communication/task translation path",
-            description="Inspect whether the inbound operator request should also improve Astrata's communication-to-task intake path.",
+            description="Inspect whether the inbound principal request should also improve Astrata's communication-to-task intake path.",
             priority=4,
             urgency=2,
             provenance={"source": "message_intake", "source_communication_id": "msg-shared"},
@@ -377,8 +377,8 @@ def test_runner_does_not_mark_followup_task_satisfied_only_because_parent_messag
         db.initialize()
         completed = TaskRecord(
             task_id="complete-parent-message",
-            title="Execute operator request",
-            description="Process the inbound operator request through the unified queue.",
+            title="Execute principal request",
+            description="Process the inbound principal request through the unified queue.",
             priority=5,
             urgency=3,
             provenance={"source": "message_intake", "source_communication_id": "msg-parent"},
@@ -492,8 +492,8 @@ def test_reconcile_marks_pending_message_task_satisfied_when_answered():
         db.initialize()
         completed = TaskRecord(
             task_id="complete-sibling-2",
-            title="Execute operator request",
-            description="Process the inbound operator request through the unified queue.",
+            title="Execute principal request",
+            description="Process the inbound principal request through the unified queue.",
             priority=5,
             urgency=3,
             provenance={"source": "message_intake", "source_communication_id": "msg-shared-2"},
@@ -508,7 +508,7 @@ def test_reconcile_marks_pending_message_task_satisfied_when_answered():
         pending = TaskRecord(
             task_id="pending-sibling-2",
             title="Review communication/task translation path",
-            description="Inspect whether the inbound operator request should also improve Astrata's communication-to-task intake path.",
+            description="Inspect whether the inbound principal request should also improve Astrata's communication-to-task intake path.",
             priority=4,
             urgency=2,
             provenance={"source": "message_intake", "source_communication_id": "msg-shared-2"},

@@ -1,4 +1,4 @@
-"""Minimal durable lanes for controller handoffs and operator messages."""
+"""Minimal durable lanes for controller handoffs and principal messages."""
 
 from __future__ import annotations
 
@@ -66,10 +66,10 @@ class HandoffLane:
         )
 
 
-class OperatorMessageLane:
-    """Durable local inbox/outbox for operator-facing Astrata messages."""
+class PrincipalMessageLane:
+    """Durable local inbox/outbox for principal-facing Astrata messages."""
 
-    def __init__(self, *, db: AstrataDatabase, channel: str = "operator") -> None:
+    def __init__(self, *, db: AstrataDatabase, channel: str = "principal") -> None:
         self._db = db
         self.channel = channel
 
@@ -77,7 +77,7 @@ class OperatorMessageLane:
         self,
         *,
         sender: str,
-        recipient: str = "operator",
+        recipient: str = "principal",
         conversation_id: str = "",
         kind: str = "notice",
         intent: str = "",
@@ -88,7 +88,8 @@ class OperatorMessageLane:
         related_attempt_ids: list[str] | None = None,
     ) -> CommunicationRecord:
         record = CommunicationRecord(
-            conversation_id=conversation_id or self.default_conversation_id(recipient if sender == "operator" else sender),
+            conversation_id=conversation_id
+            or self.default_conversation_id(recipient if sender in {"principal", "operator"} else sender),
             channel=self.channel,
             kind=kind,
             sender=sender,
@@ -112,13 +113,19 @@ class OperatorMessageLane:
     def list_messages(
         self,
         *,
-        recipient: str = "operator",
+        recipient: str = "principal",
         include_acknowledged: bool = True,
     ) -> list[CommunicationRecord]:
+        channels = {self.channel}
+        if self.channel == "principal":
+            channels.add("operator")
+        recipients = {recipient}
+        if recipient == "principal":
+            recipients.add("operator")
         records = [
             CommunicationRecord(**payload)
             for payload in self._db.list_records("communications")
-            if payload.get("channel") == self.channel and payload.get("recipient") == recipient
+            if payload.get("channel") in channels and payload.get("recipient") in recipients
         ]
         if not include_acknowledged:
             records = [record for record in records if record.status not in {"acknowledged", "resolved"}]
@@ -139,10 +146,13 @@ class OperatorMessageLane:
         )
 
     def get_message(self, communication_id: str) -> CommunicationRecord | None:
+        channels = {self.channel}
+        if self.channel == "principal":
+            channels.add("operator")
         records = [
             CommunicationRecord(**payload)
             for payload in self._db.list_records("communications")
-            if payload.get("channel") == self.channel
+            if payload.get("channel") in channels
         ]
         for record in records:
             if record.communication_id != communication_id:
@@ -168,3 +178,7 @@ class OperatorMessageLane:
         )
         self._db.upsert_communication(updated)
         return updated
+
+
+# Backwards-compatible alias while older imports migrate.
+OperatorMessageLane = PrincipalMessageLane

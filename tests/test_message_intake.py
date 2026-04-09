@@ -11,9 +11,9 @@ def test_message_intake_builds_request_spec_and_task():
     message = CommunicationRecord(
         channel="operator",
         kind="request",
-        sender="operator",
+        sender="principal",
         recipient="astrata",
-        intent="operator_message",
+        intent="principal_message",
         payload={"message": "Please strengthen the execution runner so it can run bounded commands."},
     )
     request_spec = intake.build_request_spec(message)
@@ -35,9 +35,9 @@ def test_message_intake_classifies_spec_request_and_proposes_multiple_tasks():
     message = CommunicationRecord(
         channel="operator",
         kind="request",
-        sender="operator",
+        sender="principal",
         recipient="astrata",
-        intent="operator_message",
+        intent="principal_message",
         payload={"message": "Review the spec and strengthen the operator inbox intake path."},
     )
     request_spec = intake.build_request_spec(message)
@@ -56,9 +56,9 @@ def test_process_inbound_messages_acknowledges_and_materializes_tasks():
             CommunicationRecord(
                 channel="operator",
                 kind="request",
-                sender="operator",
+                sender="principal",
                 recipient="astrata",
-                intent="operator_message",
+                intent="principal_message",
                 payload={"message": "Build the inbox bridge and review the spec."},
             )
         )

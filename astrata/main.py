@@ -9,7 +9,7 @@ import sys
 import urllib.request
 
 from astrata.comms.intake import process_inbound_messages
-from astrata.comms.lanes import OperatorMessageLane
+from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
 from astrata.config.secrets import SecretStore
 from astrata.config.settings import load_settings
@@ -1049,9 +1049,9 @@ def _cmd_comms_send(recipient: str, intent: str, message: str, kind: str, conver
     settings = load_settings()
     db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
     db.initialize()
-    lane = OperatorMessageLane(db=db)
+    lane = PrincipalMessageLane(db=db)
     record = lane.send(
-        sender="operator",
+        sender="principal",
         recipient=recipient,
         conversation_id=conversation_id or lane.default_conversation_id(recipient),
         kind=kind,
@@ -1066,7 +1066,7 @@ def _cmd_comms_inbox(recipient: str, unread_only: bool) -> int:
     settings = load_settings()
     db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
     db.initialize()
-    lane = OperatorMessageLane(db=db)
+    lane = PrincipalMessageLane(db=db)
     messages = lane.list_messages(recipient=recipient, include_acknowledged=not unread_only)
     print(json.dumps([message.model_dump(mode="json") for message in messages], indent=2))
     return 0
@@ -1076,7 +1076,7 @@ def _cmd_comms_ack(communication_id: str) -> int:
     settings = load_settings()
     db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
     db.initialize()
-    lane = OperatorMessageLane(db=db)
+    lane = PrincipalMessageLane(db=db)
     message = lane.acknowledge(communication_id)
     payload = {"status": "not_found", "communication_id": communication_id} if message is None else message.model_dump(mode="json")
     print(json.dumps(payload, indent=2))
@@ -1105,14 +1105,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("loop0-next", help="Show the next bounded Loop 0 implementation candidate.")
     loop0_run = sub.add_parser("loop0-run", help="Run one or more Loop 0 planning/recording cycles.")
     loop0_run.add_argument("--steps", type=int, default=1, help="Number of Loop 0 steps to attempt.")
-    comms_send = sub.add_parser("comms-send", help="Send a durable operator message into Astrata.")
+    comms_send = sub.add_parser("comms-send", help="Send a durable principal message into Astrata.")
     comms_send.add_argument("message", help="Message payload to send.")
     comms_send.add_argument("--recipient", default="prime", help="Recipient identity.")
     comms_send.add_argument("--conversation-id", default="", help="Optional durable conversation/thread id.")
-    comms_send.add_argument("--intent", default="operator_message", help="Intent label for the message.")
+    comms_send.add_argument("--intent", default="principal_message", help="Intent label for the message.")
     comms_send.add_argument("--kind", default="request", help="Message kind.")
     comms_inbox = sub.add_parser("comms-inbox", help="Read durable messages for a recipient.")
-    comms_inbox.add_argument("--recipient", default="operator", help="Recipient inbox to inspect.")
+    comms_inbox.add_argument("--recipient", default="principal", help="Recipient inbox to inspect.")
     comms_inbox.add_argument("--unread-only", action="store_true", help="Hide acknowledged/resolved messages.")
     comms_ack = sub.add_parser("comms-ack", help="Acknowledge a durable message.")
     comms_ack.add_argument("communication_id", help="Message ID to acknowledge.")

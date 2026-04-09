@@ -23,7 +23,7 @@ class UISendMessageRequest(BaseModel):
     message: str = Field(min_length=1)
     recipient: str = "prime"
     conversation_id: str = ""
-    intent: str = "operator_message"
+    intent: str = "principal_message"
     kind: str = "request"
 
 
