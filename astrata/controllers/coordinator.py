@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from astrata.controllers.base import ControllerDecision, ControllerEnvelope
+from astrata.routing.prime_policy import classify_work_policy, route_uses_prime
 from astrata.routing.advisor import RoutePerformanceAdvisor
 from astrata.routing.policy import ExecutionRoute, RouteChooser
 from astrata.scheduling.quota import QuotaPolicy
@@ -45,6 +46,15 @@ class CoordinatorController:
             if str(item).strip()
         )
         task_class = str(envelope.metadata.get("task_class") or "general").strip() or "general"
+        work_policy = classify_work_policy(
+            task_class=task_class,
+            risk=envelope.risk,
+            metadata={
+                **dict(envelope.metadata),
+                "priority": envelope.priority,
+                "urgency": envelope.urgency,
+            },
+        )
         if self._route_advisor is not None and not preferred_providers and not preferred_cli_tools:
             advice = self._route_advisor.advise(task_class=task_class)
             if envelope.risk in {"high", "critical"} or advice.preferred_providers != ("codex",):
@@ -54,7 +64,7 @@ class CoordinatorController:
         if (
             not require_prime_route
             and envelope.risk not in {"high", "critical"}
-            and task_class in {"coding", "general", "review"}
+            and task_class in {"coding", "general", "review", "verification", "audit", "maintenance"}
             and "codex" not in preferred_providers
         ):
             avoided_providers = tuple(dict.fromkeys([*avoided_providers, "codex"]))
@@ -81,15 +91,41 @@ class CoordinatorController:
                 prefer_local=False,
                 preferred_model=preferred_model,
             )
-        decision = self._decision_for_route(envelope, route)
+        decision = self._decision_for_route(envelope, route, work_policy=work_policy)
         return decision, route
 
     def _decision_for_route(
         self,
         envelope: ControllerEnvelope,
         route: ExecutionRoute,
+        *,
+        work_policy: dict[str, Any],
     ) -> ControllerDecision:
         quota = self._quota_policy.assess(route.__dict__)
+        followup_actions: list[dict[str, Any]] = []
+        if work_policy.get("consensus_eligible"):
+            followup_actions.append(
+                {
+                    "type": "consensus_approval_eligible",
+                    "required_reviews": 2,
+                    "reason": "Low-risk bounded review/audit work may be settled by competent non-prime workers before Prime is consulted.",
+                }
+            )
+        if work_policy.get("batchable"):
+            followup_actions.append(
+                {
+                    "type": "batch_if_non_urgent",
+                    "task_class": work_policy.get("task_class"),
+                    "reason": "This low-risk work is eligible for batch handling instead of immediate Prime attention.",
+                }
+            )
+        if route_uses_prime(route.__dict__) and (work_policy.get("consensus_eligible") or work_policy.get("cheap_first")):
+            followup_actions.append(
+                {
+                    "type": "prime_usage_review",
+                    "reason": "Prime was selected for work that should be reviewed for cheaper viable routing.",
+                }
+            )
         if quota.allowed:
             return ControllerDecision(
                 status="accepted",
@@ -98,7 +134,8 @@ class CoordinatorController:
                     {
                         "type": "route_selected",
                         "route": route.__dict__,
-                    }
+                    },
+                    *followup_actions,
                 ],
             )
         source = quota.active_window.get("source") if quota.active_window else None
@@ -124,6 +161,7 @@ class CoordinatorController:
                         "route": route.__dict__,
                         "task_id": envelope.task_id,
                     },
+                    *followup_actions,
                 ],
             )
         return ControllerDecision(
@@ -133,6 +171,7 @@ class CoordinatorController:
                 {
                     "type": "retry_after",
                     "next_allowed_at": quota.next_allowed_at,
-                }
+                },
+                *followup_actions,
             ],
         )

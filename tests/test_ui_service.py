@@ -131,6 +131,30 @@ def test_ui_service_snapshot_reports_inference_spend():
                 },
             )
         )
+        db.upsert_task(
+            TaskRecord(
+                task_id="review-task-1",
+                title="Review route",
+                description="This review should ideally stay off Prime.",
+                status="complete",
+                risk="low",
+                provenance={"task_class": "review"},
+                completion_policy={"type": "review_or_audit"},
+            )
+        )
+        db.upsert_task(
+            TaskRecord(
+                task_id="pending-batch-1",
+                title="Batch me later",
+                description="Low-risk pending maintenance that should be batchable.",
+                status="pending",
+                risk="low",
+                priority=2,
+                urgency=2,
+                provenance={"task_class": "maintenance"},
+                completion_policy={"type": "respond_or_execute"},
+            )
+        )
         db.upsert_attempt(
             AttemptRecord(
                 attempt_id="attempt-provider-1",
@@ -149,9 +173,34 @@ def test_ui_service_snapshot_reports_inference_spend():
                 ended_at="2026-04-09T00:05:00+00:00",
             )
         )
+        db.upsert_attempt(
+            AttemptRecord(
+                attempt_id="attempt-prime-1",
+                task_id="review-task-1",
+                actor="loop0:codex",
+                outcome="succeeded",
+                result_summary="Prime handled a review task.",
+                verification_status="passed",
+                resource_usage={
+                    "implementation": {
+                        "generation_mode": "provider",
+                        "resolved_route": {"provider": "codex", "model": "gpt-5.4"},
+                    }
+                },
+                started_at="2026-04-09T00:10:00+00:00",
+                ended_at="2026-04-09T00:11:00+00:00",
+            )
+        )
         service = AstrataUIService(settings=settings)
         snapshot = service.snapshot()
-        assert snapshot["inference"]["spent_attempts"] == 1
+        assert snapshot["inference"]["spent_attempts"] == 2
         assert snapshot["inference"]["spent_by_model"]["gemini-2.5-flash"] == 1
+        assert snapshot["inference"]["spent_by_task_class"]["review"] == 1
         assert snapshot["inference"]["worker_statuses"]["working"] == 1
+        assert snapshot["inference"]["prime_spend_attempts"] == 1
+        assert snapshot["inference"]["avoidable_prime_attempts"] == 1
+        assert snapshot["inference"]["prime_review_attempts"] == 1
+        assert snapshot["inference"]["prime_consensus_misses"] == 1
+        assert snapshot["inference"]["batchable_pending_tasks"] == 1
+        assert snapshot["inference"]["avoidable_prime_examples"][0]["task_id"] == "review-task-1"
         assert snapshot["inference"]["quota_snapshot_count"] >= 1

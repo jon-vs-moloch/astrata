@@ -174,3 +174,36 @@ def test_coordinator_keeps_review_work_off_codex_when_cli_is_available(tmp_path:
         return
     with TemporaryDirectory() as tmp:
         _run(Path(tmp))
+
+
+def test_coordinator_marks_review_work_as_consensus_eligible(tmp_path: Path | None = None):
+    def _run(base: Path) -> None:
+        db = AstrataDatabase(base / "quota.db")
+        db.initialize()
+        registry = ProviderRegistry({"codex": _QuotaProvider(), "cli": _CliQuotaProvider()})
+        policy = QuotaPolicy(db=db, limits_per_source={"codex": 12, "cli:kilocode": 200}, registry=registry)
+        coordinator = CoordinatorController(router=RouteChooser(registry), quota_policy=policy)
+        decision, route = coordinator.coordinate(
+            ControllerEnvelope(
+                controller_id="prime",
+                task_id="task-review-2",
+                priority=3,
+                urgency=2,
+                risk="low",
+                metadata={
+                    "task_class": "review",
+                    "completion_type": "review_or_audit",
+                },
+            )
+        )
+        assert decision.status == "accepted"
+        assert route.provider == "cli"
+        actions = {action["type"]: action for action in decision.followup_actions}
+        assert "consensus_approval_eligible" in actions
+        assert "batch_if_non_urgent" in actions
+
+    if tmp_path is not None:
+        _run(tmp_path)
+        return
+    with TemporaryDirectory() as tmp:
+        _run(Path(tmp))
