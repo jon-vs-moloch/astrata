@@ -3,6 +3,7 @@ from pathlib import Path
 from astrata.providers.base import CompletionResponse, Provider
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
 from astrata.procedures.health import RouteHealthStore
+from astrata.procedures.registry import build_default_procedure_registry, infer_actor_capability
 from astrata.providers.registry import ProviderRegistry
 from astrata.routing.policy import RouteChooser
 
@@ -108,3 +109,20 @@ def test_bounded_file_generation_procedure_honors_preferred_provider(tmp_path: P
     assert result.status == "applied"
     assert result.generation_mode == "provider"
     assert result.requested_route["provider"] == "google"
+
+
+def test_procedure_registry_falls_back_to_careful_variant_for_basic_actor():
+    registry = build_default_procedure_registry()
+    resolved = registry.resolve(
+        "loop0-bounded-file-generation",
+        actor_capability="basic",
+        requested_variant_id="direct_patch",
+    )
+    assert resolved.variant_id == "careful_patch"
+    assert resolved.fallback_from_variant_id == "direct_patch"
+
+
+def test_infer_actor_capability_distinguishes_shortcut_eligible_routes():
+    assert infer_actor_capability(provider="codex") == "expert"
+    assert infer_actor_capability(provider="google") == "strong"
+    assert infer_actor_capability(provider="cli", cli_tool="kilocode") == "basic"

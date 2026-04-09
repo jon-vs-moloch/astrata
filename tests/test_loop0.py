@@ -117,6 +117,18 @@ class _ArtifactOnlyCliProvider(_CheapCliProvider):
         )
 
 
+class _FileCodexProvider(_DeferredCodexProvider):
+    def complete(self, request: CompletionRequest) -> CompletionResponse:
+        rendered = "\n".join(message.content or "" for message in request.messages)
+        if "'files'" in rendered or '"files"' in rendered:
+            return CompletionResponse(
+                provider="codex",
+                model="gpt-5.4",
+                content='{"files":{"astrata/comms/intake.py":"# direct\\n"}}',
+            )
+        return super().complete(request)
+
+
 def test_loop0_runner_records_coordination_deferral():
     settings = load_settings(Path("/Users/jon/Projects/Astrata"))
     db = AstrataDatabase(settings.paths.data_dir / "test-loop0-coordinator.db")
@@ -347,9 +359,52 @@ def test_loop0_runner_executes_file_shaped_message_task():
         assert result["status"] == "ok"
         implementation = result["attempt"]["resource_usage"]["implementation"]
         assert implementation["execution_track"] == "bounded_file_generation"
+        assert implementation["procedure_variant_id"] == "careful_execution"
         assert "astrata/comms/intake.py" in implementation["written_paths"]
         assert (root / "astrata" / "comms" / "intake.py").read_text(encoding="utf-8") == "# strengthened\n"
         assert result["verification"]["result"] == "pass"
+
+
+def test_loop0_runner_allows_direct_variant_for_strong_file_execution_route():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "astrata" / "comms").mkdir(parents=True, exist_ok=True)
+        (root / "astrata" / "comms" / "intake.py").write_text("# original\n", encoding="utf-8")
+        settings = load_settings(root)
+        db = AstrataDatabase(Path(tmp) / ".astrata" / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        db.upsert_task(
+            TaskRecord(
+                task_id="message-task-file-direct",
+                title="Execute: update intake.py directly",
+                description="Update intake.py to strengthen validation for inbound operator messages.",
+                priority=8,
+                urgency=4,
+                provenance={"source": "message_intake", "source_communication_id": "msg-4"},
+                permissions={},
+                risk="low",
+                status="pending",
+                success_criteria={"message_addressed": True},
+                completion_policy={"type": "respond_or_execute"},
+                created_at="2026-04-08T00:00:00+00:00",
+                updated_at="2026-04-08T00:00:00+00:00",
+            )
+        )
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _FileCodexProvider()}),
+        )
+        result = runner.run_once()
+        assert result["status"] == "ok"
+        implementation = result["attempt"]["resource_usage"]["implementation"]
+        assert implementation["execution_track"] == "bounded_file_generation"
+        assert implementation["procedure_variant_id"] == "direct_execution"
+        assert implementation["actor_capability"] == "expert"
+        assert implementation["procedure_metadata"]["shortcut_allowed"] is True
+        assert (root / "astrata" / "comms" / "intake.py").read_text(encoding="utf-8") == "# direct\n"
 
 
 def test_loop0_runner_promotes_artifact_findings_into_followup_tasks():

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from astrata.providers.base import CompletionRequest, Message
 from astrata.procedures.health import RouteHealthStore
+from astrata.procedures.registry import ProcedureCapability
 from astrata.providers.registry import ProviderRegistry
 from astrata.routing.policy import RouteChooser
 from astrata.scheduling.quota import QuotaPolicy
@@ -18,11 +19,14 @@ from astrata.scheduling.quota import QuotaPolicy
 
 class ProcedureExecutionRequest(BaseModel):
     procedure_id: str
+    procedure_variant_id: str | None = None
     title: str
     description: str
     expected_paths: list[str]
     available_docs: list[str] = Field(default_factory=list)
     inspection: dict[str, Any] = Field(default_factory=dict)
+    actor_capability: ProcedureCapability = "basic"
+    execution_mode: str = "careful"
     risk: str = "low"
     priority: int = 0
     urgency: int = 0
@@ -30,11 +34,15 @@ class ProcedureExecutionRequest(BaseModel):
     avoided_providers: list[str] = Field(default_factory=list)
     preferred_cli_tool: str | None = None
     avoided_cli_tools: list[str] = Field(default_factory=list)
+    procedure_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProcedureExecutionResult(BaseModel):
     status: str
     reason: str
+    procedure_id: str
+    procedure_variant_id: str | None = None
+    actor_capability: ProcedureCapability = "basic"
     written_paths: list[str] = Field(default_factory=list)
     generation_mode: str = "fallback"
     requested_route: dict[str, Any] = Field(default_factory=dict)
@@ -44,6 +52,7 @@ class ProcedureExecutionResult(BaseModel):
     degraded_reason: str | None = None
     provider_error: str | None = None
     attempt_count: int = 0
+    procedure_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class BoundedFileGenerationProcedure:
@@ -135,6 +144,9 @@ class BoundedFileGenerationProcedure:
             return ProcedureExecutionResult(
                 status="unsupported",
                 reason="No generated files were available for this procedure.",
+                procedure_id=request.procedure_id,
+                procedure_variant_id=request.procedure_variant_id,
+                actor_capability=request.actor_capability,
                 generation_mode="none",
                 requested_route=route_dict,
                 resolved_route={},
@@ -143,6 +155,7 @@ class BoundedFileGenerationProcedure:
                 degraded_reason=degraded_reason,
                 provider_error=provider_error,
                 attempt_count=attempt_count,
+                procedure_metadata=dict(request.procedure_metadata),
             )
 
         written_paths: list[str] = []
@@ -157,6 +170,9 @@ class BoundedFileGenerationProcedure:
         return ProcedureExecutionResult(
             status="applied" if written_paths else "unsupported",
             reason="Procedure generated and wrote bounded file outputs." if written_paths else "No expected paths were written.",
+            procedure_id=request.procedure_id,
+            procedure_variant_id=request.procedure_variant_id,
+            actor_capability=request.actor_capability,
             written_paths=written_paths,
             generation_mode=generation_mode,
             requested_route=route_dict,
@@ -166,6 +182,7 @@ class BoundedFileGenerationProcedure:
             degraded_reason=degraded_reason,
             provider_error=provider_error,
             attempt_count=attempt_count,
+            procedure_metadata=dict(request.procedure_metadata),
         )
 
     def _preflight_provider(self, provider: Any, route: dict[str, Any]) -> dict[str, Any]:
@@ -204,7 +221,9 @@ class BoundedFileGenerationProcedure:
                         content=(
                             "Return strict JSON with a single top-level key 'files'. "
                             "Its value must be an object mapping expected relative paths to full file contents. "
-                            "Do not include any paths outside the supplied expected_paths."
+                            "Do not include any paths outside the supplied expected_paths. "
+                            "If the request says shortcut execution is allowed, you may take the most direct bounded route. "
+                            "Otherwise prefer the careful, legible path."
                         ),
                     ),
                     Message(

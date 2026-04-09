@@ -19,6 +19,11 @@ from astrata.governance.documents import GovernanceBundle, load_governance_bundl
 from astrata.loop0.planner import Loop0Planner, PlannerSnapshot
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
 from astrata.procedures.health import RouteHealthStore
+from astrata.procedures.registry import (
+    ResolvedProcedure,
+    build_default_procedure_registry,
+    infer_actor_capability,
+)
 from astrata.providers.base import CompletionRequest, Message
 from astrata.providers.registry import ProviderRegistry, build_default_registry
 from astrata.records.handoffs import HandoffRecord
@@ -118,6 +123,7 @@ class Loop0Runner:
         self.settings = settings
         self.db = db
         self.registry = registry or build_default_registry()
+        self.procedure_registry = build_default_procedure_registry()
         self.router = RouteChooser(self.registry)
         limits = default_source_limits()
         limits["codex"] = settings.runtime_limits.codex_requests_per_hour
@@ -1292,35 +1298,20 @@ class Loop0Runner:
             }
         if candidate.strategy == "message_task":
             return self._apply_message_task(candidate, route=route)
-        request = ProcedureExecutionRequest(
-            procedure_id="loop0-bounded-file-generation",
-            title=candidate.title,
-            description=candidate.description,
-            expected_paths=list(candidate.expected_paths),
-            available_docs=list(self.governance.planning_docs.keys()),
-            inspection=inspect_expected_paths(
-                self.settings.paths.project_root,
-                list(candidate.expected_paths),
-            ),
-            risk=candidate.risk,
-            priority=candidate.priority,
-            urgency=candidate.urgency,
-            preferred_provider=self._preferred_provider_for_strategy(candidate),
-            avoided_providers=self._avoided_providers_for_strategy(candidate),
-            preferred_cli_tool=self._preferred_cli_tool_for_strategy(candidate),
-            avoided_cli_tools=self._avoided_cli_tools_for_strategy(candidate),
-        )
-        if route:
-            request = request.model_copy(
-                update={
-                    "preferred_provider": str(route.get("provider") or request.preferred_provider or "").strip() or request.preferred_provider,
-                    "preferred_cli_tool": str(route.get("cli_tool") or request.preferred_cli_tool or "").strip() or request.preferred_cli_tool,
-                }
-            )
         baseline_inspection = (
             inspect_weak_expected_paths(self.settings.paths.project_root, list(candidate.expected_paths))
             if candidate.strategy == "strengthen"
             else inspect_expected_paths(self.settings.paths.project_root, list(candidate.expected_paths))
+        )
+        request = self._procedure_request_for_candidate(
+            procedure_id="loop0-bounded-file-generation",
+            candidate=candidate,
+            route=route,
+            inspection=inspect_expected_paths(
+                self.settings.paths.project_root,
+                list(candidate.expected_paths),
+            ),
+            expected_paths=list(candidate.expected_paths),
         )
         result = self.procedures.execute(
             project_root=self.settings.paths.project_root,
@@ -1328,7 +1319,7 @@ class Loop0Runner:
             fallback_builder=lambda procedure_request: self._candidate_implementations().get(
                 candidate.key, {}
             ),
-            force_fallback_only=(candidate.strategy == "fallback_only"),
+            force_fallback_only=bool(request.procedure_metadata.get("force_fallback_only")),
         )
         payload = result.model_dump(mode="json")
         payload["baseline_inspection"] = baseline_inspection
@@ -1454,24 +1445,18 @@ class Loop0Runner:
         expected_paths = self._infer_expected_paths_for_message_task(candidate)
         if not expected_paths:
             return None
-        request = ProcedureExecutionRequest(
+        request = self._procedure_request_for_candidate(
             procedure_id="message-task-bounded-file-generation",
-            title=candidate.title,
-            description=candidate.description,
-            expected_paths=expected_paths,
-            available_docs=list(self.governance.planning_docs.keys()),
+            candidate=candidate,
+            route=route,
             inspection={"task_record": task_payload, "inferred_expected_paths": expected_paths},
-            risk=candidate.risk,
-            priority=candidate.priority,
-            urgency=candidate.urgency,
-            preferred_provider=str(route.get("provider") or "").strip() or None,
-            preferred_cli_tool=str(route.get("cli_tool") or "").strip() or None,
+            expected_paths=expected_paths,
         )
         result = self.procedures.execute(
             project_root=self.settings.paths.project_root,
             request=request,
             fallback_builder=None,
-            force_fallback_only=False,
+            force_fallback_only=bool(request.procedure_metadata.get("force_fallback_only")),
         )
         payload = result.model_dump(mode="json")
         payload["baseline_inspection"] = baseline_inspection
@@ -1905,6 +1890,104 @@ class Loop0Runner:
             cli_tool = str(requested_route.get("cli_tool") or "").strip()
             return [cli_tool] if cli_tool else []
         return []
+
+    def _procedure_request_for_candidate(
+        self,
+        *,
+        procedure_id: str,
+        candidate: Loop0TaskCandidate,
+        route: dict[str, Any],
+        inspection: dict[str, Any],
+        expected_paths: list[str],
+    ) -> ProcedureExecutionRequest:
+        resolved = self._resolve_procedure_for_candidate(
+            procedure_id=procedure_id,
+            candidate=candidate,
+            route=route,
+        )
+        preferred_provider = str(route.get("provider") or "").strip() or None
+        preferred_cli_tool = str(route.get("cli_tool") or "").strip() or None
+        if not preferred_provider:
+            for provider in resolved.variant.preferred_providers:
+                if self.registry.get_provider(provider):
+                    preferred_provider = provider
+                    break
+        if not preferred_cli_tool:
+            available_cli_tools = set(self.registry.configured_cli_tools())
+            for cli_tool in resolved.variant.preferred_cli_tools:
+                if cli_tool in available_cli_tools:
+                    preferred_cli_tool = cli_tool
+                    break
+        avoided_providers = list(dict.fromkeys([
+            *resolved.variant.avoided_providers,
+            *self._avoided_providers_for_strategy(candidate),
+        ]))
+        avoided_cli_tools = list(dict.fromkeys([
+            *resolved.variant.avoided_cli_tools,
+            *self._avoided_cli_tools_for_strategy(candidate),
+        ]))
+        return ProcedureExecutionRequest(
+            procedure_id=procedure_id,
+            procedure_variant_id=resolved.variant_id,
+            title=candidate.title,
+            description=candidate.description,
+            expected_paths=expected_paths,
+            available_docs=list(self.governance.planning_docs.keys()),
+            inspection=inspection,
+            actor_capability=resolved.actor_capability,
+            execution_mode=resolved.variant.execution_mode,
+            risk=candidate.risk,
+            priority=candidate.priority,
+            urgency=candidate.urgency,
+            preferred_provider=preferred_provider,
+            avoided_providers=avoided_providers,
+            preferred_cli_tool=preferred_cli_tool,
+            avoided_cli_tools=avoided_cli_tools,
+            procedure_metadata={
+                "procedure_title": resolved.procedure.title,
+                "variant_title": resolved.variant.title,
+                "variant_description": resolved.variant.description,
+                "requested_variant_id": resolved.requested_variant_id,
+                "fallback_from_variant_id": resolved.fallback_from_variant_id,
+                "execution_mode": resolved.variant.execution_mode,
+                "shortcut_allowed": bool(resolved.variant.metadata.get("shortcut_allowed")),
+                "capture_shortcut_candidate": bool(resolved.variant.metadata.get("capture_shortcut_candidate")),
+                "force_fallback_only": resolved.variant.force_fallback_only,
+            },
+        )
+
+    def _resolve_procedure_for_candidate(
+        self,
+        *,
+        procedure_id: str,
+        candidate: Loop0TaskCandidate,
+        route: dict[str, Any],
+    ) -> ResolvedProcedure:
+        requested_variant_id = self._requested_variant_for_candidate(
+            procedure_id=procedure_id,
+            candidate=candidate,
+        )
+        actor_capability = infer_actor_capability(
+            provider=str(route.get("provider") or "").strip() or None,
+            cli_tool=str(route.get("cli_tool") or "").strip() or None,
+        )
+        return self.procedure_registry.resolve(
+            procedure_id,
+            actor_capability=actor_capability,
+            requested_variant_id=requested_variant_id,
+        )
+
+    def _requested_variant_for_candidate(
+        self,
+        *,
+        procedure_id: str,
+        candidate: Loop0TaskCandidate,
+    ) -> str | None:
+        if candidate.strategy == "fallback_only":
+            return "fallback_patch" if procedure_id == "loop0-bounded-file-generation" else None
+        if procedure_id == "message-task-bounded-file-generation":
+            return "direct_execution"
+        return "direct_patch"
 
     def _candidate_implementations(self) -> dict[str, dict[str, str]]:
         return {
