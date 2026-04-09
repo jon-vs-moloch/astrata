@@ -17,6 +17,7 @@ from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
+from astrata.governance.policy import governance_change_is_authorized, protected_governance_paths
 from astrata.loop0.planner import Loop0Planner, PlannerSnapshot
 from astrata.loop0.resolution import determine_task_resolution
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
@@ -1538,6 +1539,53 @@ class Loop0Runner:
             ]
         return preferences
 
+    def _protected_governance_block(
+        self,
+        *,
+        candidate: Loop0TaskCandidate,
+        protected_paths: list[str],
+        route: dict[str, Any],
+        provenance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "status": "blocked",
+            "reason": "Protected governance surfaces require direct principal-governed provenance before Astrata may edit them.",
+            "written_paths": [],
+            "generation_mode": "none",
+            "requested_route": route,
+            "resolved_route": {},
+            "preflight": {"ok": False, "reason": "protected_governance_surface"},
+            "failure_kind": "protected_governance_surface",
+            "degraded_reason": "policy:protected_governance_surface",
+            "provider_error": None,
+            "attempt_count": 0,
+            "baseline_inspection": {
+                "candidate_key": candidate.key,
+                "protected_paths": protected_paths,
+                "provenance": dict(provenance or {}),
+            },
+        }
+
+    def _ensure_governance_write_allowed(
+        self,
+        *,
+        candidate: Loop0TaskCandidate,
+        candidate_paths: list[str],
+        provenance: dict[str, Any] | None,
+        route: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        protected_paths = protected_governance_paths(candidate_paths)
+        if not protected_paths:
+            return None
+        if governance_change_is_authorized(provenance):
+            return None
+        return self._protected_governance_block(
+            candidate=candidate,
+            protected_paths=protected_paths,
+            route=route,
+            provenance=provenance,
+        )
+
     def _task_class_for_candidate(self, candidate: Loop0TaskCandidate) -> str:
         metadata = dict(candidate.metadata or {})
         domains = [str(item).strip().lower() for item in list(metadata.get("domains") or []) if str(item).strip()]
@@ -2049,6 +2097,14 @@ class Loop0Runner:
             }
         if candidate.strategy == "message_task":
             return self._apply_message_task(candidate, route=route)
+        governance_block = self._ensure_governance_write_allowed(
+            candidate=candidate,
+            candidate_paths=list(candidate.expected_paths),
+            provenance=dict(candidate.metadata or {}).get("provenance"),
+            route=route,
+        )
+        if governance_block is not None:
+            return governance_block
         baseline_inspection = (
             inspect_weak_expected_paths(self.settings.paths.project_root, list(candidate.expected_paths))
             if candidate.strategy == "strengthen"
@@ -2315,6 +2371,19 @@ class Loop0Runner:
         expected_paths = self._infer_expected_paths_for_message_task(candidate)
         if not expected_paths:
             return None
+        governance_block = self._ensure_governance_write_allowed(
+            candidate=candidate,
+            candidate_paths=expected_paths,
+            provenance=dict(task_payload.get("provenance") or {}),
+            route=route,
+        )
+        if governance_block is not None:
+            governance_block["baseline_inspection"] = {
+                **dict(governance_block.get("baseline_inspection") or {}),
+                "task_record": task_payload,
+                "inferred_expected_paths": expected_paths,
+            }
+            return governance_block
         request = self._procedure_request_for_candidate(
             procedure_id="message-task-bounded-file-generation",
             candidate=candidate,
@@ -3037,10 +3106,8 @@ class Loop0Runner:
                 "astrata/loop0/planner.py": _LOOP0_PLANNER_TEMPLATE,
             },
             "astrata-governance-constitution": {
-                "astrata/governance/constitution.py": _GOVERNANCE_CONSTITUTION_TEMPLATE,
             },
             "astrata-governance-project-specs": {
-                "astrata/governance/project_specs.py": _GOVERNANCE_PROJECT_SPECS_TEMPLATE,
             },
             "astrata-governance-authority": {
                 "astrata/governance/authority.py": _GOVERNANCE_AUTHORITY_TEMPLATE,

@@ -54,7 +54,7 @@ class CoordinatorController:
         if (
             not require_prime_route
             and envelope.risk not in {"high", "critical"}
-            and task_class in {"coding", "general"}
+            and task_class in {"coding", "general", "review"}
             and "codex" not in preferred_providers
         ):
             avoided_providers = tuple(dict.fromkeys([*avoided_providers, "codex"]))
@@ -64,6 +64,7 @@ class CoordinatorController:
                 priority=envelope.priority,
                 urgency=envelope.urgency,
                 risk=envelope.risk,
+                task_class=task_class,
                 prefer_local=False,
                 preferred_model=preferred_model,
                 preferred_providers=preferred_providers,
@@ -76,6 +77,7 @@ class CoordinatorController:
                 priority=envelope.priority,
                 urgency=envelope.urgency,
                 risk=envelope.risk,
+                task_class=task_class,
                 prefer_local=False,
                 preferred_model=preferred_model,
             )

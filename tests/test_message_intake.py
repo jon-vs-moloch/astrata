@@ -20,6 +20,7 @@ def test_message_intake_builds_request_spec_and_task():
     assert request_spec.source_communication_id == message.communication_id
     assert request_spec.summary
     assert request_spec.delta_kind == "spec_vs_reality"
+    assert request_spec.authority_chain == ["principal", "constitution"]
     proposals = intake.propose_tasks(request_spec)
     assert proposals
     assert proposals[0].route_preferences["preferred_cli_tools"][0] == "kilocode"
@@ -44,8 +45,10 @@ def test_message_intake_classifies_spec_request_and_proposes_multiple_tasks():
     assert request_spec.request_kind == "spec_hardening"
     assert request_spec.delta_kind == "input_vs_spec"
     assert "governance" in request_spec.domains
+    assert request_spec.metadata["governance_update_authorized"] is True
     proposals = intake.propose_tasks(request_spec)
     assert len(proposals) >= 2
+    assert proposals[0].provenance["governance_update_authorized"] is True
 
 
 def test_process_inbound_messages_acknowledges_and_materializes_tasks():

@@ -193,6 +193,9 @@ class WorkerRuntime:
                     "When a task needs decomposition, prefer multiple oneshottable leaf tasks with optional `task_id_hint`, "
                     "`depends_on`, `parallelizable`, and `route_preferences` fields rather than one oversized task. "
                     "`artifact` should be null or a compact object with `title`, `summary`, optional `confidence`, and optional `findings`."
+                    " Non-prime workers are explicitly allowed to perform verification, audit, and review work when the task is bounded "
+                    "and Astrata's routing policy judged this lane competent enough. Prefer the cheapest capable route and avoid escalating "
+                    "to Prime unless the work requires higher-judgment direction or protected authorization."
                 ),
             ),
             Message(role="user", content=str(payload.get("message") or "")),

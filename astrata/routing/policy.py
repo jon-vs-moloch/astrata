@@ -25,6 +25,7 @@ class RouteChooser:
         priority: int,
         urgency: int,
         risk: str,
+        task_class: str = "general",
         prefer_local: bool = False,
         preferred_model: str | None = None,
         preferred_providers: tuple[str, ...] = (),
@@ -93,19 +94,8 @@ class RouteChooser:
                     cli_tool=route.cli_tool,
                     reason="prefer_local",
                 )
-        route = _pick(("codex",))
-        if route:
-            return ExecutionRoute(
-                provider=route.provider,
-                model=route.model,
-                cli_tool=route.cli_tool,
-                reason="prime_prefers_codex_direct",
-            )
-        route = _pick_cli(("codex-cli",), reason="prime_prefers_codex")
-        if route:
-            return route
         if risk in {"high", "critical"}:
-            route = _pick(("openai", "google", "anthropic", "cli"))
+            route = _pick(("codex", "openai", "google", "anthropic", "cli"))
             if route:
                 return ExecutionRoute(
                     provider=route.provider,
@@ -113,11 +103,11 @@ class RouteChooser:
                     cli_tool=route.cli_tool,
                     reason="high_risk_prefers_stronger_inference",
                 )
-            route = _pick_cli(("gemini-cli", "claude-code", "kilocode"), reason="high_risk_cli_backup")
+            route = _pick_cli(("gemini-cli", "claude-code", "kilocode", "codex-cli"), reason="high_risk_cli_backup")
             if route:
                 return route
         if urgency > priority:
-            route = _pick_cli(("codex-cli", "kilocode", "gemini-cli", "claude-code"), reason="urgency_prefers_cli")
+            route = _pick_cli(("kilocode", "gemini-cli", "claude-code"), reason="urgency_prefers_cli")
             if route:
                 return route
             route = _pick(("cli",))
@@ -139,14 +129,31 @@ class RouteChooser:
         route = _pick_cli(("kilocode", "gemini-cli", "claude-code"), reason="assistant_cli_backup")
         if route:
             return route
-        route = _pick(tuple(self._registry.configured_provider_names()))
+        route = _pick(
+            tuple(
+                provider_name
+                for provider_name in self._registry.configured_provider_names()
+                if provider_name != "codex"
+            )
+        )
         if route:
             return ExecutionRoute(
                 provider=route.provider,
                 model=route.model,
                 cli_tool=route.cli_tool,
-                reason="default_available_provider",
+                reason="cheapest_capable_default",
             )
+        route = _pick(("codex",))
+        if route:
+            return ExecutionRoute(
+                provider=route.provider,
+                model=route.model,
+                cli_tool=route.cli_tool,
+                reason="prime_fallback_only",
+            )
+        route = _pick_cli(("codex-cli",), reason="prime_cli_fallback_only")
+        if route:
+            return route
         provider = self._registry.get_provider()
         if not provider or provider.name.lower() in avoided:
             raise RuntimeError("No configured inference provider is available")

@@ -43,3 +43,16 @@ def test_route_chooser_prefers_stronger_provider_for_high_risk():
     )
     route = RouteChooser(registry).choose(priority=1, urgency=1, risk="high", prefer_local=False)
     assert route.provider == "openai"
+
+
+def test_route_chooser_prefers_cheapest_capable_route_before_codex():
+    registry = ProviderRegistry(
+        {
+            "codex": _FakeProvider("codex", "gpt-5.4"),
+            "cli": _FakeProvider("cli", None),
+        }
+    )
+    registry._providers["cli"].available_tools = lambda: ["kilocode", "gemini-cli"]  # type: ignore[attr-defined]
+    route = RouteChooser(registry).choose(priority=1, urgency=1, risk="low", prefer_local=False)
+    assert route.provider == "cli"
+    assert route.cli_tool == "kilocode"

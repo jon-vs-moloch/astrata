@@ -74,13 +74,14 @@ class MessageIntake:
             delta_kind=delta["delta_kind"],
             delta_summary=delta["delta_summary"],
             domains=domains,
-            authority_chain=["user", "constitution"],
+            authority_chain=["principal", "constitution"],
             supporting_specs=supporting_specs,
             metadata={
                 "channel": message.channel,
                 "kind": message.kind,
                 "conversation_id": message.conversation_id,
                 "target_lane": message.recipient,
+                "governance_update_authorized": _governance_update_authorized(message, request_kind=request_kind),
             },
         )
 
@@ -106,6 +107,10 @@ class MessageIntake:
                         "delta_summary": request_spec.delta_summary,
                         "source_conversation_id": request_spec.metadata.get("conversation_id"),
                         "target_lane": request_spec.metadata.get("target_lane"),
+                        "authority_chain": list(request_spec.authority_chain),
+                        "governance_update_authorized": bool(
+                            request_spec.metadata.get("governance_update_authorized")
+                        ),
                     },
                     route_preferences=_route_preferences_for_request(request_spec),
                 )
@@ -165,6 +170,10 @@ class MessageIntake:
                             "target_lane": request_spec.metadata.get("target_lane"),
                             "supporting_specs": request_spec.supporting_specs,
                             "domains": request_spec.domains,
+                            "authority_chain": list(request_spec.authority_chain),
+                            "governance_update_authorized": bool(
+                                request_spec.metadata.get("governance_update_authorized")
+                            ),
                         },
                         route_preferences=_route_preferences_for_request(request_spec),
                     )
@@ -215,6 +224,8 @@ class MessageIntake:
                 "target_lane": request_spec.metadata.get("target_lane"),
                 "supporting_specs": request_spec.supporting_specs,
                 "domains": request_spec.domains,
+                "authority_chain": list(request_spec.authority_chain),
+                "governance_update_authorized": bool(request_spec.metadata.get("governance_update_authorized")),
             },
             route_preferences=_route_preferences_for_request(request_spec),
         )
@@ -483,3 +494,25 @@ def _completion_type_to_request_kind(completion_type: str | None) -> str | None:
     if normalized == "respond_or_execute":
         return "execution"
     return None
+
+
+def _governance_update_authorized(message: CommunicationRecord, *, request_kind: str) -> bool:
+    if str(message.sender or "").strip().lower() != "principal":
+        return False
+    if request_kind != "spec_hardening":
+        return False
+    lowered = str(message.payload.get("message") or "").lower()
+    governance_targets = (
+        "spec",
+        "constitution",
+        "project spec",
+        "project-spec",
+        "build-path",
+        "bootstrap plan",
+        "runtime architecture",
+        "phase 0",
+        "mvp loop",
+        "constitution.py",
+        "project_specs.py",
+    )
+    return any(token in lowered for token in governance_targets)

@@ -5,7 +5,7 @@ from astrata.records.communications import CommunicationRecord
 from astrata.config.settings import load_settings
 from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
 from astrata.providers.registry import ProviderRegistry
-from astrata.loop0.runner import Loop0Runner
+from astrata.loop0.runner import Loop0Runner, Loop0TaskCandidate
 from astrata.storage.db import AstrataDatabase
 
 
@@ -221,6 +221,31 @@ def test_loop0_runner_finds_strengthening_candidate_when_repo_is_complete():
     if assessment.candidate.strategy == "strengthen":
         assert assessment.verification.result == "pass"
         assert assessment.inspection.get("weak_paths")
+
+
+def test_loop0_blocks_unproven_governance_surface_edits():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"cli": _CheapCliProvider(), "codex": _DeferredCodexProvider()}),
+        )
+        candidate = Loop0TaskCandidate(
+            key="astrata-governance-constitution",
+            title="Create governance constitution module",
+            description="Attempt to rewrite a protected governance helper without principal authorization.",
+            expected_paths=("astrata/governance/constitution.py",),
+        )
+        result = runner._apply_candidate(  # noqa: SLF001
+            candidate,
+            coordination={"decision": {"status": "accepted"}, "route": {"provider": "cli", "cli_tool": "kilocode"}},
+        )
+        assert result["status"] == "blocked"
+        assert result["failure_kind"] == "protected_governance_surface"
+        assert "astrata/governance/constitution.py" in result["baseline_inspection"]["protected_paths"]
 
 
 def test_loop0_runner_unifies_pending_message_tasks():

@@ -26,7 +26,7 @@ class _QuotaProvider(Provider):
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         return CompletionResponse(provider="codex", model="gpt-5.4", content="OK")
 
-    def get_quota_windows(self):
+    def get_quota_windows(self, route=None):
         return [
             {
                 "requests_remaining": 9000,
@@ -135,6 +135,34 @@ def test_coordinator_prefers_kilocode_for_delegable_work(tmp_path: Path | None =
                     "preferred_cli_tools": ["kilocode", "gemini-cli"],
                     "avoided_providers": ["codex"],
                 },
+            )
+        )
+        assert decision.status == "accepted"
+        assert route.provider == "cli"
+        assert route.cli_tool == "kilocode"
+
+    if tmp_path is not None:
+        _run(tmp_path)
+        return
+    with TemporaryDirectory() as tmp:
+        _run(Path(tmp))
+
+
+def test_coordinator_keeps_review_work_off_codex_when_cli_is_available(tmp_path: Path | None = None):
+    def _run(base: Path) -> None:
+        db = AstrataDatabase(base / "quota.db")
+        db.initialize()
+        registry = ProviderRegistry({"codex": _QuotaProvider(), "cli": _CliQuotaProvider()})
+        policy = QuotaPolicy(db=db, limits_per_source={"codex": 12, "cli:kilocode": 200}, registry=registry)
+        coordinator = CoordinatorController(router=RouteChooser(registry), quota_policy=policy)
+        decision, route = coordinator.coordinate(
+            ControllerEnvelope(
+                controller_id="prime",
+                task_id="task-review-1",
+                priority=4,
+                urgency=2,
+                risk="low",
+                metadata={"task_class": "review"},
             )
         )
         assert decision.status == "accepted"
