@@ -77,6 +77,7 @@ class WorkerRuntime:
                     "status": "unsupported",
                     "reason": f"Unsupported delegation kind `{delegation_kind or 'unknown'}`.",
                     "task_id": payload.get("task_id"),
+                    "worker_task_id": payload.get("worker_task_id"),
                     "route": route,
                 },
             )
@@ -90,6 +91,7 @@ class WorkerRuntime:
                     "status": "blocked",
                     "reason": "Delegated worker could not resolve the requested provider.",
                     "task_id": payload.get("task_id"),
+                    "worker_task_id": payload.get("worker_task_id"),
                     "route": route,
                 },
             )
@@ -115,6 +117,7 @@ class WorkerRuntime:
                     "status": "failed",
                     "reason": str(exc),
                     "task_id": payload.get("task_id"),
+                    "worker_task_id": payload.get("worker_task_id"),
                     "route": route,
                 },
             )
@@ -125,6 +128,7 @@ class WorkerRuntime:
             payload={
                 "status": "applied",
                 "task_id": payload.get("task_id"),
+                "worker_task_id": payload.get("worker_task_id"),
                 "route": {
                     **route,
                     "provider": response.provider,

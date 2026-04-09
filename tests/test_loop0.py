@@ -221,10 +221,17 @@ def test_loop0_runner_unifies_pending_message_tasks():
         assert implementation["generation_mode"] == "delegated_worker"
         assert implementation["delegated_via_worker"] == "worker.kilocode"
         assert implementation["assistant_output"] == ""
+        assert implementation["worker_task_id"]
+        worker_task = next(
+            payload for payload in db.list_records("tasks") if payload.get("task_id") == implementation["worker_task_id"]
+        )
+        assert worker_task["status"] == "working"
+        assert worker_task["parent_task_id"] == "message-task-1"
         communications = db.list_records("communications")
         worker_requests = [payload for payload in communications if payload.get("intent") == "worker_delegation_request"]
         assert worker_requests
         assert worker_requests[-1]["recipient"] == "worker.kilocode"
+        assert worker_requests[-1]["payload"]["worker_task_id"] == implementation["worker_task_id"]
         worker_results = [payload for payload in communications if payload.get("intent") == "worker_delegation_result"]
         assert not worker_results
         runner.worker_runtime.process_pending(worker_id="worker.kilocode")
@@ -239,6 +246,11 @@ def test_loop0_runner_unifies_pending_message_tasks():
         assert delegated[-1]["payload"]["followup_tasks"]
         updated_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "message-task-1")
         assert updated_task["status"] == "complete"
+        assert updated_task["active_child_ids"] == []
+        worker_task = next(
+            payload for payload in db.list_records("tasks") if payload.get("task_id") == implementation["worker_task_id"]
+        )
+        assert worker_task["status"] == "complete"
         attempts = [payload for payload in db.list_records("attempts") if payload.get("task_id") == "message-task-1"]
         assert {payload["outcome"] for payload in attempts} == {"running", "succeeded"}
         followup_tasks = [
@@ -558,3 +570,50 @@ def test_loop0_runner_materializes_dependency_aware_decomposition_followups():
             None,
         )
         assert draft_procedure is not None
+
+
+def test_pending_followup_with_unresolved_dependency_is_not_selected():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        from astrata.records.models import TaskRecord
+
+        inspect_task = TaskRecord(
+            task_id="inspect-task",
+            parent_task_id="parent-task",
+            title="Inspect runtime posture",
+            description="Inspect current posture.",
+            priority=5,
+            urgency=3,
+            provenance={"source": "message_task_followup"},
+            risk="low",
+            status="pending",
+            success_criteria={"done": True},
+            completion_policy={"type": "review_or_audit"},
+        )
+        persist_task = TaskRecord(
+            task_id="persist-task",
+            parent_task_id="parent-task",
+            title="Persist runtime posture",
+            description="Persist posture after inspection.",
+            priority=7,
+            urgency=3,
+            provenance={"source": "message_task_followup"},
+            risk="low",
+            status="pending",
+            dependencies=["inspect-task"],
+            success_criteria={"done": True},
+            completion_policy={"type": "respond_or_execute"},
+        )
+        db.upsert_task(inspect_task)
+        db.upsert_task(persist_task)
+        runner = Loop0Runner(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": _DeferredCodexProvider(), "cli": _CheapCliProvider()}),
+        )
+        candidates = runner._pending_message_task_candidates()
+        candidate_ids = {candidate.source_task_id for candidate in candidates}
+        assert "inspect-task" in candidate_ids
+        assert "persist-task" not in candidate_ids

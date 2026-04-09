@@ -419,6 +419,37 @@ class Loop0Runner:
         payload["status"] = "complete" if str(message_payload.get("status") or "") == "applied" else "failed"
         payload["updated_at"] = _now_iso()
         provenance = dict(payload.get("provenance") or {})
+        worker_task_id = str(message_payload.get("worker_task_id") or provenance.get("worker_task_id") or "").strip()
+        if worker_task_id:
+            worker_task_payload = next(
+                (
+                    item
+                    for item in self.db.list_records("tasks")
+                    if str(item.get("task_id") or "").strip() == worker_task_id
+                ),
+                None,
+            )
+            if worker_task_payload:
+                worker_task = TaskRecord(
+                    **{
+                        **dict(worker_task_payload),
+                        "status": "complete" if payload["status"] == "complete" else "failed",
+                        "updated_at": payload["updated_at"],
+                        "provenance": {
+                            **dict(worker_task_payload.get("provenance") or {}),
+                            "worker_result": {
+                                "result_message_id": message_payload.get("source_communication_id"),
+                                "status": message_payload.get("status"),
+                            },
+                        },
+                    }
+                )
+                self.db.upsert_task(worker_task)
+        payload["active_child_ids"] = [
+            child_id
+            for child_id in list(payload.get("active_child_ids") or [])
+            if str(child_id).strip() and str(child_id).strip() != worker_task_id
+        ]
         provenance["worker_result"] = {
             "worker_id": message_payload.get("worker_id"),
             "route": message_payload.get("route"),
@@ -648,11 +679,14 @@ class Loop0Runner:
 
     def _pending_message_task_candidates(self) -> list[Loop0TaskCandidate]:
         candidates: list[Loop0TaskCandidate] = []
+        tasks_by_id = self._tasks_by_id()
         for task_payload in self.db.list_records("tasks"):
             provenance = dict(task_payload.get("provenance") or {})
             if task_payload.get("status") != "pending":
                 continue
             if provenance.get("source") not in EXECUTABLE_MESSAGE_TASK_SOURCES:
+                continue
+            if not self._task_is_ready_for_selection(task_payload, tasks_by_id=tasks_by_id):
                 continue
             if self._is_low_signal_message_task(task_payload):
                 continue
@@ -678,10 +712,7 @@ class Loop0Runner:
         return candidates
 
     def _retry_task_candidates(self) -> list[Loop0TaskCandidate]:
-        tasks_by_id = {
-            str(task_payload.get("task_id") or ""): task_payload
-            for task_payload in self.db.list_records("tasks")
-        }
+        tasks_by_id = self._tasks_by_id()
         if not tasks_by_id:
             return []
         latest_attempt_by_task: dict[str, dict[str, Any]] = {}
@@ -698,6 +729,8 @@ class Loop0Runner:
             if not task_payload:
                 continue
             if task_payload.get("status") not in {"blocked", "failed"}:
+                continue
+            if not self._task_is_ready_for_selection(task_payload, tasks_by_id=tasks_by_id):
                 continue
             outcome = str(attempt_payload.get("outcome") or "").strip().lower()
             if outcome not in {"blocked", "failed"}:
@@ -733,6 +766,7 @@ class Loop0Runner:
         return candidates
 
     def _artifact_finding_candidates(self) -> list[Loop0TaskCandidate]:
+        tasks_by_id = self._tasks_by_id()
         pending_followups = {
             (
                 str(dict(task_payload.get("provenance") or {}).get("parent_task_id") or ""),
@@ -774,6 +808,7 @@ class Loop0Runner:
                 )
                 synthetic_task = {
                     "task_id": f"artifact-finding-{artifact_payload.get('artifact_id')}",
+                    "parent_task_id": parent_task_id or None,
                     "title": title or f"Artifact finding: {artifact_payload.get('title') or 'review'}",
                     "description": description,
                     "priority": 5,
@@ -791,6 +826,8 @@ class Loop0Runner:
                     "updated_at": str(artifact_payload.get("updated_at") or ""),
                     "artifact_confidence": confidence,
                 }
+                if not self._task_is_ready_for_selection(synthetic_task, tasks_by_id=tasks_by_id):
+                    continue
                 candidates.append(
                     Loop0TaskCandidate(
                         key=f"artifact:{artifact_payload.get('artifact_id')}:{len(candidates)}",
@@ -806,6 +843,54 @@ class Loop0Runner:
                     )
                 )
         return candidates
+
+    def _tasks_by_id(self) -> dict[str, dict[str, Any]]:
+        return {
+            str(task_payload.get("task_id") or "").strip(): task_payload
+            for task_payload in self.db.list_records("tasks")
+            if str(task_payload.get("task_id") or "").strip()
+        }
+
+    def _task_is_ready_for_selection(
+        self,
+        task_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]] | None = None,
+    ) -> bool:
+        tasks = tasks_by_id or self._tasks_by_id()
+        if self._task_has_unresolved_dependencies(task_payload, tasks_by_id=tasks):
+            return False
+        if self._task_has_active_children(task_payload, tasks_by_id=tasks):
+            return False
+        return True
+
+    def _task_has_unresolved_dependencies(
+        self,
+        task_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+    ) -> bool:
+        for dependency_id in list(task_payload.get("dependencies") or []):
+            dependency = tasks_by_id.get(str(dependency_id).strip())
+            if not dependency:
+                continue
+            if str(dependency.get("status") or "").strip().lower() not in {"complete", "satisfied"}:
+                return True
+        return False
+
+    def _task_has_active_children(
+        self,
+        task_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+    ) -> bool:
+        for child_id in list(task_payload.get("active_child_ids") or []):
+            child = tasks_by_id.get(str(child_id).strip())
+            if not child:
+                continue
+            if str(child.get("status") or "").strip().lower() in {"pending", "working", "blocked"}:
+                return True
+        return False
 
     def _is_low_signal_message_task(self, task_payload: dict[str, Any]) -> bool:
         title = str(task_payload.get("title") or "").strip().lower()
@@ -1616,6 +1701,25 @@ class Loop0Runner:
         baseline_inspection: dict[str, Any],
     ) -> dict[str, Any] | None:
         worker_id = worker_id_for_route(route)
+        worker_task = TaskRecord(
+            parent_task_id=task_id,
+            title=f"Worker Task: {candidate.title}",
+            description=f"Execute delegated worker task on {worker_id}.",
+            priority=candidate.priority,
+            urgency=candidate.urgency,
+            risk=str(task_payload.get("risk") or candidate.risk or "low"),
+            status="working",
+            provenance={
+                "source": "worker_delegation",
+                "parent_task_id": task_id,
+                "worker_id": worker_id,
+                "task_class": "delegated_message_task",
+                "route": route,
+            },
+            success_criteria={"worker_result_reconciled": True},
+            completion_policy={"type": "worker_execution", "route_preferences": dict(task_payload.get("completion_policy", {}).get("route_preferences") or {})},
+        )
+        self.db.upsert_task(worker_task)
         request = self.operator_lane.send(
             sender="prime",
             recipient=worker_id,
@@ -1630,11 +1734,28 @@ class Loop0Runner:
                 "message": candidate.description,
                 "task_payload": task_payload,
                 "route": route,
+                "worker_task_id": worker_task.task_id,
             },
             priority=candidate.priority,
             urgency=candidate.urgency,
             related_task_ids=[task_id],
         )
+        if candidate.metadata:
+            updated_parent = TaskRecord(
+                **{
+                    **dict(task_payload),
+                    "status": "working",
+                    "updated_at": _now_iso(),
+                    "active_child_ids": list(
+                        dict.fromkeys([*list(task_payload.get("active_child_ids") or []), worker_task.task_id])
+                    ),
+                    "provenance": {
+                        **dict(task_payload.get("provenance") or {}),
+                        "worker_task_id": worker_task.task_id,
+                    },
+                }
+            )
+            self.db.upsert_task(updated_parent)
         return {
             "status": "delegated",
             "reason": "Unified queue delegated the inbound task to a provider-backed worker lane for later reconciliation.",
@@ -1652,6 +1773,7 @@ class Loop0Runner:
             "followup_tasks": [],
             "derived_artifact": None,
             "delegated_via_worker": worker_id,
+            "worker_task_id": worker_task.task_id,
             "delegation_request_id": request.communication_id,
             "delegation_result_id": None,
             "emitted_communication_id": None,

@@ -15,6 +15,7 @@ def _now_iso() -> str:
 
 class TaskRecord(BaseModel):
     task_id: str = Field(default_factory=lambda: str(uuid4()))
+    parent_task_id: str | None = None
     title: str
     description: str
     priority: int = 0
@@ -24,6 +25,7 @@ class TaskRecord(BaseModel):
     risk: str = "moderate"
     status: Literal["pending", "working", "blocked", "complete", "failed", "satisfied", "superseded"] = "pending"
     dependencies: list[str] = Field(default_factory=list)
+    active_child_ids: list[str] = Field(default_factory=list)
     success_criteria: dict[str, Any] = Field(default_factory=dict)
     completion_policy: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=_now_iso)
