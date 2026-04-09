@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from astrata.audit import review_audit_review, review_consensus_judgment
+from astrata.audit import review_audit_review, review_consensus_judgment, select_audit_followup_policy
 from astrata.config.settings import Settings
 from astrata.comms.intake import normalize_derived_task_proposal
 from astrata.comms.lanes import HandoffLane, PrincipalMessageLane
@@ -1120,7 +1120,95 @@ class Loop0Runner:
             status="good" if not meta_review.findings else "degraded",
         )
         self.db.upsert_artifact(meta_artifact)
+        policy = select_audit_followup_policy(review=review)
+        followup_tasks = self._materialize_review_followup_tasks(
+            review=review,
+            policy=policy,
+            parent_provenance={
+                "source": "audit_followup",
+                "review_id": review.review_id,
+                "subject_kind": review.subject_kind,
+                "subject_id": review.subject_id,
+                "artifact_type": artifact_type,
+                **provenance,
+            },
+        )
+        if followup_tasks:
+            followup_artifact = ArtifactRecord(
+                artifact_type=f"{artifact_type}_followups",
+                title=f"{title} follow-up routing",
+                description="Audit follow-up tasks derived from review findings or sampling policy.",
+                content_summary=json.dumps(
+                    {
+                        "policy": policy,
+                        "tasks": [task.model_dump(mode="json") for task in followup_tasks],
+                    },
+                    indent=2,
+                ),
+                provenance={
+                    **provenance,
+                    "review_id": review.review_id,
+                    "subject_kind": review.subject_kind,
+                    "subject_id": review.subject_id,
+                },
+                status="degraded" if policy.get("mode") == "targeted" else "good",
+            )
+            self.db.upsert_artifact(followup_artifact)
         return review_artifact, meta_artifact
+
+    def _materialize_review_followup_tasks(
+        self,
+        *,
+        review: Any,
+        policy: dict[str, Any],
+        parent_provenance: dict[str, Any],
+    ) -> list[TaskRecord]:
+        specs = list(policy.get("followup_specs") or [])
+        if not specs:
+            return []
+        materialized: list[TaskRecord] = []
+        for spec in specs[:4]:
+            if not isinstance(spec, dict):
+                continue
+            proposal = normalize_derived_task_proposal(
+                title=str(spec.get("title") or "").strip(),
+                description=str(spec.get("description") or "").strip(),
+                parent_provenance={
+                    **dict(parent_provenance),
+                    "audit_followup": {
+                        "mode": str(policy.get("mode") or "none"),
+                        "reason": str(policy.get("reason") or ""),
+                    },
+                },
+                suggested_completion_type=str(spec.get("completion_type") or "").strip() or None,
+                priority=int(spec.get("priority") or 4),
+                urgency=int(spec.get("urgency") or 1),
+                risk=str(spec.get("risk") or "low"),
+                success_criteria=dict(spec.get("success_criteria") or {"audit_followup_completed": True}),
+                route_preferences=dict(spec.get("route_preferences") or {}),
+                delta_kind=str(spec.get("delta_kind") or "").strip() or None,
+                delta_summary=str(spec.get("delta_summary") or "").strip() or None,
+                task_id_hint=str(spec.get("task_id_hint") or "").strip() or None,
+                depends_on=list(spec.get("depends_on") or []),
+                parallelizable=bool(spec.get("parallelizable")),
+            )
+            task = TaskRecord(
+                title=proposal.title,
+                description=proposal.description,
+                priority=proposal.priority,
+                urgency=proposal.urgency,
+                risk=proposal.risk,
+                dependencies=[],
+                provenance=proposal.provenance,
+                success_criteria=proposal.success_criteria,
+                completion_policy={
+                    **proposal.completion_policy,
+                    "route_preferences": proposal.route_preferences,
+                },
+            )
+            self.db.upsert_task(task)
+            materialized.append(task)
+        return materialized
 
     def _record_worker_completion_attempt(self, *, task: TaskRecord, message_payload: dict[str, Any]) -> None:
         raw_content = str(message_payload.get("raw_content") or "")
