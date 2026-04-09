@@ -278,8 +278,9 @@ class Loop0Runner:
 
     def _reconcile_pending_tasks(self) -> list[TaskRecord]:
         reconciled: list[TaskRecord] = []
+        reconciled.extend(self._reconcile_worker_results())
         for task_payload in self.db.list_records("tasks"):
-            if task_payload.get("status") != "pending":
+            if task_payload.get("status") not in {"pending", "working"}:
                 continue
             update = self._reconciled_task_payload(task_payload)
             if update is None:
@@ -292,6 +293,8 @@ class Loop0Runner:
     def _reconciled_task_payload(self, task_payload: dict[str, Any]) -> dict[str, Any] | None:
         payload = dict(task_payload)
         provenance = dict(payload.get("provenance") or {})
+        if payload.get("status") == "working":
+            return None
         closure_reason: str | None = None
         new_status: str | None = None
         if self._is_low_signal_message_task(payload):
@@ -324,6 +327,125 @@ class Loop0Runner:
             },
         }
         return payload
+
+    def _reconcile_worker_results(self) -> list[TaskRecord]:
+        reconciled: list[TaskRecord] = []
+        for message in self.operator_lane.list_messages(recipient="astrata", include_acknowledged=False):
+            if message.intent != "worker_delegation_result":
+                continue
+            payload = dict(message.payload or {})
+            task_id = str(payload.get("task_id") or "").strip()
+            if not task_id:
+                self.operator_lane.acknowledge(message.communication_id)
+                continue
+            task_payload = next(
+                (item for item in self.db.list_records("tasks") if str(item.get("task_id") or "").strip() == task_id),
+                None,
+            )
+            if not task_payload:
+                self.operator_lane.acknowledge(message.communication_id)
+                continue
+            task = self._task_from_worker_result(task_payload, message_payload=payload)
+            self.db.upsert_task(task)
+            self._record_worker_completion_attempt(task=task, message_payload=payload)
+            self.operator_lane.acknowledge(message.communication_id)
+            reconciled.append(task)
+        return reconciled
+
+    def _task_from_worker_result(
+        self,
+        task_payload: dict[str, Any],
+        *,
+        message_payload: dict[str, Any],
+    ) -> TaskRecord:
+        payload = dict(task_payload)
+        raw_content = str(message_payload.get("raw_content") or "")
+        operator_response = self._extract_operator_response(raw_content)
+        followup_tasks = self._extract_followup_tasks(raw_content, payload)
+        derived_artifact = self._extract_message_artifact(
+            raw_content,
+            Loop0TaskCandidate(
+                key=f"task:{payload.get('task_id')}",
+                title=str(payload.get("title") or ""),
+                description=str(payload.get("description") or ""),
+                expected_paths=(),
+                strategy="message_task",
+                metadata=payload,
+            ),
+            payload,
+        )
+        lane_sender, conversation_id = self._message_task_lane_context(payload)
+        notice = self.operator_lane.send(
+            sender=lane_sender,
+            recipient="operator",
+            conversation_id=conversation_id,
+            kind="notice",
+            intent="message_task_response",
+            payload={
+                "task_id": payload.get("task_id"),
+                "title": payload.get("title"),
+                "description": payload.get("description"),
+                "completion_policy": dict(payload.get("completion_policy") or {}),
+                "assistant_output": operator_response,
+                "provider": message_payload.get("route", {}).get("provider"),
+                "model": message_payload.get("route", {}).get("model"),
+                "route": message_payload.get("route") or {},
+                "followup_tasks": followup_tasks,
+                "derived_artifact": derived_artifact,
+            },
+            priority=int(payload.get("priority") or 0),
+            urgency=int(payload.get("urgency") or 0),
+            related_task_ids=[str(payload.get("task_id") or "")],
+        )
+        if followup_tasks:
+            parent_task = TaskRecord(**payload)
+            self._materialize_followup_tasks(
+                candidate=Loop0TaskCandidate(
+                    key=f"task:{payload.get('task_id')}",
+                    title=str(payload.get("title") or ""),
+                    description=str(payload.get("description") or ""),
+                    expected_paths=(),
+                    strategy="message_task",
+                    metadata=payload,
+                ),
+                parent_task=parent_task,
+                implementation={
+                    "followup_tasks": followup_tasks,
+                    "derived_artifact": derived_artifact,
+                    "assistant_output": operator_response,
+                },
+            )
+        payload["status"] = "complete" if str(message_payload.get("status") or "") == "applied" else "failed"
+        payload["updated_at"] = _now_iso()
+        provenance = dict(payload.get("provenance") or {})
+        provenance["worker_result"] = {
+            "worker_id": message_payload.get("worker_id"),
+            "route": message_payload.get("route"),
+            "result_message_id": message_payload.get("source_communication_id"),
+            "emitted_communication_id": notice.communication_id,
+        }
+        payload["provenance"] = provenance
+        return TaskRecord(**payload)
+
+    def _record_worker_completion_attempt(self, *, task: TaskRecord, message_payload: dict[str, Any]) -> None:
+        raw_content = str(message_payload.get("raw_content") or "")
+        attempt = AttemptRecord(
+            task_id=task.task_id,
+            actor=str(message_payload.get("worker_id") or "worker"),
+            provenance={
+                "source": "worker_runtime",
+                "worker_id": message_payload.get("worker_id"),
+                "route": message_payload.get("route"),
+            },
+            attempt_reason="worker delegation result reconciled by loop0",
+            outcome="succeeded" if str(message_payload.get("status") or "") == "applied" else "failed",
+            result_summary=self._extract_operator_response(raw_content) or "Worker result reconciled.",
+            verification_status="passed" if str(message_payload.get("status") or "") == "applied" else "uncertain",
+            resource_usage={"route": message_payload.get("route") or {}, "implementation": {"generation_mode": "delegated_worker_result"}},
+            started_at=_now_iso(),
+            ended_at=_now_iso(),
+        )
+        self.db.upsert_attempt(attempt)
 
     def _assessment_priority(self, assessment: Loop0CandidateAssessment) -> tuple[int, int, int]:
         candidate = assessment.candidate
@@ -367,6 +489,7 @@ class Loop0Runner:
         scheduling: dict[str, Any] = {
             "preferred_cli_tools": list(route_preferences.get("preferred_cli_tools") or []),
             "preferred_providers": list(route_preferences.get("preferred_providers") or []),
+            "preferred_model": str(route_preferences.get("preferred_model") or ""),
             "retry_count": int(provenance.get("retry_count") or 0),
             "completion_type": str(completion_policy.get("type") or ""),
             "mentions_repo_file": self._text_mentions_repo_file(title, description),
@@ -887,6 +1010,7 @@ class Loop0Runner:
             "preferred_providers": list(route_preferences.get("preferred_providers") or []),
             "avoided_providers": list(route_preferences.get("avoided_providers") or []),
             "avoided_cli_tools": list(route_preferences.get("avoided_cli_tools") or []),
+            "preferred_model": str(route_preferences.get("preferred_model") or "").strip() or None,
         }
         if candidate.risk not in {"high", "critical"}:
             preferences["avoided_providers"] = [
@@ -946,7 +1070,11 @@ class Loop0Runner:
         outcome = (
             "succeeded"
             if implementation["status"] == "applied"
-            else ("blocked" if implementation.get("degraded_reason") else "failed")
+            else (
+                "running"
+                if implementation["status"] == "delegated"
+                else ("blocked" if implementation.get("degraded_reason") else "failed")
+            )
         )
         attempt = AttemptRecord(
             task_id=task.task_id,
@@ -963,7 +1091,11 @@ class Loop0Runner:
             result_summary=(
                 f"Applied candidate {candidate.key}"
                 if implementation["status"] == "applied"
-                else f"Could not apply candidate {candidate.key}"
+                else (
+                    f"Delegated candidate {candidate.key} to a durable worker"
+                    if implementation["status"] == "delegated"
+                    else f"Could not apply candidate {candidate.key}"
+                )
             ),
             failure_kind=implementation.get("failure_kind"),
             degraded_reason=implementation.get("degraded_reason") or implementation.get("provider_error"),
@@ -994,7 +1126,7 @@ class Loop0Runner:
                 ],
             ],
             started_at=started_at,
-            ended_at=_now_iso(),
+            ended_at=None if outcome == "running" else _now_iso(),
         )
         self.db.upsert_attempt(attempt)
 
@@ -1159,7 +1291,7 @@ class Loop0Runner:
         status = (
             "complete"
             if implementation["status"] == "applied" and verification_preview.result == "pass"
-            else "pending"
+            else ("working" if implementation["status"] == "delegated" else "pending")
         )
         if candidate.strategy == "message_task" and candidate.metadata:
             payload = dict(candidate.metadata)
@@ -1239,6 +1371,13 @@ class Loop0Runner:
                     result="uncertain",
                     confidence=0.6,
                     summary="Inbound task emitted an operator message, but the assistant lane did not complete the work path cleanly.",
+                    evidence={"implementation": implementation},
+                )
+            if status == "delegated" and implementation.get("delegated_via_worker"):
+                return VerificationResult(
+                    result="uncertain",
+                    confidence=0.7,
+                    summary="Inbound task was delegated to a durable worker lane and is awaiting reconciliation.",
                     evidence={"implementation": implementation},
                 )
             return VerificationResult(
@@ -1495,71 +1634,26 @@ class Loop0Runner:
             urgency=candidate.urgency,
             related_task_ids=[task_id],
         )
-        delegation_result = self.worker_runtime.handle_message(request)
-        result_message = dict(delegation_result.result_message or {})
-        payload = dict(result_message.get("payload") or {})
-        if str(payload.get("status") or "").strip().lower() != "applied":
-            return self._fallback_message_dispatch(
-                candidate,
-                task_id=task_id,
-                completion_policy=dict(task_payload.get("completion_policy") or {}),
-                route=route,
-                baseline_inspection=baseline_inspection,
-                provider_error=str(payload.get("reason") or "delegated worker did not complete the task"),
-                failure_kind="delegated_worker_failed",
-                degraded_reason=f"worker:{worker_id}",
-            )
-        raw_content = str(payload.get("raw_content") or "")
-        operator_response = self._extract_operator_response(raw_content)
-        followup_tasks = self._extract_followup_tasks(raw_content, task_payload)
-        derived_artifact = self._extract_message_artifact(raw_content, candidate, task_payload)
-        lane_sender, conversation_id = self._message_task_lane_context(task_payload)
-        notice = self.operator_lane.send(
-            sender=lane_sender,
-            recipient="operator",
-            conversation_id=conversation_id,
-            kind="question" if dict(task_payload.get("completion_policy") or {}).get("type") == "request_clarification" else "notice",
-            intent=(
-                "clarification_request"
-                if dict(task_payload.get("completion_policy") or {}).get("type") == "request_clarification"
-                else "message_task_response"
-            ),
-            payload={
-                "task_id": task_id,
-                "title": candidate.title,
-                "description": candidate.description,
-                "completion_policy": dict(task_payload.get("completion_policy") or {}),
-                "assistant_output": operator_response,
-                "provider": payload.get("route", {}).get("provider") or route.get("provider"),
-                "model": payload.get("route", {}).get("model") or route.get("model"),
-                "route": payload.get("route") or route,
-                "followup_tasks": followup_tasks,
-                "derived_artifact": derived_artifact,
-            },
-            priority=candidate.priority,
-            urgency=candidate.urgency,
-            related_task_ids=[task_id],
-        )
         return {
-            "status": "applied",
-            "reason": "Unified queue delegated the inbound task to a provider-backed worker lane and applied the returned result.",
+            "status": "delegated",
+            "reason": "Unified queue delegated the inbound task to a provider-backed worker lane for later reconciliation.",
             "written_paths": [],
             "generation_mode": "delegated_worker",
             "requested_route": route,
-            "resolved_route": payload.get("route") or route,
-            "preflight": {"ok": True, "reason": None},
+            "resolved_route": {},
+            "preflight": {"ok": True, "reason": "worker_enqueued"},
             "failure_kind": None,
             "degraded_reason": None,
             "provider_error": None,
-            "attempt_count": 1,
+            "attempt_count": 0,
             "baseline_inspection": baseline_inspection,
-            "assistant_output": operator_response,
-            "followup_tasks": followup_tasks,
-            "derived_artifact": derived_artifact,
+            "assistant_output": "",
+            "followup_tasks": [],
+            "derived_artifact": None,
             "delegated_via_worker": worker_id,
             "delegation_request_id": request.communication_id,
-            "delegation_result_id": result_message.get("communication_id"),
-            "emitted_communication_id": notice.communication_id,
+            "delegation_result_id": None,
+            "emitted_communication_id": None,
         }
 
     def _apply_message_execution_task(

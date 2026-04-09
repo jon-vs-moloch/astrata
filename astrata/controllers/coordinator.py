@@ -38,6 +38,7 @@ class CoordinatorController:
             for item in list(envelope.metadata.get("preferred_cli_tools") or [])
             if str(item).strip()
         )
+        preferred_model = str(envelope.metadata.get("preferred_model") or "").strip() or None
         avoided_cli_tools = tuple(
             str(item).strip().lower()
             for item in list(envelope.metadata.get("avoided_cli_tools") or [])
@@ -64,6 +65,7 @@ class CoordinatorController:
                 urgency=envelope.urgency,
                 risk=envelope.risk,
                 prefer_local=False,
+                preferred_model=preferred_model,
                 preferred_providers=preferred_providers,
                 avoided_providers=avoided_providers,
                 preferred_cli_tools=preferred_cli_tools,
@@ -75,6 +77,7 @@ class CoordinatorController:
                 urgency=envelope.urgency,
                 risk=envelope.risk,
                 prefer_local=False,
+                preferred_model=preferred_model,
             )
         decision = self._decision_for_route(envelope, route)
         return decision, route

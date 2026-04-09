@@ -76,3 +76,13 @@ def test_worker_runtime_executes_delegated_message_task():
         resolved = lane.get_message(inbound.communication_id)
         assert resolved is not None
         assert resolved.status == "resolved"
+
+
+def test_worker_runtime_scopes_worker_id_to_model_variant():
+    route = {
+        "provider": "cli",
+        "cli_tool": "gemini-cli",
+        "model": "gemini-2.5-flash",
+        "reason": "preferred_cli_tool",
+    }
+    assert worker_id_for_route(route) == "worker.gemini-cli.gemini-2-5-flash"

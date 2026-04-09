@@ -82,7 +82,7 @@ class _CheapCliProvider(Provider):
         return None
 
     def available_tools(self) -> list[str]:
-        return ["kilocode"]
+        return ["kilocode", "gemini-cli"]
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         return CompletionResponse(
@@ -198,8 +198,8 @@ def test_loop0_runner_unifies_pending_message_tasks():
         result = runner.run_once()
         assert result["status"] == "ok"
         assert result["task"]["task_id"] == "message-task-1"
-        assert result["attempt"]["outcome"] == "succeeded"
-        assert result["verification"]["result"] == "pass"
+        assert result["attempt"]["outcome"] == "running"
+        assert result["verification"]["result"] == "uncertain"
         assert result["operator_message"]["intent"] == "loop0_result"
         route = result["attempt"]["resource_usage"]["route"]
         assert route["provider"] == "cli"
@@ -207,7 +207,15 @@ def test_loop0_runner_unifies_pending_message_tasks():
         implementation = result["attempt"]["resource_usage"]["implementation"]
         assert implementation["generation_mode"] == "delegated_worker"
         assert implementation["delegated_via_worker"] == "worker.kilocode"
-        assert implementation["assistant_output"] == "Delegated response from cheap lane."
+        assert implementation["assistant_output"] == ""
+        communications = db.list_records("communications")
+        worker_requests = [payload for payload in communications if payload.get("intent") == "worker_delegation_request"]
+        assert worker_requests
+        assert worker_requests[-1]["recipient"] == "worker.kilocode"
+        worker_results = [payload for payload in communications if payload.get("intent") == "worker_delegation_result"]
+        assert not worker_results
+        runner.worker_runtime.process_pending(worker_id="worker.kilocode")
+        runner._reconcile_pending_tasks()
         communications = db.list_records("communications")
         worker_results = [payload for payload in communications if payload.get("intent") == "worker_delegation_result"]
         assert worker_results
@@ -216,6 +224,10 @@ def test_loop0_runner_unifies_pending_message_tasks():
         assert delegated
         assert delegated[-1]["payload"]["assistant_output"] == "Delegated response from cheap lane."
         assert delegated[-1]["payload"]["followup_tasks"]
+        updated_task = next(payload for payload in db.list_records("tasks") if payload.get("task_id") == "message-task-1")
+        assert updated_task["status"] == "complete"
+        attempts = [payload for payload in db.list_records("attempts") if payload.get("task_id") == "message-task-1"]
+        assert {payload["outcome"] for payload in attempts} == {"running", "succeeded"}
         followup_tasks = [
             payload
             for payload in db.list_records("tasks")
@@ -293,7 +305,10 @@ def test_loop0_runner_executes_startup_diagnostic_tasks():
                 completion_policy={
                     "type": "respond_or_execute",
                     "prefer_cheap_lanes": True,
-                    "route_preferences": {"preferred_cli_tools": ["kilocode"]},
+                    "route_preferences": {
+                        "preferred_cli_tools": ["gemini-cli", "kilocode"],
+                        "preferred_model": "gemini-2.5-flash",
+                    },
                 },
                 created_at="2026-04-09T00:00:00+00:00",
                 updated_at="2026-04-09T00:00:00+00:00",
@@ -320,8 +335,20 @@ def test_loop0_runner_executes_startup_diagnostic_tasks():
 
         assert result["status"] == "ok"
         assert result["task"]["task_id"] == "startup-self-diagnosis"
-        assert result["attempt"]["outcome"] == "succeeded"
-        assert result["verification"]["result"] == "pass"
+        assert result["attempt"]["outcome"] == "running"
+        assert result["verification"]["result"] == "uncertain"
+        route = result["attempt"]["resource_usage"]["route"]
+        assert route["provider"] == "cli"
+        assert route["cli_tool"] == "gemini-cli"
+        assert route["model"] == "gemini-2.5-flash"
+        implementation = result["attempt"]["resource_usage"]["implementation"]
+        assert implementation["delegated_via_worker"] == "worker.gemini-cli.gemini-2-5-flash"
+        runner.worker_runtime.process_pending(worker_id="worker.gemini-cli.gemini-2-5-flash")
+        runner._reconcile_pending_tasks()
+        updated_task = next(
+            payload for payload in db.list_records("tasks") if payload.get("task_id") == "startup-self-diagnosis"
+        )
+        assert updated_task["status"] == "complete"
 
 
 def test_loop0_runner_executes_file_shaped_message_task():
@@ -442,10 +469,19 @@ def test_loop0_runner_promotes_artifact_findings_into_followup_tasks():
         )
         result = runner.run_once()
         assert result["status"] == "ok"
-        message_artifact = result["message_artifact"]
+        runner.worker_runtime.process_pending(worker_id="worker.kilocode")
+        runner._reconcile_pending_tasks()
+        artifacts = db.list_records("artifacts")
+        message_artifact = next(
+            (payload for payload in artifacts if payload.get("artifact_type") == "spec_review"),
+            None,
+        )
         assert message_artifact is not None
-        assert message_artifact["artifact_type"] == "spec_review"
-        followup_tasks = result["followup_tasks"]
+        followup_tasks = [
+            payload
+            for payload in db.list_records("tasks")
+            if payload.get("provenance", {}).get("source") == "message_task_followup"
+        ]
         assert followup_tasks
         assert followup_tasks[-1]["provenance"]["source"] == "message_task_followup"
         assert followup_tasks[-1]["completion_policy"]["type"] == "respond_or_execute"

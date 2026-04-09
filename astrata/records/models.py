@@ -35,7 +35,7 @@ class AttemptRecord(BaseModel):
     actor: str
     provenance: dict[str, Any] = Field(default_factory=dict)
     attempt_reason: str = ""
-    outcome: Literal["succeeded", "failed", "blocked", "cancelled"] = "failed"
+    outcome: Literal["running", "succeeded", "failed", "blocked", "cancelled"] = "failed"
     result_summary: str = ""
     failure_kind: str | None = None
     degraded_reason: str | None = None

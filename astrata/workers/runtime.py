@@ -197,6 +197,12 @@ class WorkerRuntime:
 def worker_id_for_route(route: dict[str, Any]) -> str:
     cli_tool = str(route.get("cli_tool") or "").strip().lower()
     provider = str(route.get("provider") or "").strip().lower()
+    model = str(route.get("model") or "").strip().lower()
+    suffix = ""
+    if model:
+        normalized_model = "".join(char if char.isalnum() else "-" for char in model).strip("-")
+        if normalized_model:
+            suffix = f".{normalized_model[:48]}"
     if cli_tool:
-        return f"worker.{cli_tool}"
-    return f"worker.{provider or 'default'}"
+        return f"worker.{cli_tool}{suffix}"
+    return f"worker.{provider or 'default'}{suffix}"

@@ -26,6 +26,7 @@ class RouteChooser:
         urgency: int,
         risk: str,
         prefer_local: bool = False,
+        preferred_model: str | None = None,
         preferred_providers: tuple[str, ...] = (),
         avoided_providers: tuple[str, ...] = (),
         preferred_cli_tools: tuple[str, ...] = (),
@@ -35,6 +36,9 @@ class RouteChooser:
         preferred = tuple(provider.strip().lower() for provider in preferred_providers if provider)
         avoided_tools = {tool.strip().lower() for tool in avoided_cli_tools if tool}
         preferred_tools = tuple(tool.strip().lower() for tool in preferred_cli_tools if tool)
+
+        def _resolved_model(default_model: str | None) -> str | None:
+            return str(preferred_model or "").strip() or default_model
 
         def _pick_cli(candidates: tuple[str, ...], *, reason: str) -> ExecutionRoute | None:
             if "cli" in avoided:
@@ -47,7 +51,7 @@ class RouteChooser:
                 if provider:
                     return ExecutionRoute(
                         provider="cli",
-                        model=None,
+                        model=_resolved_model(None),
                         cli_tool=tool,
                         reason=reason,
                     )
@@ -61,7 +65,7 @@ class RouteChooser:
                 if provider:
                     return ExecutionRoute(
                         provider=provider.name,
-                        model=provider.default_model(),
+                        model=_resolved_model(provider.default_model()),
                         cli_tool=None,
                         reason="policy_selected_provider",
                     )
