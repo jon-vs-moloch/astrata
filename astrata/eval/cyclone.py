@@ -16,6 +16,7 @@ from typing import Any
 
 from astrata.config.settings import load_settings
 from astrata.local.backends.llama_cpp import LlamaCppBackend
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
 from astrata.local.models.discovery import discover_local_models
 from astrata.local.models.registry import LocalModelRecord, LocalModelRegistry
 from astrata.local.runtime.client import LocalRuntimeClient
@@ -472,11 +473,19 @@ class CycloneExperiment:
                 metadata={"model_path": model_path, "mode": mode},
             )
         provider = self._provider_for_route(route)
-        request = CompletionRequest(
+        request = build_memory_augmented_request(
             messages=messages,
             model=route.model,
             temperature=temperature,
             metadata={"cli_tool": route.cli_tool, "cyclone_mode": mode or "default"},
+            memory_store_path=default_memory_store_path(data_dir=self._settings.paths.data_dir),
+            memory_query="\n".join(
+                str(message.content or "")
+                for message in messages
+                if str(message.role or "").lower() != "system"
+            ),
+            accessor="local",
+            destination="remote",
         )
         response = provider.complete(request)
         total_wall_seconds = max(0.001, time.monotonic() - started)

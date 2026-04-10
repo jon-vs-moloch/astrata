@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any
 import urllib.error
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
+from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
 
 
 class OpenAICompatibleProvider(Provider):
@@ -54,6 +54,8 @@ class OpenAICompatibleProvider(Provider):
         endpoint = self.endpoint()
         if not endpoint:
             raise RuntimeError(f"{self.name} endpoint is not configured")
+        if not _looks_local_endpoint(endpoint):
+            assert_projected_memory_request(request, provider_name=self.name)
 
         model = request.model or self.default_model()
         payload = {
@@ -82,6 +84,11 @@ class OpenAICompatibleProvider(Provider):
         raw = json.loads(body)
         content = _extract_openai_compatible_content(raw)
         return CompletionResponse(provider=self.name, model=model, content=content, raw=raw)
+
+
+def _looks_local_endpoint(endpoint: str) -> bool:
+    normalized = str(endpoint or "").strip().lower()
+    return normalized.startswith("http://127.0.0.1") or normalized.startswith("http://localhost")
 
 
 def _extract_openai_compatible_content(raw: dict[str, Any]) -> str:

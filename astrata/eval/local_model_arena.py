@@ -8,10 +8,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from astrata.config.settings import load_settings
 from astrata.eval.ratings import RatingStore
 from astrata.eval.substrate import build_eval_domain
 from astrata.local.lmstudio import LmStudioCli, LmStudioGeneration
 from astrata.local.telemetry import LocalModelTelemetryStore
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
 from astrata.providers.base import CompletionRequest, Message, Provider
 
 
@@ -118,7 +120,8 @@ class LocalModelArena:
         right: LmStudioGeneration,
         judge_metadata: dict[str, object] | None = None,
     ) -> tuple[float, str]:
-        request = CompletionRequest(
+        settings = load_settings()
+        request = build_memory_augmented_request(
             messages=[
                 Message(
                     role="system",
@@ -151,6 +154,10 @@ class LocalModelArena:
                 ),
             ],
             metadata=dict(judge_metadata or {}),
+            memory_store_path=default_memory_store_path(data_dir=settings.paths.data_dir),
+            memory_query=prompt,
+            accessor="local",
+            destination="remote",
         )
         response = judge.complete(request)
         payload = self._parse_json_payload(response.content)

@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
+from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
 
 
 CLI_TOOL_SPECS: dict[str, dict[str, str]] = {
@@ -104,8 +104,9 @@ class CliProvider(Provider):
             raise RuntimeError("No CLI inference tool is configured")
         if not self._tool_is_usable(tool):
             raise RuntimeError(f"CLI tool {tool} is not configured")
-
         spec = CLI_TOOL_SPECS[tool]
+        if spec["underlying_provider"] != "custom":
+            assert_projected_memory_request(request, provider_name=f"{self.name}:{tool}")
         exec_path = shutil.which(spec["exec"]) or spec["exec"]
         prompt = _render_prompt(request)
         model = request.model or str(request.metadata.get("model") or "").strip() or None

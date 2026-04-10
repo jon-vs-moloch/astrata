@@ -8,7 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-import sys
+
 from typing import Any
 from urllib.parse import urlparse
 
@@ -133,7 +133,9 @@ def generate_python_preflight_report(
 
     issues = [
         {
-            "severity": "critical" if check["name"] in {"selected_python_exists", "selected_python_imports"} else "high",
+            "severity": "critical"
+            if check["name"] in {"selected_python_exists", "selected_python_imports"}
+            else "high",
             "kind": check["name"],
             "detail": check["detail"],
         }
@@ -208,7 +210,10 @@ def run_startup_reflection(
             description=report["summary"],
             priority=9,
             urgency=7,
-            provenance={"source": "startup_diagnostic", "report_path": str(runtime_report_path(settings))},
+            provenance={
+                "source": "startup_diagnostic",
+                "report_path": str(runtime_report_path(settings)),
+            },
             permissions={},
             risk="low",
             status="pending",
@@ -239,7 +244,9 @@ def run_startup_reflection(
             existing = TaskRecord(**payload)
             if existing.status in {"complete", "satisfied", "superseded"}:
                 break
-            db.upsert_task(existing.model_copy(update={"status": "satisfied", "updated_at": _now_iso()}))
+            db.upsert_task(
+                existing.model_copy(update={"status": "satisfied", "updated_at": _now_iso()})
+            )
             break
 
     _write_json(
@@ -251,7 +258,13 @@ def run_startup_reflection(
             "last_issue_count": len(report["issues"]),
         },
     )
-    return StartupReflectionResult(report=report, task_created=task_created, message_sent=message_sent)
+    return StartupReflectionResult(
+        report=report, task_created=task_created, message_sent=message_sent
+    )
+
+
+def _is_thermal_issue(issues: list[dict[str, Any]]) -> bool:
+    return any(issue["kind"] == "thermal_throttle" for issue in issues)
 
 
 def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, Any]:
@@ -288,11 +301,14 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
             }
         )
     else:
-        managed_endpoint = managed_status.endpoint if managed_status and managed_status.endpoint else None
+        managed_endpoint = (
+            managed_status.endpoint if managed_status and managed_status.endpoint else None
+        )
         manager.select_runtime(
             backend_id="llama_cpp",
             mode="managed",
-            endpoint=managed_endpoint or f"http://{settings.local_runtime.llama_cpp_host}:{settings.local_runtime.llama_cpp_port}/health",
+            endpoint=managed_endpoint
+            or f"http://{settings.local_runtime.llama_cpp_host}:{settings.local_runtime.llama_cpp_port}/health",
         )
         local_health = manager.health(
             config=_llama_config_from_endpoint(
@@ -304,6 +320,16 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
         )
     thermal_state = probe_thermal_state(preference=settings.local_runtime.thermal_preference)
     thermal_controller = ThermalController(state_path=settings.paths.data_dir / "thermal_state.json")
+
+    prior_reflection_state = _read_json(reflection_state_path(settings)) or {}
+    prior_issues = prior_reflection_state.get("issues", [])
+    if (
+        prior_reflection_state.get("last_issue_count", 0) > 0
+        and _is_thermal_issue(prior_issues)
+        and thermal_state.thermal_pressure.lower() == "nominal"
+    ):
+        thermal_controller.clear_latch()
+
     thermal_decision = thermal_controller.evaluate(thermal_state)
     runtime_client = LocalRuntimeClient()
     native_strata = StrataEndpointService(
@@ -348,7 +374,9 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
             + "; ".join(issue["kind"] for issue in issues[:4])
         )
     else:
-        summary_parts.append("Startup reflection looks healthy enough to continue normal operation.")
+        summary_parts.append(
+            "Startup reflection looks healthy enough to continue normal operation."
+        )
     if default_route:
         summary_parts.append(
             "Default route is "
@@ -376,7 +404,9 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
                 "reason": thermal_decision.reason,
             },
             "health": None if local_health is None else local_health.model_dump(mode="json"),
-            "managed_process": None if manager.managed_status() is None else {
+            "managed_process": None
+            if manager.managed_status() is None
+            else {
                 "running": manager.managed_status().running,
                 "pid": manager.managed_status().pid,
                 "endpoint": manager.managed_status().endpoint,

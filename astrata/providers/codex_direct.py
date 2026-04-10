@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
+from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
 
 
 class CodexDirectProvider(Provider):
@@ -41,6 +41,7 @@ class CodexDirectProvider(Provider):
         token, account_id = self._read_codex_auth()
         if not token:
             raise RuntimeError("Codex session token is not available")
+        assert_projected_memory_request(request, provider_name=self.name)
 
         headers = {
             "Authorization": f"Bearer {token}",

@@ -1,9 +1,11 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from astrata.config.settings import load_settings
 from astrata.eval.observations import EvalObservationStore
 from astrata.eval.provider_routes import ProviderRouteArena
 from astrata.eval.ratings import RatingStore
+from astrata.memory import MemoryStore
 from astrata.providers.base import CompletionResponse
 from astrata.providers.registry import ProviderRegistry
 
@@ -198,13 +200,14 @@ def test_provider_route_arena_can_compare_strata_endpoint_against_provider():
         def __init__(self):
             self.calls = []
 
-        def chat(self, *, content, thread_id=None, model_id=None, allow_degraded_fallback=False, system_prompt=None):
+        def chat(self, *, content, thread_id=None, model_id=None, allow_degraded_fallback=False, system_prompt=None, reasoning_effort="auto"):
             self.calls.append(
                 {
                     "content": content,
                     "thread_id": thread_id,
                     "model_id": model_id,
                     "allow_degraded_fallback": allow_degraded_fallback,
+                    "reasoning_effort": reasoning_effort,
                 }
             )
 
@@ -289,3 +292,68 @@ def test_provider_route_arena_rejects_scarce_sidequest_judge_by_default():
             assert "Scarce judge route" in str(exc)
         else:
             raise AssertionError("Expected scarce sidequest judge to be rejected.")
+
+
+def test_provider_route_arena_attaches_projected_memory_context(monkeypatch):
+    class FakeProvider:
+        def __init__(self, name, content):
+            self._name = name
+            self._content = content
+            self.last_request = None
+
+        @property
+        def name(self):
+            return self._name
+
+        def is_configured(self):
+            return True
+
+        def default_model(self):
+            return None
+
+        def complete(self, request):
+            self.last_request = request
+            return CompletionResponse(provider=self._name, model=request.model, content=self._content)
+
+    class FakeJudge(FakeProvider):
+        def complete(self, request):
+            self.last_request = request
+            return CompletionResponse(
+                provider=self._name,
+                model=request.model,
+                content='{"left_score": 1.0, "rationale": "Left is more useful."}',
+            )
+
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path(tmp))
+        MemoryStore(settings.paths.data_dir / "memory.db").create_or_update_page(
+            slug="helper",
+            title="Helper",
+            body="A helper note for coding tasks.",
+            summary="Helper note.",
+            summary_public="A helper note exists for coding tasks.",
+            tags=["helper", "coding"],
+            visibility="shared",
+            confidentiality="normal",
+        )
+        monkeypatch.setattr("astrata.eval.provider_routes.load_settings", lambda: settings)
+        left = FakeProvider("left", "left output")
+        right = FakeProvider("right", "right output")
+        judge = FakeJudge("judge", "")
+        registry = ProviderRegistry(providers={"left": left, "right": right, "judge": judge})
+        observations = EvalObservationStore(state_path=Path(tmp) / "obs.json")
+        ratings = RatingStore(state_path=Path(tmp) / "ratings.json")
+        arena = ProviderRouteArena(registry=registry, observations=observations, ratings=ratings)
+
+        arena.run_pair_eval(
+            task_class="coding",
+            prompt="Write a helper.",
+            left_route={"provider": "left"},
+            right_route={"provider": "right"},
+            judge=judge,
+        )
+
+        assert left.last_request is not None
+        assert left.last_request.metadata["memory_context"] == [
+            "[public] Helper: A helper note exists for coding tasks."
+        ]

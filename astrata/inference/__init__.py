@@ -7,7 +7,6 @@ from astrata.inference.contracts import (
 )
 from astrata.inference.planner import InferencePlanner
 from astrata.inference.strategies import (
-    FastThenPersistentStrategy,
     SinglePassStrategy,
     StrategyContext,
     StrategyResult,
@@ -18,7 +17,6 @@ __all__ = [
     "EndpointProfile",
     "InferenceExecutionPlan",
     "InferencePlanner",
-    "FastThenPersistentStrategy",
     "SinglePassStrategy",
     "StrategyContext",
     "StrategyResult",

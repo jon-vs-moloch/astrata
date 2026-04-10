@@ -40,7 +40,12 @@ def _probe_total_memory_bytes(system: str) -> int:
         try:
             pages = os.sysconf("SC_PHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
-            if isinstance(pages, int) and isinstance(page_size, int) and pages > 0 and page_size > 0:
+            if (
+                isinstance(pages, int)
+                and isinstance(page_size, int)
+                and pages > 0
+                and page_size > 0
+            ):
                 return pages * page_size
         except Exception:
             pass
@@ -69,7 +74,7 @@ def probe_thermal_state(*, preference: str = "quiet") -> ThermalState:
                     thermal_pressure = "critical"
                 elif "severe" in lowered:
                     thermal_pressure = "severe"
-                elif "fair" in lowered or "warning" in lowered:
+                elif "fair" in lowered:
                     thermal_pressure = "fair"
                 else:
                     thermal_pressure = "nominal"

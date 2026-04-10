@@ -978,7 +978,7 @@ def _cmd_strata_endpoint_status() -> int:
     return 0
 
 
-def _cmd_strata_endpoint_chat(message: str, thread_id: str | None, model_id: str | None, allow_degraded_fallback: bool, mode: str | None, response_budget: str) -> int:
+def _cmd_strata_endpoint_chat(message: str, thread_id: str | None, model_id: str | None, allow_degraded_fallback: bool, reasoning_effort: str, response_budget: str) -> int:
     settings = load_settings()
     service = StrataEndpointService.from_settings(settings)
     reply = service.chat(
@@ -986,7 +986,7 @@ def _cmd_strata_endpoint_chat(message: str, thread_id: str | None, model_id: str
         thread_id=thread_id,
         model_id=model_id,
         allow_degraded_fallback=allow_degraded_fallback,
-        mode=mode,
+        reasoning_effort=reasoning_effort,
         response_budget=response_budget,
     )
     print(
@@ -995,10 +995,9 @@ def _cmd_strata_endpoint_chat(message: str, thread_id: str | None, model_id: str
                 "thread_id": reply.thread_id,
                 "content": reply.content,
                 "model_id": reply.model_id,
-                "mode": reply.mode,
-                "initial_mode": reply.initial_mode,
-                "mode_source": reply.mode_source,
-                "escalated": reply.escalated,
+                "reasoning_effort": reply.reasoning_effort,
+                "requested_reasoning_effort": reply.requested_reasoning_effort,
+                "reasoning_effort_source": reply.reasoning_effort_source,
                 "degraded_fallback": reply.degraded_fallback,
                 "response_budget": response_budget,
             },
@@ -1015,12 +1014,11 @@ def _cmd_strata_endpoint_set_prompt(prompt_kind: str, value: str) -> int:
     print(
         json.dumps(
             {
-                "status": "updated",
-                "prompt_kind": prompt_kind,
-                "prompt_config": {
-                    "route_selector_prompt": updated.route_selector_prompt,
-                    "fast_system_prompt": updated.fast_system_prompt,
-                    "persistent_system_prompt": updated.persistent_system_prompt,
+                    "status": "updated",
+                    "prompt_kind": prompt_kind,
+                    "prompt_config": {
+                    "reasoning_effort_selector_prompt": updated.reasoning_effort_selector_prompt,
+                    "default_system_prompt": updated.default_system_prompt,
                 },
             },
             indent=2,
@@ -1304,10 +1302,10 @@ def _build_parser() -> argparse.ArgumentParser:
     strata_chat.add_argument("--thread-id", default=None, help="Persistent thread id to continue.")
     strata_chat.add_argument("--model-id", default=None, help="Optional local model id override.")
     strata_chat.add_argument("--allow-degraded-fallback", action="store_true", help="Allow explicit degraded fallback semantics.")
-    strata_chat.add_argument("--mode", choices=("fast", "persistent"), default=None, help="Optional explicit execution mode override.")
+    strata_chat.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "high"), default="auto", help="Requested reasoning effort. `auto` asks the local model to choose the lightest adequate effort.")
     strata_chat.add_argument("--response-budget", choices=("instant", "normal", "deep"), default="normal", help="Requested response budget / latency preference.")
     strata_prompt = sub.add_parser("strata-endpoint-set-prompt", help="Update one native Strata-endpoint routing or execution prompt.")
-    strata_prompt.add_argument("--prompt-kind", choices=("route_selector", "fast_system", "persistent_system"), required=True, help="Prompt slot to update.")
+    strata_prompt.add_argument("--prompt-kind", choices=("reasoning_effort_selector", "default_system"), required=True, help="Prompt slot to update.")
     strata_prompt.add_argument("--value", required=True, help="New prompt text.")
     return parser
 
@@ -1394,7 +1392,7 @@ def main() -> int:
             args.thread_id,
             args.model_id,
             args.allow_degraded_fallback,
-            args.mode,
+            args.reasoning_effort,
             args.response_budget,
         )
     if args.command == "strata-endpoint-set-prompt":

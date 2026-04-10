@@ -4,12 +4,14 @@ import json
 
 from astrata.records.communications import CommunicationRecord
 from astrata.config.settings import load_settings
+from astrata.memory import MemoryStore
 from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
 from astrata.providers.registry import ProviderRegistry
-from astrata.loop0.runner import Loop0Runner, Loop0TaskCandidate
+from astrata.loop0.runner import Loop0CandidateAssessment, Loop0Runner, Loop0TaskCandidate
 from astrata.records.models import ArtifactRecord, TaskRecord
 from astrata.storage.db import AstrataDatabase
 from astrata.audit import open_signal
+from astrata.verification.basic import VerificationResult
 
 
 def test_loop0_runner_finds_a_missing_candidate():
@@ -47,6 +49,50 @@ def test_loop0_runner_records_one_cycle():
     assert "loop0_verification_review_meta_review" in artifact_types
     assert "loop0_inference_telemetry" in artifact_types
     assert result["verification"]["result"] in {"pass", "fail", "uncertain"}
+
+
+def test_loop0_recommendation_attaches_projected_memory_context():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = load_settings(root)
+        MemoryStore(settings.paths.data_dir / "memory.db").create_or_update_page(
+            slug="runtime-posture",
+            title="Runtime Posture",
+            body="Guidance about runtime posture fixes.",
+            summary="Runtime posture guidance.",
+            summary_public="A runtime posture note exists.",
+            tags=["runtime", "posture"],
+            visibility="shared",
+            confidentiality="normal",
+        )
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        provider = _CheapCliProvider()
+        runner = Loop0Runner(settings=settings, db=db, registry=ProviderRegistry({"cli": provider}))
+        candidate = Loop0TaskCandidate(
+            key="runtime-posture",
+            title="Inspect runtime posture",
+            description="Inspect the runtime posture and record the mismatch.",
+            expected_paths=("astrata/runtime.py",),
+        )
+        assessment = Loop0CandidateAssessment(
+            candidate=candidate,
+            inspection={"manual": True},
+            verification=VerificationResult(
+                result="pass",
+                confidence=0.8,
+                summary="Manual test candidate.",
+                evidence={},
+            ),
+        )
+
+        recommendation = runner.recommend_next_step(assessment)
+
+        assert recommendation["selection_mode"] in {"heuristic", "provider"}
+        assert provider.last_request is not None
+        assert provider.last_request.metadata["memory_context"] == [
+            "[public] Runtime Posture: A runtime posture note exists."
+        ]
 
 
 def test_loop0_selects_observation_signal_tasks_as_executable_alignment_work():
@@ -199,6 +245,9 @@ class _DeferredCodexProvider(Provider):
 
 
 class _CheapCliProvider(Provider):
+    def __init__(self) -> None:
+        self.last_request: CompletionRequest | None = None
+
     @property
     def name(self) -> str:
         return "cli"
@@ -213,6 +262,7 @@ class _CheapCliProvider(Provider):
         return ["kilocode", "gemini-cli"]
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
+        self.last_request = request
         return CompletionResponse(
             provider="cli",
             model=str(request.metadata.get("cli_tool") or "kilocode"),

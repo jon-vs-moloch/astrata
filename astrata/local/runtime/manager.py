@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import time
 from typing import Any
 from pathlib import Path
@@ -132,6 +133,10 @@ class LocalRuntimeManager:
         if model is None:
             raise RuntimeError(f"Unknown local model: {model_id}")
         profile = self._resolve_profile(profile_id)
+        if not _port_is_available(host, port):
+            raise RuntimeError(
+                f"Local runtime port {host}:{port} is already in use; refusing to load another managed model onto a busy port."
+            )
         launch_spec = self._build_launch_spec(
             backend_id=backend_id,
             backend=backend,
@@ -318,3 +323,12 @@ def _derive_runtime_path(path: Path, runtime_key: str) -> Path:
     stem = path.name[: -len(suffix)] if suffix else path.name
     filename = f"{stem}-{runtime_key}{suffix}"
     return path.with_name(filename)
+
+
+def _port_is_available(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return sock.connect_ex((host, int(port))) != 0
+    except Exception:
+        return False

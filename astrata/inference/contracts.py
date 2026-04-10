@@ -16,7 +16,6 @@ MemoryPolicy = Literal[
 ]
 InferenceStrategyId = Literal[
     "single_pass",
-    "fast_then_persistent",
     "cyclone",
 ]
 ContinuityMode = Literal["stateless", "threaded", "managed"]

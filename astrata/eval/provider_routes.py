@@ -17,6 +17,7 @@ from astrata.config.settings import load_settings
 from astrata.local.backends.llama_cpp import LlamaCppBackend
 from astrata.local.hardware import probe_thermal_state
 from astrata.local.strata_endpoint import StrataEndpointService
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
 from astrata.providers.base import CompletionRequest, Message, Provider
 from astrata.providers.registry import ProviderRegistry
 from astrata.local.runtime.client import LocalRuntimeClient
@@ -64,6 +65,7 @@ class ProviderRouteArena:
         local_client: LocalRuntimeClient | None = None,
         strata_service: StrataEndpointService | None = None,
     ) -> None:
+        self._settings = load_settings()
         self._registry = registry
         self._observations = observations
         self._ratings = ratings
@@ -277,7 +279,7 @@ class ProviderRouteArena:
             model_key = str(route.get("model") or "").strip()
             if not model_key:
                 raise RuntimeError("Local-model route requires a model identifier or path.")
-            thermal_state = probe_thermal_state(preference=load_settings().local_runtime.thermal_preference)
+            thermal_state = probe_thermal_state(preference=self._settings.local_runtime.thermal_preference)
             ready = _ensure_local_route_ready(self._local_runtime, model_key=model_key)
             request = CompletionRequest(
                 messages=[
@@ -300,8 +302,7 @@ class ProviderRouteArena:
                 thermal_pressure=thermal_state.thermal_pressure,
             )
         if provider_name in {"strata-endpoint", "strata_endpoint", "strata", "lightning"}:
-            settings = load_settings()
-            base_url = str(route.get("base_url") or settings.local_runtime.strata_endpoint_base_url or "").strip()
+            base_url = str(route.get("base_url") or self._settings.local_runtime.strata_endpoint_base_url or "").strip()
             thread_id = str(route.get("thread_id") or "").strip() or None
             allow_degraded_fallback = bool(route.get("allow_degraded_fallback"))
             started = time.monotonic()
@@ -326,6 +327,7 @@ class ProviderRouteArena:
                     model_id=str(route.get("model") or "").strip() or None,
                     allow_degraded_fallback=allow_degraded_fallback,
                     system_prompt=system_prompt,
+                    reasoning_effort=str(route.get("reasoning_effort") or "auto"),
                 )
                 content = reply.content
             execution = max(0.001, time.monotonic() - started)
@@ -343,7 +345,7 @@ class ProviderRouteArena:
         provider = self._registry.get_provider(str(route.get("provider") or ""))
         if provider is None:
             raise RuntimeError(f"Provider {route.get('provider')!r} is not configured.")
-        request = CompletionRequest(
+        request = build_memory_augmented_request(
             messages=[
                 Message(role="system", content=system_prompt or "You are a helpful Astrata evaluation worker."),
                 Message(role="user", content=prompt),
@@ -352,6 +354,10 @@ class ProviderRouteArena:
             metadata={
                 "cli_tool": route.get("cli_tool"),
             },
+            memory_store_path=default_memory_store_path(data_dir=self._settings.paths.data_dir),
+            memory_query=prompt,
+            accessor="local",
+            destination="remote",
         )
         started = time.monotonic()
         response = provider.complete(request)
@@ -381,7 +387,7 @@ class ProviderRouteArena:
         right_duration: float,
         judge_metadata: dict[str, object] | None = None,
     ) -> tuple[float, str]:
-        request = CompletionRequest(
+        request = build_memory_augmented_request(
             messages=[
                 Message(
                     role="system",
@@ -414,6 +420,10 @@ class ProviderRouteArena:
                 ),
             ],
             metadata=dict(judge_metadata or {}),
+            memory_store_path=default_memory_store_path(data_dir=self._settings.paths.data_dir),
+            memory_query=prompt,
+            accessor="local",
+            destination="remote",
         )
         response = judge.complete(request)
         payload = self._parse_json_payload(response.content)

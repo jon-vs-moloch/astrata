@@ -18,9 +18,9 @@ class InferencePlanner:
             return EndpointProfile(
                 endpoint_type="agent_session",
                 memory_policy="managed_session_state",
-                default_strategy="fast_then_persistent",
+                default_strategy="single_pass",
                 continuity="managed",
-                description="Long-running agentic endpoint with managed continuity rather than literal transcript replay.",
+                description="Long-running agentic endpoint with managed continuity and adaptive reasoning effort rather than literal transcript replay.",
                 quality_priority=0.75,
                 latency_priority=0.6,
                 hides_strategy_details=True,
@@ -70,8 +70,6 @@ class InferencePlanner:
         notes: list[str] = []
         if strategy == "cyclone":
             requirements.extend(["multi_model_residency", "edit_tail_invalidation"])
-        if strategy == "fast_then_persistent":
-            requirements.append("ephemeral_sessions")
         if backend is not None:
             if strategy == "cyclone" and not backend.multi_model_residency:
                 notes.append("Backend lacks native multi-model residency; Cyclone should remain disabled or emulated.")

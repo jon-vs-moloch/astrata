@@ -10,6 +10,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, Field
 
 from astrata.git import GitWorkspaceManager
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
 from astrata.providers.base import CompletionRequest, Message
 from astrata.procedures.health import RouteHealthStore
 from astrata.procedures.registry import ProcedureCapability
@@ -117,7 +118,7 @@ class BoundedFileGenerationProcedure:
             for attempt_index in range(1, max_attempts + 1):
                 attempt_count = attempt_index
                 try:
-                    generated_files = self._generate_via_provider(provider, route, request)
+                    generated_files = self._generate_via_provider(provider, route, request, project_root=project_root)
                     self._health_store.record_success(route_dict)
                     break
                 except Exception as exc:
@@ -244,9 +245,11 @@ class BoundedFileGenerationProcedure:
         provider: Any,
         route: Any,
         request: ProcedureExecutionRequest,
+        *,
+        project_root: Path,
     ) -> dict[str, str] | None:
         completion = provider.complete(
-            CompletionRequest(
+            build_memory_augmented_request(
                 model=route.model,
                 messages=[
                     Message(
@@ -265,6 +268,16 @@ class BoundedFileGenerationProcedure:
                     ),
                 ],
                 metadata={"cli_tool": route.cli_tool},
+                memory_store_path=default_memory_store_path(project_root=project_root),
+                memory_query=" ".join(
+                    [
+                        request.title,
+                        request.description,
+                        " ".join(request.available_docs),
+                    ]
+                ),
+                accessor="local",
+                destination="remote",
             )
         )
         payload = _try_parse_json(completion.content)

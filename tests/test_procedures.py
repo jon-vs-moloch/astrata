@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 
+from astrata.memory import MemoryStore
 from astrata.providers.base import CompletionResponse, Provider
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
 from astrata.procedures.health import RouteHealthStore
@@ -13,6 +14,7 @@ class _FakeProvider(Provider):
     def __init__(self, name: str, model: str = "test-model") -> None:
         self._name = name
         self._model = model
+        self.last_request = None
 
     @property
     def name(self) -> str:
@@ -25,6 +27,7 @@ class _FakeProvider(Provider):
         return self._model
 
     def complete(self, request):
+        self.last_request = request
         return CompletionResponse(
             provider=self._name,
             model=self._model,
@@ -110,6 +113,7 @@ def test_bounded_file_generation_procedure_honors_preferred_provider(tmp_path: P
     assert result.status == "applied"
     assert result.generation_mode == "provider"
     assert result.requested_route["provider"] == "google"
+    assert "memory_context" not in registry.get_provider("google").last_request.metadata
 
 
 def test_procedure_registry_falls_back_to_careful_variant_for_basic_actor():
@@ -163,3 +167,39 @@ def test_bounded_file_generation_procedure_can_write_via_git_worktree(tmp_path: 
     assert Path(str(result.workspace_path)).exists()
     assert (tmp_path / "astrata/generated.py").exists()
     assert result.procedure_metadata["mirrored_to_project_root"] is True
+
+
+def test_bounded_file_generation_procedure_attaches_projected_memory_context(tmp_path: Path):
+    store = MemoryStore(tmp_path / ".astrata" / "memory.db")
+    store.create_or_update_page(
+        slug="test-procedure",
+        title="Test Procedure",
+        body="Procedure guidance for creating test files.",
+        summary="Procedure guidance.",
+        summary_public="A procedure note exists for creating test files.",
+        tags=["test", "procedure"],
+        visibility="shared",
+        confidentiality="normal",
+    )
+    provider = _FakeProvider("openai", "gpt-test")
+    registry = ProviderRegistry({"openai": provider})
+    procedure = BoundedFileGenerationProcedure(
+        registry=registry,
+        router=RouteChooser(registry),
+        health_store=RouteHealthStore(tmp_path / "route-health.json"),
+    )
+    request = ProcedureExecutionRequest(
+        procedure_id="test",
+        title="Create test file",
+        description="Write one bounded file",
+        expected_paths=["astrata/generated.py"],
+        preferred_provider="openai",
+    )
+
+    result = procedure.execute(project_root=tmp_path, request=request)
+
+    assert result.status == "applied"
+    assert provider.last_request is not None
+    assert provider.last_request.metadata["memory_context"] == [
+        "[public] Test Procedure: A procedure note exists for creating test files."
+    ]

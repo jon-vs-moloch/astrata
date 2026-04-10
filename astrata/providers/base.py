@@ -56,3 +56,23 @@ class Provider(ABC):
 
     def get_quota_windows(self, route: dict[str, Any] | None = None) -> list[dict[str, Any]] | None:
         return None
+
+
+def assert_projected_memory_request(request: CompletionRequest, *, provider_name: str) -> None:
+    metadata = dict(request.metadata or {})
+    for key in ("memory_pages", "memory_records", "raw_memory", "raw_memory_pages", "memory_payloads"):
+        if key in metadata:
+            raise RuntimeError(
+                f"{provider_name} refused request: raw memory records may not be sent to a remote provider."
+            )
+
+    projected = metadata.get("memory_context")
+    if projected is None:
+        return
+    if isinstance(projected, str):
+        return
+    if isinstance(projected, list) and all(isinstance(item, str) for item in projected):
+        return
+    raise RuntimeError(
+        f"{provider_name} refused request: memory context must be projected text snippets, not raw memory structures."
+    )

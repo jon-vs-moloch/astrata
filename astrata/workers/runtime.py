@@ -8,6 +8,7 @@ from typing import Any
 
 from astrata.comms.lanes import PrincipalMessageLane
 from astrata.config.settings import Settings
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
 from astrata.providers.base import CompletionRequest, Message
 from astrata.providers.registry import ProviderRegistry, build_default_registry
 from astrata.records.communications import CommunicationRecord
@@ -97,7 +98,7 @@ class WorkerRuntime:
             )
         try:
             response = provider.complete(
-                CompletionRequest(
+                build_memory_augmented_request(
                     model=route.get("model"),
                     messages=self._delegated_message_task_prompt(payload),
                     metadata={
@@ -106,6 +107,13 @@ class WorkerRuntime:
                         "worker_id": worker_id,
                         "task_class": "delegated_message_task",
                     },
+                    memory_store_path=default_memory_store_path(data_dir=self.settings.paths.data_dir),
+                    memory_query=" ".join(
+                        str(payload.get(key) or "")
+                        for key in ("title", "description", "message")
+                    ),
+                    accessor="local",
+                    destination="remote",
                 )
             )
         except Exception as exc:

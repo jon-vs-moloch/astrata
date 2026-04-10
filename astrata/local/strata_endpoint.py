@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from astrata.inference.planner import InferencePlanner
-from astrata.inference.strategies import FastThenPersistentStrategy, SinglePassStrategy, StrategyContext
+from astrata.inference.strategies import SinglePassStrategy, StrategyContext
 from astrata.local.backends.llama_cpp import LlamaCppBackend
 from astrata.local.runtime.client import LocalRuntimeClient
 from astrata.local.runtime.manager import LocalRuntimeManager
@@ -23,25 +23,22 @@ class StrataEndpointReply:
     thread_id: str
     content: str
     model_id: str | None
-    mode: str = "persistent"
-    initial_mode: str = "persistent"
-    mode_source: str = "heuristic"
-    escalated: bool = False
+    reasoning_effort: str = "medium"
+    requested_reasoning_effort: str = "auto"
+    reasoning_effort_source: str = "auto_selector"
     degraded_fallback: bool = False
     strategy_id: str = "single_pass"
-    runtime_key: str = "default"
 
 
 @dataclass(frozen=True)
 class StrataEndpointPromptConfig:
-    route_selector_prompt: str
-    fast_system_prompt: str
-    persistent_system_prompt: str
+    reasoning_effort_selector_prompt: str
+    default_system_prompt: str
 
 
 @dataclass(frozen=True)
-class StrataModeDecision:
-    mode: str
+class StrataReasoningDecision:
+    reasoning_effort: str
     source: str
 
 
@@ -61,7 +58,6 @@ class StrataEndpointService:
         self._prompt_config_path = prompt_config_path or (self._state_path.parent / "strata_endpoint_prompts.json")
         self._planner = InferencePlanner()
         self._single_pass = SinglePassStrategy()
-        self._fast_then_persistent = FastThenPersistentStrategy()
 
     @classmethod
     def from_settings(cls, settings) -> "StrataEndpointService":
@@ -95,9 +91,8 @@ class StrataEndpointService:
             "execution_plan": execution_plan.model_dump(mode="json"),
             "prompt_config_path": str(self._prompt_config_path),
             "prompt_config": {
-                "route_selector_prompt": prompts.route_selector_prompt,
-                "fast_system_prompt": prompts.fast_system_prompt,
-                "persistent_system_prompt": prompts.persistent_system_prompt,
+                "reasoning_effort_selector_prompt": prompts.reasoning_effort_selector_prompt,
+                "default_system_prompt": prompts.default_system_prompt,
             },
             "selection": None if selection is None else selection.model_dump(mode="json"),
             "selections": [selection.model_dump(mode="json") for selection in self._runtime.list_selections()],
@@ -133,113 +128,78 @@ class StrataEndpointService:
         model_id: str | None = None,
         allow_degraded_fallback: bool = False,
         system_prompt: str | None = None,
-        mode: str | None = None,
+        reasoning_effort: str = "auto",
         response_budget: str = "normal",
     ) -> StrataEndpointReply:
         payload = self._load()
         active_thread_id = thread_id or f"thread-{uuid4()}"
         thread = list(payload.setdefault("threads", {}).get(active_thread_id, []))
         thread.append({"role": "user", "content": content})
-        selected_mode = self._choose_mode(
+        selected_reasoning = self._choose_reasoning_effort(
             content=content,
             thread=thread,
-            mode=mode,
+            reasoning_effort=reasoning_effort,
             response_budget=response_budget,
+            model_id=model_id,
         )
         execution_plan = self._planner.plan_for_endpoint(
             endpoint_type=self.profile().endpoint_type,
             backend=self._runtime.backend_capabilities("llama_cpp"),
         )
-        fast_request = self._build_request(
+        request = self._build_request(
             thread=thread,
-            content=content,
-            selected_mode="fast",
             system_prompt=system_prompt,
             response_budget=response_budget,
+            reasoning_effort=selected_reasoning.reasoning_effort,
         )
-        persistent_request = self._build_request(
-            thread=thread,
-            content=content,
-            selected_mode="persistent",
-            system_prompt=system_prompt,
-            response_budget="deep" if response_budget == "instant" else response_budget,
-        )
-        strategy_result = self._execute_strategy(
-            selected_mode=selected_mode.mode,
-            fast_request=fast_request,
-            persistent_request=persistent_request,
+        strategy_result = self._execute_request(
+            request=request,
             model_id=model_id,
             thread_id=active_thread_id,
             allow_degraded_fallback=allow_degraded_fallback,
             execution_plan=execution_plan,
         )
         reply = strategy_result.content
-        escalated = bool(strategy_result.metadata.get("escalated"))
-        initial_mode = selected_mode.mode
-        final_mode = "persistent" if escalated else selected_mode.mode
         thread.append(
             {
                 "role": "assistant",
                 "content": reply,
-                "mode": final_mode,
-                "initial_mode": initial_mode,
-                "mode_source": selected_mode.source,
-                "escalated": escalated,
+                "reasoning_effort": selected_reasoning.reasoning_effort,
+                "requested_reasoning_effort": reasoning_effort,
+                "reasoning_effort_source": selected_reasoning.source,
                 "response_budget": response_budget,
                 "strategy_id": strategy_result.strategy_id,
-                "runtime_key": strategy_result.runtime_key,
             }
         )
         payload["threads"][active_thread_id] = thread
         self._store(payload)
-        selection = self._runtime.current_selection(strategy_result.runtime_key)
+        selection = self._runtime.current_selection()
         return StrataEndpointReply(
             thread_id=active_thread_id,
             content=reply,
             model_id=None if selection is None else selection.model_id,
-            mode=final_mode,
-            initial_mode=initial_mode,
-            mode_source=selected_mode.source,
-            escalated=escalated,
+            reasoning_effort=selected_reasoning.reasoning_effort,
+            requested_reasoning_effort=reasoning_effort,
+            reasoning_effort_source=selected_reasoning.source,
             degraded_fallback=allow_degraded_fallback,
             strategy_id=strategy_result.strategy_id,
-            runtime_key=strategy_result.runtime_key,
         )
 
     def _build_request(
         self,
         *,
         thread: list[dict[str, Any]],
-        content: str,
-        selected_mode: str,
         system_prompt: str | None,
         response_budget: str,
+        reasoning_effort: str,
     ) -> CompletionRequest:
         prompts = self._load_prompt_config()
-        if selected_mode == "fast":
-            return CompletionRequest(
-                messages=[
-                    Message(
-                        role="system",
-                        content=system_prompt
-                        or prompts.fast_system_prompt,
-                    ),
-                    Message(role="user", content=content),
-                ],
-                model="local",
-                temperature=0.1,
-                metadata={
-                    "max_tokens": 80 if response_budget == "instant" else 160,
-                    "execution_mode": "fast",
-                    "response_budget": response_budget,
-                },
-            )
         recent_thread = thread[-8:]
         return CompletionRequest(
             messages=[
                 Message(
                     role="system",
-                    content=system_prompt or prompts.persistent_system_prompt,
+                    content=system_prompt or prompts.default_system_prompt,
                 ),
                 *[
                     Message(role=str(item.get("role") or "user"), content=str(item.get("content") or ""))
@@ -247,53 +207,64 @@ class StrataEndpointService:
                 ],
             ],
             model="local",
-            temperature=0.2 if response_budget != "deep" else 0.15,
+            temperature=0.2 if reasoning_effort in {"low", "medium"} else 0.15,
             metadata={
-                "max_tokens": 400 if response_budget != "deep" else 700,
-                "execution_mode": "persistent",
+                "max_tokens": self._max_tokens_for_budget(response_budget, reasoning_effort),
+                "reasoning_effort": reasoning_effort,
                 "response_budget": response_budget,
             },
         )
 
-    def _choose_mode(
+    def _choose_reasoning_effort(
         self,
         *,
         content: str,
         thread: list[dict[str, Any]],
-        mode: str | None,
+        reasoning_effort: str,
         response_budget: str,
-    ) -> StrataModeDecision:
-        if mode in {"fast", "persistent"}:
-            return StrataModeDecision(mode=mode, source="forced")
+        model_id: str | None = None,
+    ) -> StrataReasoningDecision:
+        normalized = str(reasoning_effort or "auto").strip().lower() or "auto"
+        if normalized in {"low", "medium", "high"}:
+            return StrataReasoningDecision(reasoning_effort=normalized, source="forced")
         if response_budget == "instant":
-            return StrataModeDecision(mode="fast", source="budget")
+            return StrataReasoningDecision(reasoning_effort="low", source="budget")
         if response_budget == "deep":
-            return StrataModeDecision(mode="persistent", source="budget")
-        decision = self._select_mode_with_model(content=content, thread=thread)
+            return StrataReasoningDecision(reasoning_effort="high", source="budget")
+        decision = self._select_reasoning_effort_with_model(content=content, thread=thread, model_id=model_id)
         if decision:
-            return StrataModeDecision(mode=decision, source="self_routed")
-        return StrataModeDecision(mode=self._heuristic_mode(content=content, thread=thread), source="heuristic")
+            return StrataReasoningDecision(reasoning_effort=decision, source="auto_selector")
+        return StrataReasoningDecision(
+            reasoning_effort=self._heuristic_reasoning_effort(content=content, thread=thread),
+            source="heuristic",
+        )
 
-    def _heuristic_mode(self, *, content: str, thread: list[dict[str, Any]]) -> str:
+    def _heuristic_reasoning_effort(self, *, content: str, thread: list[dict[str, Any]]) -> str:
         prompt = str(content or "").strip()
         lowered = prompt.lower()
         if len(thread) > 2:
-            return "persistent"
+            return "medium"
         if len(prompt) <= 140 and _looks_trivial_request(lowered):
-            return "fast"
+            return "low"
         if any(token in lowered for token in ("continue", "rewrite", "refine", "compare", "why", "plan", "strategy")):
-            return "persistent"
+            return "high"
         if prompt.count("\n") >= 3 or len(prompt) >= 300:
-            return "persistent"
-        return "fast"
+            return "high"
+        return "medium"
 
-    def _select_mode_with_model(self, *, content: str, thread: list[dict[str, Any]]) -> str | None:
-        endpoint = self._ensure_runtime(runtime_key="fast")
+    def _select_reasoning_effort_with_model(
+        self,
+        *,
+        content: str,
+        thread: list[dict[str, Any]],
+        model_id: str | None,
+    ) -> str | None:
+        endpoint = self._ensure_runtime(model_id=model_id)
         prompts = self._load_prompt_config()
         recent_thread = thread[-4:]
         request = CompletionRequest(
             messages=[
-                Message(role="system", content=prompts.route_selector_prompt),
+                Message(role="system", content=prompts.reasoning_effort_selector_prompt),
                 *[
                     Message(role=str(item.get("role") or "user"), content=str(item.get("content") or ""))
                     for item in recent_thread[:-1]
@@ -302,7 +273,7 @@ class StrataEndpointService:
             ],
             model="local",
             temperature=0.0,
-            metadata={"max_tokens": 8, "execution_mode": "route_selector", "response_budget": "instant"},
+            metadata={"max_tokens": 8, "reasoning_effort": "low", "response_budget": "instant"},
         )
         try:
             decision = self._client.complete(
@@ -313,17 +284,18 @@ class StrataEndpointService:
             ).strip().lower()
         except Exception:
             return None
-        if "persistent" in decision or "slow" in decision or "deep" in decision:
-            return "persistent"
-        if "fast" in decision or "quick" in decision or "instant" in decision:
-            return "fast"
+        if "high" in decision or "deep" in decision:
+            return "high"
+        if "low" in decision or "light" in decision or "quick" in decision:
+            return "low"
+        if "medium" in decision or "normal" in decision:
+            return "medium"
         return None
 
-    def _ensure_runtime(self, *, runtime_key: str = "default", model_id: str | None = None) -> str:
-        current = self._runtime.current_selection(runtime_key)
+    def _ensure_runtime(self, *, model_id: str | None = None) -> str:
+        current = self._runtime.current_selection()
         current_metadata = getattr(current, "metadata", {}) if current is not None else {}
         health = self._runtime.health(
-            runtime_key=runtime_key,
             config=current_metadata if current_metadata else None
         ) if current is not None else None
         if current is not None and current.endpoint and health is not None and health.ok:
@@ -347,86 +319,33 @@ class StrataEndpointService:
                     adopted = self._runtime.model_registry().adopt(chosen_model_id)
                     chosen_model_id = adopted.model_id
         self._runtime.start_managed(
-            runtime_key=runtime_key,
+            runtime_key="default",
             backend_id="llama_cpp",
             model_id=chosen_model_id,
             profile_id="quiet",
-            port=self._runtime_port(runtime_key),
-            activate=runtime_key != "fast",
+            port=self._runtime_port(),
+            activate=True,
         )
-        current = self._runtime.current_selection(runtime_key)
+        current = self._runtime.current_selection()
         if current is None or not current.endpoint:
             raise RuntimeError("Native Strata endpoint could not acquire a local runtime endpoint.")
         return current.endpoint.removesuffix("/health")
 
-    def _execute_strategy(
+    def _execute_request(
         self,
         *,
-        selected_mode: str,
-        fast_request: CompletionRequest,
-        persistent_request: CompletionRequest,
+        request: CompletionRequest,
         model_id: str | None,
         thread_id: str | None,
         allow_degraded_fallback: bool,
         execution_plan,
     ):
-        if execution_plan.strategy == "fast_then_persistent":
-            if selected_mode == "persistent":
-                endpoint = self._ensure_runtime(runtime_key="persistent", model_id=model_id)
-                return self._single_pass.execute(
-                    StrategyContext(
-                        request=persistent_request,
-                        endpoint_type=execution_plan.endpoint.endpoint_type,
-                        strategy_id="single_pass",
-                        memory_policy=execution_plan.memory_policy,
-                        continuity=execution_plan.endpoint.continuity,
-                        runtime_key="persistent",
-                        metadata={
-                            "executor": lambda req, runtime_key: self._client.complete(
-                                base_url=endpoint,
-                                request=req,
-                                thread_id=thread_id,
-                                allow_degraded_fallback=allow_degraded_fallback,
-                            )
-                        },
-                    )
-                )
-            fast_endpoint = self._ensure_runtime(runtime_key="fast", model_id=model_id)
-            persistent_endpoint = self._ensure_runtime(runtime_key="persistent", model_id=model_id)
-            return self._fast_then_persistent.execute(
-                StrategyContext(
-                    request=fast_request,
-                    endpoint_type=execution_plan.endpoint.endpoint_type,
-                    strategy_id=execution_plan.strategy,
-                    memory_policy=execution_plan.memory_policy,
-                    continuity=execution_plan.endpoint.continuity,
-                    runtime_key="fast",
-                    metadata={
-                        "fast_request": fast_request,
-                        "persistent_request": persistent_request,
-                        "fast_runtime_key": "fast",
-                        "persistent_runtime_key": "persistent",
-                        "fast_executor": lambda req, runtime_key: self._client.complete(
-                            base_url=fast_endpoint,
-                            request=req,
-                            thread_id=thread_id,
-                            allow_degraded_fallback=allow_degraded_fallback,
-                        ),
-                        "persistent_executor": lambda req, runtime_key: self._client.complete(
-                            base_url=persistent_endpoint,
-                            request=req,
-                            thread_id=thread_id,
-                            allow_degraded_fallback=allow_degraded_fallback,
-                        ),
-                    },
-                )
-            )
         if execution_plan.strategy != "single_pass":
             raise RuntimeError(f"Unsupported strategy for current endpoint: {execution_plan.strategy}")
-        endpoint = self._ensure_runtime(runtime_key="default", model_id=model_id)
+        endpoint = self._ensure_runtime(model_id=model_id)
         return self._single_pass.execute(
             StrategyContext(
-                request=persistent_request,
+                request=request,
                 endpoint_type=execution_plan.endpoint.endpoint_type,
                 strategy_id=execution_plan.strategy,
                 memory_policy=execution_plan.memory_policy,
@@ -443,9 +362,9 @@ class StrataEndpointService:
             )
         )
 
-    def _runtime_port(self, runtime_key: str) -> int:
+    def _runtime_port(self) -> int:
         base = 8080
-        current = self._runtime.current_selection(runtime_key)
+        current = self._runtime.current_selection()
         if current is not None and current.endpoint:
             match = re.search(r":(\d+)(?:/health)?$", current.endpoint)
             if match:
@@ -453,8 +372,14 @@ class StrataEndpointService:
                     return int(match.group(1))
                 except Exception:
                     pass
-        offsets = {"default": 0, "persistent": 0, "fast": 1}
-        return base + offsets.get(runtime_key, 2)
+        return base
+
+    def _max_tokens_for_budget(self, response_budget: str, reasoning_effort: str) -> int:
+        if response_budget == "instant":
+            return 120 if reasoning_effort == "low" else 180
+        if response_budget == "deep":
+            return 900 if reasoning_effort == "high" else 700
+        return {"low": 220, "medium": 420, "high": 700}.get(reasoning_effort, 420)
 
     def _load(self) -> dict[str, Any]:
         if not self._state_path.exists():
@@ -473,30 +398,23 @@ class StrataEndpointService:
 
     def _load_prompt_config(self) -> StrataEndpointPromptConfig:
         defaults = StrataEndpointPromptConfig(
-            route_selector_prompt=(
-                "You are Astrata's route selector. "
-                "Choose the cheapest adequate execution mode for this request. "
-                "Return exactly one word: FAST or PERSISTENT. "
-                "Choose FAST for trivial, one-shot, stateless requests. "
-                "Choose PERSISTENT for requests that need continuity, planning, refinement, or deeper reasoning. "
+            reasoning_effort_selector_prompt=(
+                "You are Astrata's reasoning-effort selector. "
+                "Choose the lightest adequate reasoning effort for this request. "
+                "Return exactly one word: LOW, MEDIUM, or HIGH. "
+                "Choose LOW for trivial, one-shot, or obvious requests. "
+                "Choose MEDIUM for normal requests that benefit from some thought. "
+                "Choose HIGH for requests that need planning, refinement, comparison, or deeper reasoning. "
                 "Do not explain your answer."
             ),
-            fast_system_prompt=(
-                "You are Astrata's fast local execution mode. "
-                "Answer directly and tersely. "
-                "Prefer the shortest correct useful response. "
-                "Do not add extra explanation, docstrings, or examples unless required. "
-                "If the task unexpectedly requires deeper reasoning than fast mode supports, respond with exactly ESCALATE_THINKING."
-            ),
-            persistent_system_prompt="You are Astrata's native persistent Strata-style endpoint.",
+            default_system_prompt="You are Astrata's native local Strata-style endpoint.",
         )
         if not self._prompt_config_path.exists():
             self._prompt_config_path.write_text(
                 json.dumps(
                     {
-                        "route_selector_prompt": defaults.route_selector_prompt,
-                        "fast_system_prompt": defaults.fast_system_prompt,
-                        "persistent_system_prompt": defaults.persistent_system_prompt,
+                        "reasoning_effort_selector_prompt": defaults.reasoning_effort_selector_prompt,
+                        "default_system_prompt": defaults.default_system_prompt,
                     },
                     indent=2,
                 ),
@@ -508,28 +426,28 @@ class StrataEndpointService:
         except Exception:
             return defaults
         return StrataEndpointPromptConfig(
-            route_selector_prompt=str(payload.get("route_selector_prompt") or defaults.route_selector_prompt),
-            fast_system_prompt=str(payload.get("fast_system_prompt") or defaults.fast_system_prompt),
-            persistent_system_prompt=str(payload.get("persistent_system_prompt") or defaults.persistent_system_prompt),
+            reasoning_effort_selector_prompt=str(
+                payload.get("reasoning_effort_selector_prompt")
+                or payload.get("route_selector_prompt")
+                or defaults.reasoning_effort_selector_prompt
+            ),
+            default_system_prompt=str(
+                payload.get("default_system_prompt")
+                or payload.get("persistent_system_prompt")
+                or defaults.default_system_prompt
+            ),
         )
 
     def set_prompt(self, *, prompt_kind: str, value: str) -> StrataEndpointPromptConfig:
         current = self._load_prompt_config()
         updates = {
-            "route_selector": {
-                "route_selector_prompt": value,
-                "fast_system_prompt": current.fast_system_prompt,
-                "persistent_system_prompt": current.persistent_system_prompt,
+            "reasoning_effort_selector": {
+                "reasoning_effort_selector_prompt": value,
+                "default_system_prompt": current.default_system_prompt,
             },
-            "fast_system": {
-                "route_selector_prompt": current.route_selector_prompt,
-                "fast_system_prompt": value,
-                "persistent_system_prompt": current.persistent_system_prompt,
-            },
-            "persistent_system": {
-                "route_selector_prompt": current.route_selector_prompt,
-                "fast_system_prompt": current.fast_system_prompt,
-                "persistent_system_prompt": value,
+            "default_system": {
+                "reasoning_effort_selector_prompt": current.reasoning_effort_selector_prompt,
+                "default_system_prompt": value,
             },
         }
         if prompt_kind not in updates:

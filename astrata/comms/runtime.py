@@ -12,6 +12,7 @@ from astrata.config.settings import Settings
 from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.local.strata_endpoint import StrataEndpointService
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
 from astrata.providers.base import CompletionRequest, Message
 from astrata.providers.registry import ProviderRegistry, build_default_registry
 from astrata.records.communications import CommunicationRecord
@@ -170,7 +171,7 @@ class LaneRuntime:
                 detail="missing_provider",
                 coordination=coordination,
             )
-        request = CompletionRequest(
+        request = build_memory_augmented_request(
             messages=[
                 Message(
                     role="system",
@@ -189,6 +190,10 @@ class LaneRuntime:
                 "conversation_id": conversation_id,
                 "task_class": "general",
             },
+            memory_store_path=default_memory_store_path(data_dir=self.settings.paths.data_dir),
+            memory_query=str(message.payload.get("message") or ""),
+            accessor="local",
+            destination="remote",
         )
         response = provider.complete(request)
         return self._emit_reply(
@@ -224,7 +229,7 @@ class LaneRuntime:
             lane="local",
             content=reply.content.strip() or "Local is ready.",
             action="direct_reply",
-            detail=f"mode:{reply.mode}",
+            detail=f"reasoning_effort:{reply.reasoning_effort}",
         )
 
     def _emit_reply(

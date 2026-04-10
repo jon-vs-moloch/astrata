@@ -7,7 +7,7 @@ def test_inference_planner_exposes_agent_session_profile():
     profile = planner.endpoint_profile("agent_session")
     assert profile.endpoint_type == "agent_session"
     assert profile.memory_policy == "managed_session_state"
-    assert profile.default_strategy == "fast_then_persistent"
+    assert profile.default_strategy == "single_pass"
     assert profile.continuity == "managed"
 
 

@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
+from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
 
 
 def _now() -> datetime:
@@ -68,6 +68,7 @@ class GoogleAiStudioProvider(Provider):
         api_key = self.api_key()
         if not api_key:
             raise RuntimeError("Google AI Studio API key is not configured")
+        assert_projected_memory_request(request, provider_name=self.name)
         model = request.model or self.default_model()
         payload: dict[str, Any] = {
             "model": model,

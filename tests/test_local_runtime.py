@@ -1,4 +1,5 @@
 from pathlib import Path
+import socket
 from tempfile import TemporaryDirectory
 
 from astrata.local.backends.llama_cpp import LlamaCppBackend, LlamaCppLaunchConfig
@@ -255,10 +256,45 @@ def test_local_runtime_manager_start_managed_applies_quiet_profile():
         assert "-t" in launch_spec.command
         assert "1" in launch_spec.command
         assert "-ngl" in launch_spec.command
+        assert "--ctx-size" in launch_spec.command
+        assert "8192" in launch_spec.command
+        assert "--cache-ram" in launch_spec.command
+        assert "--no-warmup" in launch_spec.command
         selection = manager.current_selection()
         assert selection is not None
         assert selection.profile_id == "quiet"
-        assert selection.runtime_key == "default"
+
+
+def test_local_runtime_manager_fails_fast_when_port_is_busy():
+    registry = LocalModelRegistry()
+    model = registry.adopt("/tmp/gemma-demo.gguf", display_name="gemma-demo")
+    with TemporaryDirectory() as tmp:
+        controller = ManagedProcessController(
+            state_path=Path(tmp) / "runtime.json",
+            log_path=Path(tmp) / "runtime.log",
+        )
+        manager = LocalRuntimeManager(
+            backends={"llama_cpp": LlamaCppBackend()},
+            model_registry=registry,
+            process_controller=controller,
+        )
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            busy_port = sock.getsockname()[1]
+            try:
+                manager.start_managed(
+                    backend_id="llama_cpp",
+                    model_id=model.model_id,
+                    profile_id="quiet",
+                    binary_path="/usr/local/bin/llama-server",
+                    host="127.0.0.1",
+                    port=busy_port,
+                )
+            except RuntimeError as exc:
+                assert "already in use" in str(exc)
+            else:
+                raise AssertionError("Expected busy port launch to fail fast.")
 
 
 def test_local_runtime_manager_can_track_multiple_managed_runtimes():

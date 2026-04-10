@@ -715,6 +715,8 @@ It stores:
 - preferences
 - recent work state
 - embeddings and retrieval indices
+- tiered summaries and disclosure views
+- provenance and revision history
 
 ### 10. Knowledge
 
@@ -817,6 +819,65 @@ These three surfaces belong to one routing system.
 ---
 
 ## Experimental Runtime
+
+The current local endpoint should converge on one explicit inference control surface centered on `reasoning_effort`.
+
+Near-term semantics should include:
+
+- `none`
+- `low`
+- `medium`
+- `high`
+- `auto`
+- `auto_none`
+- `auto_low`
+
+`auto` means the model first chooses the lightest adequate reasoning effort for the request, then answers using that effort.
+
+`auto_none` and `auto_low` mean effort selection itself should be done with no or low reasoning, which may be preferable for small local models.
+
+This should replace imprecise lane terminology such as “fast” versus “persistent” when the real distinction is simply reasoning effort selection.
+
+### Endpoint Versus Backend
+
+Serving configuration and backend residency should be separate concepts.
+
+Astrata should eventually support multiple externally visible endpoints with independent:
+
+- ports
+- auth policies
+- rate limits
+- disclosure rules
+- inference settings
+- experimental routing or reasoning policies
+
+But those endpoint-level configurations should not imply duplicate model loads by default.
+
+The system should be able to:
+
+- load models A, B, and C into one backend residency set
+- expose endpoint 1000 with models A and B
+- expose endpoint 1001 with models A and C
+- share the same loaded model instances unless deliberate duplicate loading was explicitly requested
+
+Multi-loading should remain possible, but it should be a separate operational decision rather than an accidental consequence of serving topology.
+
+### Local Security Enclave
+
+Local inference is not only a cost or privacy preference.
+It is also a security surface.
+
+Astrata should eventually have a secure local enclave accessible only to approved local runtimes and procedures.
+
+That enclave should support:
+
+- sensitive local-only context
+- disclosure policies
+- access checks
+- audit trails
+- explicit rules about when information may leave the machine or be shown to non-local models
+
+This is likely more strategically valuable than richer multi-endpoint serving in the near term and should be treated as a plausible priority candidate.
 
 Astrata should operate as an always-learning system under bounded experimental discipline.
 
@@ -1380,6 +1441,8 @@ This matters both for UI ergonomics and for model efficiency:
 - large operational records should not be injected into working context by default
 - summary-first access should be the normal path
 - deeper detail should remain available without polluting every turn
+- access level should determine which summary tier is returned
+- some security tiers should hide existence entirely rather than merely withholding details
 
 Strata-style response layering is the right direction here: concise top-level representations, with drill-down to detailed evidence only when needed.
 
@@ -1991,6 +2054,9 @@ Stores:
 - preferences
 - files, projects, relationships
 - embeddings and retrieval metadata
+- encyclopedic pages with dense links and revision history
+- disclosure-aware summaries for different access tiers
+- provenance for facts, edits, and derived summaries
 
 ### Knowledge Layer
 
@@ -2010,6 +2076,23 @@ Memory is optimized for retrieval.
 Knowledge is optimized for reuse and interpretation.
 
 They should interoperate, but they should not be collapsed into one blurry abstraction.
+
+Memory should feel much closer to a navigable, densely interlinked encyclopedia than to a flat transcript cache.
+The target shape is effectively "Wikipedia with permissions, provenance, and machine retrieval."
+
+Each memory object should support:
+
+- graph relationships
+- revision history
+- provenance
+- view and write permissions
+- retrieval indices
+- projected summaries at multiple disclosure tiers
+
+Projected retrieval is the default path.
+Remote-facing consumers should not receive raw pages directly.
+They should receive the highest disclosure tier they are permitted to see, and some access tiers should be unable to learn that a record exists at all.
+Remote egress should be fail-closed here: provider-boundary code should reject raw memory records outright and accept only projected text snippets or other explicitly approved disclosure formats.
 
 ---
 

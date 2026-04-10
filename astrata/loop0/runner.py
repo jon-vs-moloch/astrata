@@ -34,6 +34,7 @@ from astrata.governance.policy import (
     governance_change_is_authorized,
     protected_governance_paths,
 )
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
 from astrata.loop0.planner import Loop0Planner, PlannerSnapshot
 from astrata.loop0.resolution import determine_task_resolution
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
@@ -2310,7 +2311,7 @@ class Loop0Runner:
         if not provider:
             return heuristic
         try:
-            request = CompletionRequest(
+            request = build_memory_augmented_request(
                 model=route.get("model"),
                 messages=[
                     Message(
@@ -2333,6 +2334,10 @@ class Loop0Runner:
                     ),
                 ],
                 metadata={"cli_tool": route.get("cli_tool")},
+                memory_store_path=default_memory_store_path(data_dir=self.settings.paths.data_dir),
+                memory_query=" ".join([candidate.title, candidate.description]),
+                accessor="local",
+                destination="remote",
             )
             response = provider.complete(request)
             parsed = _try_parse_json(response.content)
@@ -3163,12 +3168,22 @@ class Loop0Runner:
 
         try:
             response = provider.complete(
-                CompletionRequest(
+                build_memory_augmented_request(
                     model=route.get("model"),
                     messages=self._message_task_prompt(candidate, task_payload),
                     metadata={
                         "cli_tool": route.get("cli_tool"),
                     },
+                    memory_store_path=default_memory_store_path(data_dir=self.settings.paths.data_dir),
+                    memory_query=" ".join(
+                        [
+                            candidate.title,
+                            candidate.description,
+                            str(task_payload.get("message") or ""),
+                        ]
+                    ),
+                    accessor="local",
+                    destination="remote",
                 )
             )
         except Exception as exc:

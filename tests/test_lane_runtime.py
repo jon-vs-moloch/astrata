@@ -5,6 +5,7 @@ from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
 from astrata.config.settings import AstrataPaths, LocalRuntimeSettings, RuntimeLimits, Settings
 from astrata.local.strata_endpoint import StrataEndpointReply
+from astrata.memory import MemoryStore
 from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
 from astrata.providers.registry import ProviderRegistry
 from astrata.storage.db import AstrataDatabase
@@ -29,6 +30,9 @@ def _settings(root: Path) -> Settings:
 
 
 class _PrimeProvider(Provider):
+    def __init__(self) -> None:
+        self.last_request: CompletionRequest | None = None
+
     @property
     def name(self) -> str:
         return "codex"
@@ -40,6 +44,7 @@ class _PrimeProvider(Provider):
         return "gpt-5.4"
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
+        self.last_request = request
         return CompletionResponse(provider="codex", model="gpt-5.4", content="Prime reply.")
 
 
@@ -64,10 +69,9 @@ class _FakeLocalEndpoint:
             thread_id=thread_id or "lane:local:default",
             content="Local reply.",
             model_id="local-model",
-            mode="fast",
-            initial_mode="fast",
-            mode_source="forced",
-            escalated=False,
+            reasoning_effort="low",
+            requested_reasoning_effort="auto",
+            reasoning_effort_source="auto_selector",
             degraded_fallback=False,
         )
 
@@ -161,3 +165,49 @@ def test_lane_runtime_uses_local_endpoint_for_local_lane():
         replies = [item for item in db.list_records("communications") if item.get("sender") == "local"]
         assert replies
         assert replies[-1]["payload"]["message"] == "Local reply."
+
+
+def test_lane_runtime_attaches_projected_memory_context_for_remote_reply():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        store = MemoryStore(settings.paths.data_dir / "memory.db")
+        store.create_or_update_page(
+            slug="astrata",
+            title="Astrata",
+            body="Astrata is a local-first coordination system.",
+            summary="Local-first coordination system.",
+            summary_public="Astrata is a coordination system.",
+            tags=["astrata", "coordination"],
+            visibility="shared",
+            confidentiality="normal",
+        )
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        lane = PrincipalMessageLane(db=db)
+        inbound = lane.send(
+            sender="principal",
+            recipient="prime",
+            conversation_id="lane:prime:default",
+            kind="request",
+            intent="principal_message",
+            payload={"message": "Tell me about Astrata."},
+        )
+        provider = _PrimeProvider()
+        runtime = LaneRuntime(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"codex": provider, "cli": _NoCliProvider()}),
+            local_endpoint=_FakeLocalEndpoint(),
+        )
+
+        runtime.handle_message(inbound)
+
+        assert provider.last_request is not None
+        assert provider.last_request.metadata["memory_context"] == [
+            "[public] Astrata: Astrata is a coordination system."
+        ]
+        assert any(
+            "Relevant memory context below is already projected" in str(message.content or "")
+            for message in provider.last_request.messages
+        )

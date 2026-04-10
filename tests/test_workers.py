@@ -3,6 +3,7 @@ from tempfile import TemporaryDirectory
 
 from astrata.comms.lanes import PrincipalMessageLane
 from astrata.config.settings import load_settings
+from astrata.memory import MemoryStore
 from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
 from astrata.providers.registry import ProviderRegistry
 from astrata.storage.db import AstrataDatabase
@@ -10,6 +11,9 @@ from astrata.workers.runtime import WorkerRuntime, worker_id_for_route
 
 
 class _CheapCliProvider(Provider):
+    def __init__(self) -> None:
+        self.last_request: CompletionRequest | None = None
+
     @property
     def name(self) -> str:
         return "cli"
@@ -24,6 +28,7 @@ class _CheapCliProvider(Provider):
         return ["kilocode", "gemini-cli"]
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
+        self.last_request = request
         return CompletionResponse(
             provider="cli",
             model=str(request.metadata.get("cli_tool") or "kilocode"),
@@ -99,3 +104,55 @@ def test_worker_runtime_scopes_worker_id_to_model_variant():
         "reason": "preferred_cli_tool",
     }
     assert worker_id_for_route(route) == "worker.gemini-cli.gemini-2-5-flash"
+
+
+def test_worker_runtime_attaches_projected_memory_context():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = load_settings(root)
+        store = MemoryStore(settings.paths.data_dir / "memory.db")
+        store.create_or_update_page(
+            slug="do-the-thing",
+            title="Do the Thing",
+            body="A standard operating note about doing the thing carefully.",
+            summary="Thing procedure.",
+            summary_public="A procedure note exists for doing the thing.",
+            tags=["thing"],
+            visibility="shared",
+            confidentiality="normal",
+        )
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        lane = PrincipalMessageLane(db=db)
+        route = {"provider": "cli", "cli_tool": "kilocode", "model": None, "reason": "preferred_cli_tool"}
+        worker_id = worker_id_for_route(route)
+        inbound = lane.send(
+            sender="prime",
+            recipient=worker_id,
+            conversation_id=lane.default_conversation_id(worker_id),
+            kind="delegation",
+            intent="worker_delegation_request",
+            payload={
+                "delegation_kind": "message_task",
+                "task_id": "task-1",
+                "title": "Do the thing",
+                "description": "Do the thing carefully.",
+                "message": "Do the thing carefully.",
+                "task_payload": {"completion_policy": {"type": "respond_or_execute"}},
+                "route": route,
+            },
+            related_task_ids=["task-1"],
+        )
+        provider = _CheapCliProvider()
+        runtime = WorkerRuntime(
+            settings=settings,
+            db=db,
+            registry=ProviderRegistry({"cli": provider}),
+        )
+
+        runtime.handle_message(inbound)
+
+        assert provider.last_request is not None
+        assert provider.last_request.metadata["memory_context"] == [
+            "[public] Do the Thing: A procedure note exists for doing the thing."
+        ]
