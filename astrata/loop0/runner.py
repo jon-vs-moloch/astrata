@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from astrata.audit import review_audit_review, review_consensus_judgment, select_audit_followup_policy
+from astrata.audit.posture import VerificationPostureStore
 from astrata.config.settings import Settings
 from astrata.comms.intake import normalize_derived_task_proposal
 from astrata.comms.lanes import HandoffLane, PrincipalMessageLane
@@ -150,6 +151,7 @@ class Loop0Runner:
         health_store = RouteHealthStore(settings.paths.data_dir / "route_health.json")
         self.health_store = health_store
         self.route_observations = EvalObservationStore(state_path=settings.paths.data_dir / "eval_observations.json")
+        self.verification_posture = VerificationPostureStore(settings.paths.data_dir / "verification_posture.json")
         quota_policy = QuotaPolicy(db=db, limits_per_source=limits, registry=self.registry)
         self.quota_policy = quota_policy
         self.procedures = BoundedFileGenerationProcedure(
@@ -1113,6 +1115,11 @@ class Loop0Runner:
             artifact_type=artifact_type,
             provenance=provenance,
         )
+        posture = self.verification_posture.record_review(
+            subject_kind=str(review.subject_kind or "unknown"),
+            findings_count=len(list(review.findings or [])),
+            status=str(review.status or "open"),
+        )
         meta_review = review_audit_review(review=review)
         meta_artifact = ArtifactRecord(
             artifact_type=f"{artifact_type}_meta_review",
@@ -1128,7 +1135,35 @@ class Loop0Runner:
             status="good" if not meta_review.findings else "degraded",
         )
         self.db.upsert_artifact(meta_artifact)
-        policy = select_audit_followup_policy(review=review)
+        meta_posture = self.verification_posture.record_review(
+            subject_kind="audit_review",
+            findings_count=len(list(meta_review.findings or [])),
+            status=str(meta_review.status or "open"),
+        )
+        posture_artifact = ArtifactRecord(
+            artifact_type="verification_posture",
+            title=f"Verification posture: {review.subject_kind}",
+            description="Current annealed verification/audit posture derived from recent review cleanliness.",
+            content_summary=json.dumps(
+                {
+                    "subject_posture": posture,
+                    "meta_review_posture": meta_posture,
+                    "source_review_id": review.review_id,
+                    "source_subject_kind": review.subject_kind,
+                    "source_subject_id": review.subject_id,
+                },
+                indent=2,
+            ),
+            provenance={
+                **provenance,
+                "review_id": review.review_id,
+                "subject_kind": review.subject_kind,
+                "subject_id": review.subject_id,
+            },
+            status="good" if posture.get("level") == "relaxed" else ("degraded" if posture.get("level") == "strict" else "good"),
+        )
+        self.db.upsert_artifact(posture_artifact)
+        policy = select_audit_followup_policy(review=review, sample_rate=int(posture.get("sample_rate") or 1))
         followup_tasks = self._materialize_review_followup_tasks(
             review=review,
             policy=policy,
@@ -1138,6 +1173,7 @@ class Loop0Runner:
                 "subject_kind": review.subject_kind,
                 "subject_id": review.subject_id,
                 "artifact_type": artifact_type,
+                "verification_posture": posture,
                 **provenance,
             },
         )
