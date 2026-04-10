@@ -181,6 +181,7 @@ class WorkerRuntime:
             "task_id": payload.get("task_id"),
             "completion_policy": task_payload.get("completion_policy"),
             "provenance": task_payload.get("provenance"),
+            "approval": payload.get("approval") or task_payload.get("completion_policy", {}).get("approval"),
         }
         return [
             Message(
@@ -195,7 +196,8 @@ class WorkerRuntime:
                     "`artifact` should be null or a compact object with `title`, `summary`, optional `confidence`, and optional `findings`."
                     " Non-prime workers are explicitly allowed to perform verification, audit, and review work when the task is bounded "
                     "and Astrata's routing policy judged this lane competent enough. Prefer the cheapest capable route and avoid escalating "
-                    "to Prime unless the work requires higher-judgment direction or protected authorization."
+                    "to Prime unless the work requires higher-judgment direction or protected authorization. "
+                    "Treat `approval` as authoritative: by default delegated work is not self-approving and requires explicit parent approval."
                 ),
             ),
             Message(role="user", content=str(payload.get("message") or "")),

@@ -76,10 +76,12 @@ def summarize_inference_activity(
     spent_attempts = 0
     prime_spend_attempts = 0
     avoidable_prime_attempts = 0
+    unjustified_prime_attempts = 0
     prime_review_attempts = 0
     prime_consensus_misses = 0
     consensus_candidate_attempts = 0
     avoidable_prime_examples: list[dict[str, Any]] = []
+    unjustified_prime_examples: list[dict[str, Any]] = []
     task_by_id = {str(task.get("task_id") or "").strip(): dict(task) for task in tasks if str(task.get("task_id") or "").strip()}
 
     for attempt in attempts:
@@ -136,6 +138,18 @@ def summarize_inference_activity(
                         "batchable": burden["batchable"],
                     }
                 )
+        if burden["unjustified_prime"]:
+            unjustified_prime_attempts += 1
+            if len(unjustified_prime_examples) < 5:
+                unjustified_prime_examples.append(
+                    {
+                        "task_id": burden["task_id"],
+                        "task_title": burden["task_title"],
+                        "task_class": burden["task_class"],
+                        "route": burden["route"],
+                        "prime_admission_basis": burden["prime_admission_basis"],
+                    }
+                )
 
     worker_statuses: Counter[str] = Counter()
     worker_routes: Counter[str] = Counter()
@@ -174,11 +188,13 @@ def summarize_inference_activity(
         "spent_by_task_class": dict(spent_by_task_class),
         "prime_spend_attempts": prime_spend_attempts,
         "avoidable_prime_attempts": avoidable_prime_attempts,
+        "unjustified_prime_attempts": unjustified_prime_attempts,
         "prime_review_attempts": prime_review_attempts,
         "prime_consensus_misses": prime_consensus_misses,
         "consensus_candidate_attempts": consensus_candidate_attempts,
         "prime_spend_by_task_class": dict(prime_spend_by_task_class),
         "avoidable_prime_examples": avoidable_prime_examples,
+        "unjustified_prime_examples": unjustified_prime_examples,
         "batchable_pending_tasks": batchable_pending_tasks,
         "delegation_by_source": dict(delegation_by_source),
         "worker_statuses": dict(worker_statuses),

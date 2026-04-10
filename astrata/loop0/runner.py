@@ -9,7 +9,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from astrata.audit import review_audit_review, review_consensus_judgment, select_audit_followup_policy
+from astrata.audit import (
+    ObservationSignal,
+    review_audit_review,
+    review_consensus_judgment,
+    select_audit_followup_policy,
+    select_signal_followup_policy,
+    signals_from_inference_telemetry,
+    signals_from_review,
+)
 from astrata.audit.posture import VerificationPostureStore
 from astrata.config.settings import Settings
 from astrata.comms.intake import normalize_derived_task_proposal
@@ -18,6 +26,7 @@ from astrata.context import build_quota_snapshot, summarize_inference_activity
 from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
+from astrata.governance.authority import delegated_task_approval
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
 from astrata.eval.observations import EvalObservation, EvalObservationStore
 from astrata.governance.policy import (
@@ -121,6 +130,9 @@ EXECUTABLE_MESSAGE_TASK_SOURCES = {
     "message_intake",
     "message_task_followup",
     "artifact_finding",
+    "alignment_maintenance",
+    "audit_followup",
+    "observation_signal",
     "startup_diagnostic",
 }
 
@@ -139,8 +151,8 @@ class Loop0Runner:
         self.procedure_registry = build_default_procedure_registry()
         self.router = RouteChooser(self.registry)
         limits = default_source_limits()
-        limits["codex"] = settings.runtime_limits.codex_requests_per_hour
-        limits["cli:codex-cli"] = settings.runtime_limits.codex_requests_per_hour
+        limits["codex"] = settings.runtime_limits.codex_direct_requests_per_hour
+        limits["cli:codex-cli"] = settings.runtime_limits.codex_cli_requests_per_hour
         limits["cli:kilocode"] = settings.runtime_limits.kilocode_requests_per_hour
         limits["cli:gemini-cli"] = settings.runtime_limits.gemini_requests_per_hour
         limits["cli:claude-code"] = settings.runtime_limits.claude_requests_per_hour
@@ -234,6 +246,17 @@ class Loop0Runner:
                 ScheduledWorkItem.from_assessment(
                     assessment,
                     source_kind="artifact_finding",
+                    created_at=str(dict(candidate.metadata or {}).get("created_at") or ""),
+                    metadata={"strategy": candidate.strategy, **scheduling_metadata},
+                )
+            )
+        for candidate in self._alignment_maintenance_candidates():
+            scheduling_metadata = self._scheduling_metadata_for_task_payload(dict(candidate.metadata or {}))
+            assessment = self._message_task_assessment(candidate)
+            work_items.append(
+                ScheduledWorkItem.from_assessment(
+                    assessment,
+                    source_kind="alignment_maintenance",
                     created_at=str(dict(candidate.metadata or {}).get("created_at") or ""),
                     metadata={"strategy": candidate.strategy, **scheduling_metadata},
                 )
@@ -1200,6 +1223,89 @@ class Loop0Runner:
             self.db.upsert_artifact(followup_artifact)
         return review_artifact, meta_artifact
 
+    def _persist_observation_signal(
+        self,
+        *,
+        signal: Any,
+        artifact_type: str,
+        title: str,
+        description: str,
+        provenance: dict[str, Any],
+    ) -> ArtifactRecord:
+        signal_artifact = ArtifactRecord(
+            artifact_type=artifact_type,
+            title=title,
+            description=description,
+            content_summary=signal.model_dump_json(indent=2),
+            provenance={
+                **provenance,
+                "signal_id": signal.signal_id,
+                "signal_kind": signal.signal_kind,
+                "subject_kind": signal.subject_kind,
+                "subject_id": signal.subject_id,
+            },
+            status="degraded" if signal.signal_kind in {"surprise", "problem", "drift"} else "good",
+        )
+        self.db.upsert_artifact(signal_artifact)
+        policy = select_signal_followup_policy(signal=signal)
+        followup_tasks = self._materialize_review_followup_tasks(
+            review=signal,
+            policy=policy,
+            parent_provenance={
+                "source": "observation_signal",
+                "signal_id": signal.signal_id,
+                "signal_kind": signal.signal_kind,
+                "subject_kind": signal.subject_kind,
+                "subject_id": signal.subject_id,
+                "artifact_type": artifact_type,
+                **provenance,
+            },
+        )
+        if followup_tasks:
+            followup_artifact = ArtifactRecord(
+                artifact_type=f"{artifact_type}_followups",
+                title=f"{title} follow-up routing",
+                description="Follow-up tasks derived from a durable internal observation signal.",
+                content_summary=json.dumps(
+                    {
+                        "policy": policy,
+                        "tasks": [task.model_dump(mode="json") for task in followup_tasks],
+                    },
+                    indent=2,
+                ),
+                provenance={
+                    **provenance,
+                    "signal_id": signal.signal_id,
+                    "subject_kind": signal.subject_kind,
+                    "subject_id": signal.subject_id,
+                },
+                status="degraded",
+            )
+            self.db.upsert_artifact(followup_artifact)
+        return signal_artifact
+
+    def _persist_signals(
+        self,
+        *,
+        signals: list[Any],
+        artifact_type: str,
+        title_prefix: str,
+        description: str,
+        provenance: dict[str, Any],
+    ) -> list[ArtifactRecord]:
+        artifacts: list[ArtifactRecord] = []
+        for signal in signals:
+            artifacts.append(
+                self._persist_observation_signal(
+                    signal=signal,
+                    artifact_type=artifact_type,
+                    title=f"{title_prefix}: {signal.subject_id}",
+                    description=description,
+                    provenance=provenance,
+                )
+            )
+        return artifacts
+
     def _record_audit_route_observations(
         self,
         *,
@@ -1861,6 +1967,195 @@ class Loop0Runner:
                 )
         return candidates
 
+    def _alignment_maintenance_candidates(self) -> list[Loop0TaskCandidate]:
+        tasks_by_id = self._tasks_by_id()
+        pending_subjects = self._pending_alignment_subject_keys(tasks_by_id=tasks_by_id)
+        candidates: list[Loop0TaskCandidate] = []
+        for artifact_payload in self.db.list_records("artifacts"):
+            candidate = self._alignment_candidate_from_artifact(
+                artifact_payload,
+                tasks_by_id=tasks_by_id,
+                pending_subjects=pending_subjects,
+            )
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+            metadata = dict(candidate.metadata or {})
+            subject_key = self._alignment_subject_key_from_payload(metadata)
+            if subject_key is not None:
+                pending_subjects.add(subject_key)
+        return candidates
+
+    def _alignment_candidate_from_artifact(
+        self,
+        artifact_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+        pending_subjects: set[tuple[str, ...]],
+    ) -> Loop0TaskCandidate | None:
+        artifact_type = str(artifact_payload.get("artifact_type") or "").strip()
+        if artifact_type in {"loop0_review_signal", "loop0_inference_signal"}:
+            return self._alignment_candidate_from_signal_artifact(
+                artifact_payload,
+                tasks_by_id=tasks_by_id,
+                pending_subjects=pending_subjects,
+            )
+        if artifact_type == "governance_drift_alert":
+            return self._alignment_candidate_from_governance_drift_artifact(
+                artifact_payload,
+                tasks_by_id=tasks_by_id,
+                pending_subjects=pending_subjects,
+            )
+        return None
+
+    def _alignment_candidate_from_signal_artifact(
+        self,
+        artifact_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+        pending_subjects: set[tuple[str, ...]],
+    ) -> Loop0TaskCandidate | None:
+        parsed = _try_parse_json(str(artifact_payload.get("content_summary") or "")) or {}
+        if not parsed:
+            return None
+        signal = ObservationSignal.model_validate(parsed)
+        if signal.status != "open":
+            return None
+        subject_key = ("subject", str(signal.subject_kind), str(signal.subject_id))
+        if subject_key in pending_subjects:
+            return None
+        policy = select_signal_followup_policy(signal=signal)
+        specs = [spec for spec in list(policy.get("followup_specs") or []) if isinstance(spec, dict)]
+        if not specs:
+            return None
+        spec = specs[0]
+        task_payload = {
+            "task_id": f"alignment-maintenance-{artifact_payload.get('artifact_id')}",
+            "title": str(spec.get("title") or f"Alignment maintenance: {signal.subject_id}"),
+            "description": str(spec.get("description") or signal.summary),
+            "priority": int(spec.get("priority") or 6),
+            "urgency": int(spec.get("urgency") or 3),
+            "risk": str(spec.get("risk") or "moderate"),
+            "status": "pending",
+            "provenance": {
+                "source": "alignment_maintenance",
+                "maintenance_kind": "signal_followup",
+                "source_artifact_id": artifact_payload.get("artifact_id"),
+                "signal_id": signal.signal_id,
+                "signal_kind": signal.signal_kind,
+                "subject_kind": signal.subject_kind,
+                "subject_id": signal.subject_id,
+            },
+            "success_criteria": dict(spec.get("success_criteria") or {"signal_addressed": True}),
+            "completion_policy": {
+                "type": str(spec.get("completion_type") or "review_or_audit"),
+                "route_preferences": dict(spec.get("route_preferences") or {}),
+            },
+            "created_at": str(artifact_payload.get("created_at") or ""),
+            "updated_at": str(artifact_payload.get("updated_at") or ""),
+        }
+        if not self._task_is_ready_for_selection(task_payload, tasks_by_id=tasks_by_id):
+            return None
+        return Loop0TaskCandidate(
+            key=f"alignment:{artifact_payload.get('artifact_id')}",
+            title=str(task_payload["title"]),
+            description=str(task_payload["description"]),
+            expected_paths=(),
+            strategy="message_task",
+            priority=int(task_payload["priority"]),
+            urgency=int(task_payload["urgency"]),
+            risk=str(task_payload["risk"]),
+            source_task_id=str(task_payload["task_id"]),
+            metadata=task_payload,
+        )
+
+    def _alignment_candidate_from_governance_drift_artifact(
+        self,
+        artifact_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+        pending_subjects: set[tuple[str, ...]],
+    ) -> Loop0TaskCandidate | None:
+        subject_key = ("governance_drift", "protected_governance")
+        if subject_key in pending_subjects:
+            return None
+        parsed = _try_parse_json(str(artifact_payload.get("content_summary") or "")) or {}
+        drifted_paths = [
+            str(path).strip()
+            for path in list(parsed.get("newly_reported_paths") or parsed.get("drifted_paths") or [])
+            if str(path).strip()
+        ]
+        if not drifted_paths:
+            return None
+        task_payload = {
+            "task_id": f"alignment-maintenance-{artifact_payload.get('artifact_id')}",
+            "title": "Correct detected system drift: protected_governance",
+            "description": (
+                "Investigate protected governance drift and either repair it or explicitly ratify it. "
+                f"Impacted paths: {', '.join(drifted_paths[:5])}"
+            ),
+            "priority": 9,
+            "urgency": 9,
+            "risk": "high",
+            "status": "pending",
+            "provenance": {
+                "source": "alignment_maintenance",
+                "maintenance_kind": "governance_drift",
+                "source_artifact_id": artifact_payload.get("artifact_id"),
+                "subject_kind": "governance_drift",
+                "subject_id": "protected_governance",
+                "drifted_paths": drifted_paths,
+            },
+            "success_criteria": {"governance_drift_addressed": True},
+            "completion_policy": {
+                "type": "review_or_audit",
+                "route_preferences": {"preferred_cli_tools": ["kilocode", "gemini-cli"]},
+            },
+            "created_at": str(artifact_payload.get("created_at") or ""),
+            "updated_at": str(artifact_payload.get("updated_at") or ""),
+        }
+        if not self._task_is_ready_for_selection(task_payload, tasks_by_id=tasks_by_id):
+            return None
+        return Loop0TaskCandidate(
+            key=f"alignment:{artifact_payload.get('artifact_id')}",
+            title=str(task_payload["title"]),
+            description=str(task_payload["description"]),
+            expected_paths=(),
+            strategy="message_task",
+            priority=int(task_payload["priority"]),
+            urgency=int(task_payload["urgency"]),
+            risk=str(task_payload["risk"]),
+            source_task_id=str(task_payload["task_id"]),
+            metadata=task_payload,
+        )
+
+    def _pending_alignment_subject_keys(
+        self,
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+    ) -> set[tuple[str, ...]]:
+        subjects: set[tuple[str, ...]] = set()
+        for task_payload in tasks_by_id.values():
+            if str(task_payload.get("status") or "").strip().lower() not in {"pending", "working", "blocked"}:
+                continue
+            subject_key = self._alignment_subject_key_from_payload(task_payload)
+            if subject_key is not None:
+                subjects.add(subject_key)
+        return subjects
+
+    def _alignment_subject_key_from_payload(self, task_payload: dict[str, Any]) -> tuple[str, ...] | None:
+        provenance = dict(task_payload.get("provenance") or {})
+        source = str(provenance.get("source") or "").strip().lower()
+        subject_kind = str(provenance.get("subject_kind") or "").strip()
+        subject_id = str(provenance.get("subject_id") or "").strip()
+        if source in {"observation_signal", "alignment_maintenance"} and subject_kind and subject_id:
+            if subject_kind == "governance_drift":
+                return ("governance_drift", subject_id)
+            return ("subject", subject_kind, subject_id)
+        if source == "audit_followup" and subject_kind and subject_id:
+            return ("subject", subject_kind, subject_id)
+        return None
+
     def _tasks_by_id(self) -> dict[str, dict[str, Any]]:
         return {
             str(task_payload.get("task_id") or "").strip(): task_payload
@@ -2424,12 +2719,21 @@ class Loop0Runner:
             expected_paths=list(candidate.expected_paths),
             implementation=implementation,
             verification=verification,
+            attempt=attempt.model_dump(mode="json"),
+            task_payload=task.model_dump(mode="json"),
         )
         review_artifact, verification_meta_review_artifact = self._persist_audit_review(
             review=verification_review,
             artifact_type="loop0_verification_review",
             title=f"Loop 0 verification review: {candidate.title}",
             description="Second-pass audit of whether verification matched observed repository state.",
+            provenance={"task_id": task.task_id, "attempt_id": attempt.attempt_id},
+        )
+        self._persist_signals(
+            signals=signals_from_review(verification_review),
+            artifact_type="loop0_review_signal",
+            title_prefix="Loop 0 review signal",
+            description="Durable internal observation signal derived from review findings.",
             provenance={"task_id": task.task_id, "attempt_id": attempt.attempt_id},
         )
 
@@ -2447,6 +2751,13 @@ class Loop0Runner:
             status="good",
         )
         self.db.upsert_artifact(telemetry_artifact)
+        self._persist_signals(
+            signals=signals_from_inference_telemetry(inference_telemetry),
+            artifact_type="loop0_inference_signal",
+            title_prefix="Loop 0 inference signal",
+            description="Durable internal observation signal derived from inference telemetry.",
+            provenance={"task_id": task.task_id, "attempt_id": attempt.attempt_id},
+        )
 
         self.db.upsert_verification(verification)
 
@@ -3026,6 +3337,7 @@ class Loop0Runner:
         )
         if len(routes) < 2:
             return None
+        approval = delegated_task_approval(task_payload=task_payload, delegated_by="prime")
         worker_task_ids: list[str] = []
         worker_ids: list[str] = []
         request_ids: list[str] = []
@@ -3047,11 +3359,14 @@ class Loop0Runner:
                     "worker_id": worker_id,
                     "task_class": "delegated_message_task",
                     "route": worker_route,
+                    "approval": approval,
                 },
+                permissions={"approval": approval},
                 success_criteria={"worker_result_reconciled": True},
                 completion_policy={
                     "type": "worker_execution",
                     "route_preferences": dict(task_payload.get("completion_policy", {}).get("route_preferences") or {}),
+                    "approval": approval,
                 },
             )
             self.db.upsert_task(worker_task)
@@ -3077,6 +3392,7 @@ class Loop0Runner:
                     },
                     "route": worker_route,
                     "worker_task_id": worker_task.task_id,
+                    "approval": approval,
                 },
                 priority=candidate.priority,
                 urgency=candidate.urgency,
@@ -3142,6 +3458,7 @@ class Loop0Runner:
         baseline_inspection: dict[str, Any],
     ) -> dict[str, Any] | None:
         worker_id = worker_id_for_route(route)
+        approval = delegated_task_approval(task_payload=task_payload, delegated_by="prime")
         worker_task = TaskRecord(
             parent_task_id=task_id,
             title=f"Worker Task: {candidate.title}",
@@ -3156,9 +3473,15 @@ class Loop0Runner:
                 "worker_id": worker_id,
                 "task_class": "delegated_message_task",
                 "route": route,
+                "approval": approval,
             },
+            permissions={"approval": approval},
             success_criteria={"worker_result_reconciled": True},
-            completion_policy={"type": "worker_execution", "route_preferences": dict(task_payload.get("completion_policy", {}).get("route_preferences") or {})},
+            completion_policy={
+                "type": "worker_execution",
+                "route_preferences": dict(task_payload.get("completion_policy", {}).get("route_preferences") or {}),
+                "approval": approval,
+            },
         )
         self.db.upsert_task(worker_task)
         request = self.principal_lane.send(
@@ -3176,6 +3499,7 @@ class Loop0Runner:
                 "task_payload": task_payload,
                 "route": route,
                 "worker_task_id": worker_task.task_id,
+                "approval": approval,
             },
             priority=candidate.priority,
             urgency=candidate.urgency,
@@ -3907,6 +4231,8 @@ class Loop0Runner:
                 "shortcut_allowed": bool(resolved.variant.metadata.get("shortcut_allowed")),
                 "capture_shortcut_candidate": bool(resolved.variant.metadata.get("capture_shortcut_candidate")),
                 "force_fallback_only": resolved.variant.force_fallback_only,
+                "use_git_worktree": True,
+                "task_id": candidate.key,
             },
         )
 

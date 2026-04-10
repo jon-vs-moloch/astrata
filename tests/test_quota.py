@@ -207,3 +207,76 @@ def test_coordinator_marks_review_work_as_consensus_eligible(tmp_path: Path | No
         return
     with TemporaryDirectory() as tmp:
         _run(Path(tmp))
+
+
+def test_coordinator_uses_prime_when_direct_execution_is_cheaper(tmp_path: Path | None = None):
+    def _run(base: Path) -> None:
+        db = AstrataDatabase(base / "quota.db")
+        db.initialize()
+        registry = ProviderRegistry({"codex": _QuotaProvider(), "cli": _CliQuotaProvider()})
+        policy = QuotaPolicy(
+            db=db,
+            limits_per_source={"codex": 12, "cli:kilocode": 200, "cli:gemini-cli": 60},
+            registry=registry,
+        )
+        coordinator = CoordinatorController(router=RouteChooser(registry), quota_policy=policy)
+        decision, route = coordinator.coordinate(
+            ControllerEnvelope(
+                controller_id="prime",
+                task_id="task-prime-direct",
+                priority=7,
+                urgency=7,
+                risk="low",
+                metadata={
+                    "task_class": "coding",
+                    "prime_direct_more_efficient": True,
+                },
+            )
+        )
+        assert decision.status == "accepted"
+        assert route.provider == "codex"
+        actions = {action["type"]: action for action in decision.followup_actions}
+        assert actions["prime_admission_basis"]["basis"] == ["direct_more_efficient"]
+
+    if tmp_path is not None:
+        _run(tmp_path)
+        return
+    with TemporaryDirectory() as tmp:
+        _run(Path(tmp))
+
+
+def test_coordinator_uses_prime_for_opportunistic_course_correction_when_budget_is_healthy(tmp_path: Path | None = None):
+    def _run(base: Path) -> None:
+        db = AstrataDatabase(base / "quota.db")
+        db.initialize()
+        registry = ProviderRegistry({"codex": _QuotaProvider(), "cli": _CliQuotaProvider()})
+        policy = QuotaPolicy(
+            db=db,
+            limits_per_source={"codex": 12, "cli:kilocode": 200, "cli:gemini-cli": 60},
+            registry=registry,
+        )
+        coordinator = CoordinatorController(router=RouteChooser(registry), quota_policy=policy)
+        decision, route = coordinator.coordinate(
+            ControllerEnvelope(
+                controller_id="prime",
+                task_id="task-course-correct",
+                priority=4,
+                urgency=3,
+                risk="low",
+                metadata={
+                    "task_class": "review",
+                    "completion_type": "review_or_audit",
+                    "allow_prime_course_correction": True,
+                },
+            )
+        )
+        assert decision.status == "accepted"
+        assert route.provider == "codex"
+        actions = {action["type"]: action for action in decision.followup_actions}
+        assert actions["prime_admission_basis"]["basis"] == ["opportunistic_course_correction"]
+
+    if tmp_path is not None:
+        _run(tmp_path)
+        return
+    with TemporaryDirectory() as tmp:
+        _run(Path(tmp))

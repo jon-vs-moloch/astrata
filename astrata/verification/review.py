@@ -6,6 +6,7 @@ from pathlib import Path
 
 from astrata.audit.review import AuditReview, ReviewFinding, open_review
 from astrata.records.models import VerificationRecord
+from astrata.routing.prime_policy import prime_burden_summary
 from astrata.verification.basic import inspect_expected_paths
 
 
@@ -16,6 +17,8 @@ def review_verification(
     expected_paths: list[str],
     implementation: dict[str, object],
     verification: VerificationRecord,
+    attempt: dict[str, object] | None = None,
+    task_payload: dict[str, object] | None = None,
 ) -> AuditReview:
     inspection = inspect_expected_paths(project_root, expected_paths)
     findings: list[ReviewFinding] = []
@@ -64,6 +67,34 @@ def review_verification(
                 },
             )
         )
+
+    if attempt is not None:
+        burden = prime_burden_summary(attempt=attempt, task_payload=task_payload)
+        if burden["unjustified_prime"]:
+            findings.append(
+                ReviewFinding(
+                    severity="moderate",
+                    summary="Prime was invoked without a recorded admission basis; route policy should be reviewed and corrected.",
+                    evidence={
+                        "candidate_key": candidate_key,
+                        "route": burden["route"],
+                        "task_id": burden["task_id"],
+                        "task_class": burden["task_class"],
+                        "prime_admission_basis": burden["prime_admission_basis"],
+                    },
+                    proposed_actions=[
+                        {
+                            "type": "review_prime_routing",
+                            "task_id": burden["task_id"],
+                            "expected_basis": [
+                                "direct_more_efficient",
+                                "catastrophic_or_protected",
+                                "opportunistic_course_correction",
+                            ],
+                        }
+                    ],
+                )
+            )
 
     summary = (
         "Verification is internally consistent with filesystem reality."

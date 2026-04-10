@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
+import subprocess
 from typing import Any
 
 from astrata.comms.intake import process_inbound_messages
@@ -85,6 +87,14 @@ class AstrataUIService:
             tasks=[task.model_dump(mode="json") for task in tasks],
             quota_snapshots=self._quota_snapshots(db, registry),
         )
+        history = self._history_snapshot(
+            tasks=tasks,
+            attempts=attempts,
+            artifacts=artifacts,
+            verifications=verifications,
+            communications=self._communications(db),
+            inference_telemetry=inference_telemetry,
+        )
         return {
             "generated_at": _now_iso(),
             "product": {
@@ -115,6 +125,7 @@ class AstrataUIService:
                 "recent_attempts": [self._attempt_summary(attempt) for attempt in attempts[:8]],
             },
             "inference": inference_telemetry,
+            "history": history,
             "communications": {
                 "principal_inbox": [self._message_summary(message) for message in principal_messages],
                 "operator_inbox": [self._message_summary(message) for message in principal_messages],
@@ -344,8 +355,8 @@ class AstrataUIService:
 
     def _quota_policy(self, db: AstrataDatabase, registry: ProviderRegistry) -> QuotaPolicy:
         limits = default_source_limits()
-        limits["codex"] = self.settings.runtime_limits.codex_requests_per_hour
-        limits["cli:codex-cli"] = self.settings.runtime_limits.codex_requests_per_hour
+        limits["codex"] = self.settings.runtime_limits.codex_direct_requests_per_hour
+        limits["cli:codex-cli"] = self.settings.runtime_limits.codex_cli_requests_per_hour
         limits["cli:kilocode"] = self.settings.runtime_limits.kilocode_requests_per_hour
         limits["cli:gemini-cli"] = self.settings.runtime_limits.gemini_requests_per_hour
         limits["cli:claude-code"] = self.settings.runtime_limits.claude_requests_per_hour
@@ -560,3 +571,322 @@ class AstrataUIService:
             return True
         content = artifact.content_summary or ""
         return task_id in content
+
+    def _history_snapshot(
+        self,
+        *,
+        tasks: list[TaskRecord],
+        attempts: list[AttemptRecord],
+        artifacts: list[ArtifactRecord],
+        verifications: list[VerificationRecord],
+        communications: list[CommunicationRecord],
+        inference_telemetry: dict[str, Any],
+    ) -> dict[str, Any]:
+        recent_events = self._history_events(
+            tasks=tasks,
+            attempts=attempts,
+            artifacts=artifacts,
+            verifications=verifications,
+            communications=communications,
+        )
+        return {
+            "window_hours": int(inference_telemetry.get("window_hours") or 24),
+            "overview": {
+                "tasks_total": len(tasks),
+                "attempts_total": len(attempts),
+                "artifacts_total": len(artifacts),
+                "verifications_total": len(verifications),
+                "communications_total": len(communications),
+                "blocked_tasks": sum(1 for task in tasks if task.status == "blocked"),
+                "failed_attempts": sum(1 for attempt in attempts if attempt.outcome == "failed"),
+                "pending_tasks": sum(1 for task in tasks if task.status == "pending"),
+                "prime_attempts": int(inference_telemetry.get("prime_spend_attempts") or 0),
+                "avoidable_prime_attempts": int(inference_telemetry.get("avoidable_prime_attempts") or 0),
+                "unjustified_prime_attempts": int(inference_telemetry.get("unjustified_prime_attempts") or 0),
+            },
+            "runtime": self._history_runtime_status(tasks=tasks, attempts=attempts, artifacts=artifacts),
+            "bottlenecks": self._history_bottlenecks(tasks=tasks, attempts=attempts, inference_telemetry=inference_telemetry),
+            "snapshot_reports": [self._artifact_summary(artifact) for artifact in artifacts[:10] if self._is_history_worthy_artifact(artifact)],
+            "recent_events": recent_events[:24],
+            "git": self._git_snapshot(),
+        }
+
+    def _history_events(
+        self,
+        *,
+        tasks: list[TaskRecord],
+        attempts: list[AttemptRecord],
+        artifacts: list[ArtifactRecord],
+        verifications: list[VerificationRecord],
+        communications: list[CommunicationRecord],
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for task in tasks[:12]:
+            events.append(
+                {
+                    "event_kind": "task",
+                    "event_id": task.task_id,
+                    "title": task.title,
+                    "summary": task.description,
+                    "status": task.status,
+                    "timestamp": task.updated_at,
+                }
+            )
+        for attempt in attempts[:12]:
+            events.append(
+                {
+                    "event_kind": "attempt",
+                    "event_id": attempt.attempt_id,
+                    "title": attempt.actor,
+                    "summary": attempt.result_summary or attempt.failure_kind or "Execution attempt recorded.",
+                    "status": attempt.outcome,
+                    "timestamp": attempt.ended_at or attempt.started_at,
+                }
+            )
+        for artifact in artifacts[:12]:
+            events.append(
+                {
+                    "event_kind": "artifact",
+                    "event_id": artifact.artifact_id,
+                    "title": artifact.title,
+                    "summary": artifact.content_summary or artifact.description or artifact.artifact_type,
+                    "status": artifact.status,
+                    "timestamp": artifact.updated_at,
+                }
+            )
+        for verification in verifications[:8]:
+            events.append(
+                {
+                    "event_kind": "verification",
+                    "event_id": verification.verification_id,
+                    "title": f"{verification.target_kind}:{verification.target_id}",
+                    "summary": f"{verification.verifier} verification recorded.",
+                    "status": verification.result,
+                    "timestamp": verification.created_at,
+                }
+            )
+        for message in communications[:8]:
+            body = str(message.payload.get("message") or "").strip()
+            events.append(
+                {
+                    "event_kind": "communication",
+                    "event_id": message.communication_id,
+                    "title": f"{message.sender} -> {message.recipient}",
+                    "summary": body or f"{message.intent or message.kind} message",
+                    "status": message.status,
+                    "timestamp": message.created_at,
+                }
+            )
+        events.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
+        return events
+
+    def _history_bottlenecks(
+        self,
+        *,
+        tasks: list[TaskRecord],
+        attempts: list[AttemptRecord],
+        inference_telemetry: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        bottlenecks: list[dict[str, Any]] = []
+        blocked_tasks = sum(1 for task in tasks if task.status == "blocked")
+        if blocked_tasks:
+            bottlenecks.append(
+                {
+                    "title": "Blocked tasks",
+                    "summary": f"{blocked_tasks} task(s) are currently blocked and may need intervention.",
+                    "severity": "moderate" if blocked_tasks < 3 else "high",
+                }
+            )
+        failed_attempts = sum(1 for attempt in attempts if attempt.outcome == "failed")
+        if failed_attempts:
+            bottlenecks.append(
+                {
+                    "title": "Failed attempts",
+                    "summary": f"{failed_attempts} recent attempt(s) failed and may be consuming throughput without progress.",
+                    "severity": "moderate" if failed_attempts < 3 else "high",
+                }
+            )
+        quota_pressure = list(inference_telemetry.get("quota_pressure") or [])
+        constrained = [item for item in quota_pressure if not bool(item.get("allowed", True))]
+        if constrained:
+            sources = ", ".join(str(item.get("source") or item.get("route", {}).get("provider") or "unknown") for item in constrained[:3])
+            bottlenecks.append(
+                {
+                    "title": "Quota pressure",
+                    "summary": f"One or more routes are currently throttled or exhausted: {sources}.",
+                    "severity": "high",
+                }
+            )
+        avoidable_prime_attempts = int(inference_telemetry.get("avoidable_prime_attempts") or 0)
+        if avoidable_prime_attempts:
+            bottlenecks.append(
+                {
+                    "title": "Avoidable Prime load",
+                    "summary": f"{avoidable_prime_attempts} recent Prime invocation(s) look avoidable and should move to cheaper capable routes.",
+                    "severity": "moderate",
+                }
+            )
+        unjustified_prime_attempts = int(inference_telemetry.get("unjustified_prime_attempts") or 0)
+        if unjustified_prime_attempts:
+            bottlenecks.append(
+                {
+                    "title": "Prime policy drift",
+                    "summary": f"{unjustified_prime_attempts} recent Prime invocation(s) lacked a recorded admission basis.",
+                    "severity": "high",
+                }
+            )
+        return bottlenecks[:8]
+
+    def _history_runtime_status(
+        self,
+        *,
+        tasks: list[TaskRecord],
+        attempts: list[AttemptRecord],
+        artifacts: list[ArtifactRecord],
+    ) -> dict[str, Any]:
+        heartbeat = next((artifact for artifact in artifacts if artifact.artifact_type == "loop0_daemon_heartbeat"), None)
+        heartbeat_payload: dict[str, Any] = {}
+        if heartbeat is not None:
+            try:
+                heartbeat_payload = json.loads(heartbeat.content_summary or "{}")
+            except Exception:
+                heartbeat_payload = {}
+        last_success = next(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.artifact_type == "loop0_daemon_heartbeat"
+                and str(dict(artifact.provenance or {}).get("status") or "").strip() == "ok"
+            ),
+            None,
+        )
+        last_failure = next(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.artifact_type == "loop0_daemon_heartbeat"
+                and str(dict(artifact.provenance or {}).get("status") or "").strip() == "failed"
+            ),
+            None,
+        )
+        stale = False
+        interval_seconds = int(heartbeat_payload.get("interval_seconds") or 0)
+        if heartbeat is not None and interval_seconds > 0:
+            try:
+                updated_at = datetime.fromisoformat(str(heartbeat.updated_at))
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                stale = (datetime.now(timezone.utc) - updated_at).total_seconds() > max(interval_seconds * 3, 180)
+            except Exception:
+                stale = False
+        return {
+            "daemon_configured": heartbeat is not None,
+            "stale": stale,
+            "latest_heartbeat": None if heartbeat is None else self._artifact_summary(heartbeat),
+            "latest_heartbeat_payload": heartbeat_payload,
+            "last_successful_heartbeat": None if last_success is None else self._artifact_summary(last_success),
+            "last_failed_heartbeat": None if last_failure is None else self._artifact_summary(last_failure),
+            "latest_attempt": None if not attempts else self._attempt_summary(attempts[0]),
+            "latest_task": None if not tasks else self._task_summary(tasks[0]),
+        }
+
+    def _is_history_worthy_artifact(self, artifact: ArtifactRecord) -> bool:
+        artifact_type = str(artifact.artifact_type or "").strip().lower()
+        return any(
+            token in artifact_type
+            for token in ("telemetry", "review", "signal", "report", "summary", "history")
+        )
+
+    def _git_snapshot(self) -> dict[str, Any]:
+        project_root = self.settings.paths.project_root
+        status_proc = self._run_git(project_root, "status", "--short", "--branch")
+        worktree_proc = self._run_git(project_root, "worktree", "list", "--porcelain")
+        snapshot = {
+            "available": bool(status_proc is not None and status_proc.returncode == 0),
+            "branch": None,
+            "head": None,
+            "ahead": 0,
+            "behind": 0,
+            "dirty": False,
+            "modified_count": 0,
+            "modified_paths": [],
+            "worktrees": [],
+        }
+        if status_proc is None or status_proc.returncode != 0:
+            return snapshot
+        status_lines = [line.rstrip() for line in status_proc.stdout.splitlines() if line.strip()]
+        if status_lines:
+            branch_line = status_lines[0]
+            if branch_line.startswith("## "):
+                snapshot.update(self._parse_git_branch_line(branch_line[3:]))
+            modified_paths = []
+            for line in status_lines[1:]:
+                payload = line[3:] if len(line) > 3 else line
+                modified_paths.append(payload.strip())
+            snapshot["dirty"] = bool(modified_paths)
+            snapshot["modified_count"] = len(modified_paths)
+            snapshot["modified_paths"] = modified_paths[:12]
+        if worktree_proc is not None:
+            snapshot["worktrees"] = self._parse_worktree_list(worktree_proc.stdout)
+        return snapshot
+
+    def _run_git(self, cwd: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return None
+
+    def _parse_git_branch_line(self, payload: str) -> dict[str, Any]:
+        branch = payload
+        ahead = 0
+        behind = 0
+        if "..." in payload:
+            branch, tracking = payload.split("...", 1)
+            if "[" in tracking and "]" in tracking:
+                tracking, bracket = tracking.split("[", 1)
+                details = bracket.rstrip("]")
+                for item in [piece.strip() for piece in details.split(",")]:
+                    if item.startswith("ahead "):
+                        ahead = int(item.split(" ", 1)[1] or 0)
+                    elif item.startswith("behind "):
+                        behind = int(item.split(" ", 1)[1] or 0)
+        return {
+            "branch": branch.strip(),
+            "head": None,
+            "ahead": ahead,
+            "behind": behind,
+        }
+
+    def _parse_worktree_list(self, payload: str) -> list[dict[str, Any]]:
+        worktrees: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+        for raw_line in payload.splitlines():
+            line = raw_line.strip()
+            if not line:
+                if current:
+                    worktrees.append(current)
+                    current = None
+                continue
+            if line.startswith("worktree "):
+                if current:
+                    worktrees.append(current)
+                current = {"path": line.split(" ", 1)[1], "branch": None, "head": None}
+                continue
+            if current is None:
+                continue
+            if line.startswith("HEAD "):
+                current["head"] = line.split(" ", 1)[1]
+            elif line.startswith("branch "):
+                current["branch"] = line.split(" ", 1)[1]
+            elif line == "bare":
+                current["bare"] = True
+            elif line == "detached":
+                current["detached"] = True
+        if current:
+            worktrees.append(current)
+        return worktrees[:12]

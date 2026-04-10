@@ -49,6 +49,8 @@ class WorkPrioritizer:
     def _source_bias(self, item: ScheduledWorkItem) -> int:
         if item.source_kind == "message_task":
             return 3
+        if item.source_kind == "alignment_maintenance":
+            return 2
         if item.source_kind == "retry_task":
             return 2
         if item.source_kind == "artifact_finding":

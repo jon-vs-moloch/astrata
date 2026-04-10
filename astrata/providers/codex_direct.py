@@ -17,7 +17,14 @@ class CodexDirectProvider(Provider):
         self._name = name
         self._endpoint = "https://chatgpt.com/backend-api/codex/responses"
         self._timeout_seconds = int(os.environ.get("ASTRATA_CODEX_DIRECT_TIMEOUT_SECONDS", "90"))
-        self._default_model = str(os.environ.get("ASTRATA_CODEX_MODEL") or "gpt-5.4").strip() or "gpt-5.4"
+        self._default_model = (
+            str(
+                os.environ.get("ASTRATA_CODEX_DIRECT_MODEL")
+                or os.environ.get("ASTRATA_CODEX_MODEL")
+                or "gpt-5.4"
+            ).strip()
+            or "gpt-5.4"
+        )
 
     @property
     def name(self) -> str:

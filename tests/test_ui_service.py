@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from datetime import datetime, timedelta, timezone
 
 from astrata.config.settings import AstrataPaths, LocalRuntimeSettings, RuntimeLimits, Settings
 from astrata.records.models import AttemptRecord, ArtifactRecord, TaskRecord, VerificationRecord
@@ -115,6 +116,7 @@ def test_ui_service_task_detail_and_lane_views():
 
 def test_ui_service_snapshot_reports_inference_spend():
     with TemporaryDirectory() as tmp:
+        now = datetime.now(timezone.utc)
         root = Path(tmp)
         settings = _settings(root)
         db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
@@ -169,8 +171,8 @@ def test_ui_service_snapshot_reports_inference_spend():
                         "resolved_route": {"provider": "cli", "cli_tool": "gemini-cli", "model": "gemini-2.5-flash"},
                     }
                 },
-                started_at="2026-04-09T00:00:00+00:00",
-                ended_at="2026-04-09T00:05:00+00:00",
+                started_at=(now - timedelta(minutes=15)).isoformat(),
+                ended_at=(now - timedelta(minutes=10)).isoformat(),
             )
         )
         db.upsert_attempt(
@@ -187,8 +189,8 @@ def test_ui_service_snapshot_reports_inference_spend():
                         "resolved_route": {"provider": "codex", "model": "gpt-5.4"},
                     }
                 },
-                started_at="2026-04-09T00:10:00+00:00",
-                ended_at="2026-04-09T00:11:00+00:00",
+                started_at=(now - timedelta(minutes=8)).isoformat(),
+                ended_at=(now - timedelta(minutes=7)).isoformat(),
             )
         )
         service = AstrataUIService(settings=settings)
@@ -199,8 +201,93 @@ def test_ui_service_snapshot_reports_inference_spend():
         assert snapshot["inference"]["worker_statuses"]["working"] == 1
         assert snapshot["inference"]["prime_spend_attempts"] == 1
         assert snapshot["inference"]["avoidable_prime_attempts"] == 1
+        assert snapshot["inference"]["unjustified_prime_attempts"] == 1
         assert snapshot["inference"]["prime_review_attempts"] == 1
         assert snapshot["inference"]["prime_consensus_misses"] == 1
         assert snapshot["inference"]["batchable_pending_tasks"] == 1
         assert snapshot["inference"]["avoidable_prime_examples"][0]["task_id"] == "review-task-1"
+        assert snapshot["inference"]["unjustified_prime_examples"][0]["task_id"] == "review-task-1"
         assert snapshot["inference"]["quota_snapshot_count"] >= 1
+
+
+def test_ui_service_snapshot_includes_history_review_surface():
+    with TemporaryDirectory() as tmp:
+        now = datetime.now(timezone.utc)
+        root = Path(tmp)
+        settings = _settings(root)
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        db.upsert_task(
+            TaskRecord(
+                task_id="task-history-1",
+                title="Blocked task",
+                description="This should show up in the morning review.",
+                status="blocked",
+                risk="moderate",
+                updated_at=(now - timedelta(minutes=4)).isoformat(),
+            )
+        )
+        db.upsert_attempt(
+            AttemptRecord(
+                attempt_id="attempt-history-1",
+                task_id="task-history-1",
+                actor="loop0:codex",
+                outcome="failed",
+                result_summary="Attempt failed and should be visible in history.",
+                verification_status="failed",
+                resource_usage={
+                    "implementation": {
+                        "generation_mode": "provider",
+                        "resolved_route": {"provider": "codex", "model": "gpt-5.4"},
+                    }
+                },
+                started_at=(now - timedelta(minutes=6)).isoformat(),
+                ended_at=(now - timedelta(minutes=5)).isoformat(),
+            )
+        )
+        db.upsert_artifact(
+            ArtifactRecord(
+                artifact_id="artifact-history-1",
+                artifact_type="loop0_inference_telemetry",
+                title="Loop 0 inference telemetry",
+                content_summary="Compact history-worthy report.",
+                updated_at=(now - timedelta(minutes=3)).isoformat(),
+            )
+        )
+        service = AstrataUIService(settings=settings)
+        snapshot = service.snapshot()
+        history = snapshot["history"]
+        assert history["overview"]["blocked_tasks"] == 1
+        assert history["overview"]["failed_attempts"] == 1
+        assert history["overview"]["prime_attempts"] == 1
+        assert history["snapshot_reports"][0]["artifact_id"] == "artifact-history-1"
+        assert history["recent_events"][0]["event_kind"] in {"artifact", "task", "attempt", "communication", "verification"}
+        assert any(item["title"] == "Blocked task" for item in history["recent_events"])
+        assert any(item["title"] == "Blocked tasks" for item in history["bottlenecks"])
+        assert history["git"]["available"] is False
+
+
+def test_ui_service_history_includes_runtime_heartbeat_status():
+    with TemporaryDirectory() as tmp:
+        now = datetime.now(timezone.utc)
+        root = Path(tmp)
+        settings = _settings(root)
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        db.upsert_artifact(
+            ArtifactRecord(
+                artifact_id="heartbeat-1",
+                artifact_type="loop0_daemon_heartbeat",
+                title="Loop0 daemon heartbeat #1",
+                content_summary='{"interval_seconds": 60, "summary": {"loop0_status": "ok", "step_count": 1, "lane_turns": 2, "inbox_count": 0}}',
+                provenance={"source": "loop0_daemon", "status": "ok"},
+                updated_at=(now - timedelta(seconds=30)).isoformat(),
+            )
+        )
+        service = AstrataUIService(settings=settings)
+        snapshot = service.snapshot()
+        runtime = snapshot["history"]["runtime"]
+        assert runtime["daemon_configured"] is True
+        assert runtime["stale"] is False
+        assert runtime["latest_heartbeat"]["artifact_id"] == "heartbeat-1"
+        assert runtime["latest_heartbeat_payload"]["summary"]["loop0_status"] == "ok"

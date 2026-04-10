@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
+import time
 import urllib.request
 
 from astrata.comms.intake import process_inbound_messages
@@ -35,6 +37,7 @@ from astrata.local.runtime.processes import ManagedProcessController
 from astrata.local.strata_endpoint import StrataEndpointService
 from astrata.loop0.runner import Loop0Runner
 from astrata.providers.registry import build_default_registry
+from astrata.records.models import ArtifactRecord
 from astrata.routing.policy import RouteChooser
 from astrata.scheduling.quota import QuotaPolicy, default_source_limits
 from astrata.storage.db import AstrataDatabase
@@ -70,8 +73,8 @@ def _cmd_doctor() -> int:
     db.initialize()
     runtime_report = run_startup_reflection(settings, db=db).report
     limits = default_source_limits()
-    limits["codex"] = settings.runtime_limits.codex_requests_per_hour
-    limits["cli:codex-cli"] = settings.runtime_limits.codex_requests_per_hour
+    limits["codex"] = settings.runtime_limits.codex_direct_requests_per_hour
+    limits["cli:codex-cli"] = settings.runtime_limits.codex_cli_requests_per_hour
     limits["cli:kilocode"] = settings.runtime_limits.kilocode_requests_per_hour
     limits["cli:gemini-cli"] = settings.runtime_limits.gemini_requests_per_hour
     limits["cli:claude-code"] = settings.runtime_limits.claude_requests_per_hour
@@ -1030,6 +1033,12 @@ def _cmd_loop0_run(steps: int) -> int:
     settings = load_settings()
     db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
     db.initialize()
+    payload = _run_loop0_cycle(settings=settings, db=db, steps=steps)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _run_loop0_cycle(*, settings, db: AstrataDatabase, steps: int) -> dict[str, object]:
     lane_runtime = LaneRuntime(settings=settings, db=db)
     lane_turns = lane_runtime.process_pending_turns(lane="prime", limit=5)
     lane_turns.extend(lane_runtime.process_pending_turns(lane="local", limit=5))
@@ -1041,7 +1050,118 @@ def _cmd_loop0_run(steps: int) -> int:
     )
     runner = Loop0Runner(settings=settings, db=db)
     result = runner.run_steps(steps)
-    print(json.dumps({"inbox": inbox_results, "lane_turns": lane_turns, "loop0": result}, indent=2))
+    return {"inbox": inbox_results, "lane_turns": lane_turns, "loop0": result}
+
+
+def _record_loop0_daemon_heartbeat(
+    *,
+    db: AstrataDatabase,
+    cycle_index: int,
+    interval_seconds: int,
+    started_at: str,
+    finished_at: str,
+    status: str,
+    payload: dict[str, object],
+    error: str | None = None,
+) -> ArtifactRecord:
+    heartbeat = ArtifactRecord(
+        artifact_type="loop0_daemon_heartbeat",
+        title=f"Loop0 daemon heartbeat #{cycle_index}",
+        description="Periodic runtime heartbeat for overnight Loop 0 execution.",
+        content_summary=json.dumps(
+            {
+                "cycle_index": cycle_index,
+                "interval_seconds": interval_seconds,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "status": status,
+                "error": error,
+                "summary": {
+                    "inbox_count": len(list(payload.get("inbox") or [])),
+                    "lane_turns": len(list(payload.get("lane_turns") or [])),
+                    "loop0_status": dict(payload.get("loop0") or {}).get("status"),
+                    "step_count": len(list(dict(payload.get("loop0") or {}).get("steps") or [])),
+                },
+            },
+            indent=2,
+        ),
+        provenance={
+            "source": "loop0_daemon",
+            "cycle_index": cycle_index,
+            "interval_seconds": interval_seconds,
+            "status": status,
+        },
+        status="good" if status == "ok" else "degraded",
+    )
+    db.upsert_artifact(heartbeat)
+    return heartbeat
+
+
+def _cmd_loop0_daemon(steps: int, interval_seconds: int, max_cycles: int | None) -> int:
+    settings = load_settings()
+    db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+    db.initialize()
+    cycle_index = 0
+    try:
+        while max_cycles is None or cycle_index < max_cycles:
+            cycle_index += 1
+            started_at = datetime.now(timezone.utc).isoformat()
+            try:
+                payload = _run_loop0_cycle(settings=settings, db=db, steps=steps)
+                finished_at = datetime.now(timezone.utc).isoformat()
+                heartbeat = _record_loop0_daemon_heartbeat(
+                    db=db,
+                    cycle_index=cycle_index,
+                    interval_seconds=interval_seconds,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    status="ok",
+                    payload=payload,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "cycle_index": cycle_index,
+                            "heartbeat_artifact_id": heartbeat.artifact_id,
+                            "finished_at": finished_at,
+                            "loop0_status": dict(payload.get("loop0") or {}).get("status"),
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                finished_at = datetime.now(timezone.utc).isoformat()
+                heartbeat = _record_loop0_daemon_heartbeat(
+                    db=db,
+                    cycle_index=cycle_index,
+                    interval_seconds=interval_seconds,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    status="failed",
+                    payload={},
+                    error=str(exc),
+                )
+                print(
+                    json.dumps(
+                        {
+                            "status": "failed",
+                            "cycle_index": cycle_index,
+                            "heartbeat_artifact_id": heartbeat.artifact_id,
+                            "finished_at": finished_at,
+                            "error": str(exc),
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+            if max_cycles is not None and cycle_index >= max_cycles:
+                break
+            time.sleep(max(1, interval_seconds))
+    except KeyboardInterrupt:
+        print(json.dumps({"status": "stopped", "cycle_index": cycle_index}, indent=2))
+        return 0
     return 0
 
 
@@ -1105,6 +1225,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("loop0-next", help="Show the next bounded Loop 0 implementation candidate.")
     loop0_run = sub.add_parser("loop0-run", help="Run one or more Loop 0 planning/recording cycles.")
     loop0_run.add_argument("--steps", type=int, default=1, help="Number of Loop 0 steps to attempt.")
+    loop0_daemon = sub.add_parser("loop0-daemon", help="Run Loop 0 continuously with periodic heartbeat artifacts.")
+    loop0_daemon.add_argument("--steps", type=int, default=1, help="Number of Loop 0 steps per cycle.")
+    loop0_daemon.add_argument("--interval", type=int, default=60, help="Seconds to sleep between cycles.")
+    loop0_daemon.add_argument("--max-cycles", type=int, default=None, help="Optional limit for bounded runs or tests.")
     comms_send = sub.add_parser("comms-send", help="Send a durable principal message into Astrata.")
     comms_send.add_argument("message", help="Message payload to send.")
     comms_send.add_argument("--recipient", default="prime", help="Recipient identity.")
@@ -1199,6 +1323,8 @@ def main() -> int:
         return _cmd_loop0_next()
     if args.command == "loop0-run":
         return _cmd_loop0_run(max(1, args.steps))
+    if args.command == "loop0-daemon":
+        return _cmd_loop0_daemon(max(1, args.steps), max(1, args.interval), args.max_cycles)
     if args.command == "comms-send":
         return _cmd_comms_send(args.recipient, args.intent, args.message, args.kind, args.conversation_id)
     if args.command == "comms-inbox":

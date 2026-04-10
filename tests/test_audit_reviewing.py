@@ -1,13 +1,20 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from astrata.audit import review_audit_review, review_consensus_judgment, select_audit_followup_policy
+from astrata.audit import (
+    open_signal,
+    review_audit_review,
+    review_consensus_judgment,
+    select_audit_followup_policy,
+    select_signal_followup_policy,
+    signals_from_inference_telemetry,
+    signals_from_review,
+)
 from astrata.audit.review import ReviewFinding, open_review
 from astrata.config.settings import load_settings
 from astrata.loop0.runner import Loop0Runner
 from astrata.records.models import AttemptRecord
 from astrata.storage.db import AstrataDatabase
-
 
 def test_review_consensus_judgment_flags_false_approval():
     review = review_consensus_judgment(
@@ -67,6 +74,19 @@ def test_select_audit_followup_policy_can_sample_clean_review():
     assert policy["mode"] == "sampled"
     assert policy["followup_specs"]
     assert "Spot-check verification" in policy["followup_specs"][0]["title"]
+
+def test_select_signal_followup_policy_targets_open_problem_signal():
+    signal = open_signal(
+        signal_kind="problem",
+        subject_kind="inference_policy",
+        subject_id="prime_admission_basis",
+        summary="Prime was invoked without a recorded admission basis.",
+        severity="high",
+    )
+    policy = select_signal_followup_policy(signal=signal)
+    assert policy["mode"] == "targeted"
+    assert policy["followup_specs"]
+    assert "Repair observed system problem" in policy["followup_specs"][0]["title"]
 
 
 def test_persist_audit_review_materializes_targeted_followup_task():
@@ -177,3 +197,70 @@ def test_persist_audit_review_records_positive_route_observations_for_consensus_
         variant_ids = {item["variant_id"] for item in observations}
         assert "cli:kilocode:kilocode" in variant_ids
         assert "cli:gemini-cli:gemini-2.5-flash" in variant_ids
+
+
+def test_persist_signals_materializes_followup_tasks_for_general_observation_signals():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        runner = Loop0Runner(settings=settings, db=db)
+        artifacts = runner._persist_signals(  # noqa: SLF001
+            signals=[
+                open_signal(
+                    signal_kind="drift",
+                    subject_kind="inference_policy",
+                    subject_id="prime_admission_basis",
+                    summary="Prime was invoked without a recorded admission basis.",
+                    severity="moderate",
+                )
+            ],
+            artifact_type="loop0_inference_signal",
+            title_prefix="Loop 0 inference signal",
+            description="Durable internal observation signal derived from inference telemetry.",
+            provenance={"task_id": "task-1", "attempt_id": "attempt-1"},
+        )
+        assert artifacts
+        tasks = db.list_records("tasks")
+        assert tasks
+        assert any(task.get("provenance", {}).get("source") == "observation_signal" for task in tasks)
+
+
+def test_inference_telemetry_emits_multiple_reusable_signals():
+    signals = signals_from_inference_telemetry(
+        {
+            "window_hours": 24,
+            "unjustified_prime_attempts": 1,
+            "avoidable_prime_attempts": 2,
+            "unjustified_prime_examples": [{"task_id": "task-1"}],
+            "avoidable_prime_examples": [{"task_id": "task-2"}],
+        }
+    )
+    subject_ids = {signal.subject_id for signal in signals}
+    assert "prime_admission_basis" in subject_ids
+    assert "prime_pressure_reduction" in subject_ids
+
+
+def test_review_derived_signals_materialize_followup_tasks():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        runner = Loop0Runner(settings=settings, db=db)
+        review = open_review(
+            subject_kind="verification",
+            subject_id="verification-1",
+            summary="Verification contradicted reality.",
+            findings=[ReviewFinding(severity="critical", summary="Verifier passed a broken result.")],
+        )
+        artifacts = runner._persist_signals(  # noqa: SLF001
+            signals=signals_from_review(review),
+            artifact_type="loop0_review_signal",
+            title_prefix="Loop 0 review signal",
+            description="Durable internal observation signal derived from review findings.",
+            provenance={"task_id": "task-1", "attempt_id": "attempt-1"},
+        )
+        assert artifacts
+        tasks = db.list_records("tasks")
+        assert tasks
+        assert any(task.get("provenance", {}).get("source") == "observation_signal" for task in tasks)

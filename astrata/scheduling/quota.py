@@ -188,8 +188,8 @@ class QuotaPolicy:
 
 def default_source_limits() -> dict[str, int | None]:
     return {
-        "codex": 12,
-        "cli:codex-cli": 12,
+        "codex": 6,
+        "cli:codex-cli": 4,
         "cli:kilocode": 200,
         "cli:gemini-cli": 60,
         "cli:claude-code": 30,

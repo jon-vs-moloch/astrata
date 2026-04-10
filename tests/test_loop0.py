@@ -1,12 +1,15 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 
 from astrata.records.communications import CommunicationRecord
 from astrata.config.settings import load_settings
 from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
 from astrata.providers.registry import ProviderRegistry
 from astrata.loop0.runner import Loop0Runner, Loop0TaskCandidate
+from astrata.records.models import ArtifactRecord, TaskRecord
 from astrata.storage.db import AstrataDatabase
+from astrata.audit import open_signal
 
 
 def test_loop0_runner_finds_a_missing_candidate():
@@ -44,6 +47,129 @@ def test_loop0_runner_records_one_cycle():
     assert "loop0_verification_review_meta_review" in artifact_types
     assert "loop0_inference_telemetry" in artifact_types
     assert result["verification"]["result"] in {"pass", "fail", "uncertain"}
+
+
+def test_loop0_selects_observation_signal_tasks_as_executable_alignment_work():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        db.upsert_task(
+            TaskRecord(
+                task_id="signal-task-1",
+                title="Correct detected system drift: prime_admission_basis",
+                description="Investigate and repair drift against the constitution/spec when Prime was invoked without basis.",
+                priority=10,
+                urgency=10,
+                risk="moderate",
+                status="pending",
+                provenance={
+                    "source": "observation_signal",
+                    "signal_kind": "drift",
+                    "subject_kind": "inference_policy",
+                    "subject_id": "prime_admission_basis",
+                },
+                completion_policy={"type": "review_or_audit", "route_preferences": {"preferred_cli_tools": ["kilocode"]}},
+            )
+        )
+        runner = Loop0Runner(settings=settings, db=db)
+        assessment = runner.next_candidate_assessment()
+        assert assessment is not None
+        assert assessment.candidate.strategy == "message_task"
+        assert assessment.candidate.source_task_id == "signal-task-1"
+
+
+def test_loop0_selects_audit_followup_tasks_as_executable_alignment_work():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        db.upsert_task(
+            TaskRecord(
+                task_id="audit-followup-1",
+                title="Repair verification path: verification-1",
+                description="Repair a spec-relevant verification defect discovered during review.",
+                priority=10,
+                urgency=9,
+                risk="moderate",
+                status="pending",
+                provenance={
+                    "source": "audit_followup",
+                    "review_id": "review-1",
+                    "subject_kind": "verification",
+                    "subject_id": "verification-1",
+                },
+                completion_policy={"type": "review_or_audit", "route_preferences": {"preferred_cli_tools": ["kilocode"]}},
+            )
+        )
+        runner = Loop0Runner(settings=settings, db=db)
+        assessment = runner.next_candidate_assessment()
+        assert assessment is not None
+        assert assessment.candidate.strategy == "message_task"
+        assert assessment.candidate.source_task_id == "audit-followup-1"
+
+
+def test_loop0_synthesizes_alignment_work_from_open_signal_artifacts():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        signal = open_signal(
+            signal_kind="drift",
+            subject_kind="inference_policy",
+            subject_id="prime_admission_basis",
+            summary="Prime was invoked without a recorded admission basis.",
+            severity="high",
+        )
+        db.upsert_artifact(
+            ArtifactRecord(
+                artifact_id="signal-artifact-1",
+                artifact_type="loop0_inference_signal",
+                title="Loop 0 inference signal: prime_admission_basis",
+                description="Durable internal observation signal derived from inference telemetry.",
+                content_summary=signal.model_dump_json(indent=2),
+                provenance={"signal_id": signal.signal_id, "subject_kind": signal.subject_kind, "subject_id": signal.subject_id},
+                status="degraded",
+            )
+        )
+        runner = Loop0Runner(settings=settings, db=db)
+        assessment = runner.next_candidate_assessment()
+        assert assessment is not None
+        assert assessment.candidate.strategy == "message_task"
+        assert assessment.candidate.metadata["provenance"]["source"] == "alignment_maintenance"
+        assert assessment.candidate.metadata["provenance"]["maintenance_kind"] == "signal_followup"
+        assert assessment.candidate.metadata["provenance"]["subject_id"] == "prime_admission_basis"
+
+
+def test_loop0_synthesizes_alignment_work_from_governance_drift_artifacts():
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        db.upsert_artifact(
+            ArtifactRecord(
+                artifact_id="drift-artifact-1",
+                artifact_type="governance_drift_alert",
+                title="Protected governance drift detected",
+                description="Protected governance surfaces changed without approved principal provenance.",
+                content_summary=json.dumps(
+                    {
+                        "status": "drifted",
+                        "newly_reported_paths": ["constitution.md", "spec.md"],
+                    },
+                    indent=2,
+                ),
+                provenance={"source": "governance_drift_monitor"},
+                status="broken",
+            )
+        )
+        runner = Loop0Runner(settings=settings, db=db)
+        assessment = runner.next_candidate_assessment()
+        assert assessment is not None
+        assert assessment.candidate.strategy == "message_task"
+        assert assessment.candidate.metadata["provenance"]["source"] == "alignment_maintenance"
+        assert assessment.candidate.metadata["provenance"]["maintenance_kind"] == "governance_drift"
+        assert "constitution.md" in assessment.candidate.description
 
 
 class _DeferredCodexProvider(Provider):
@@ -195,20 +321,21 @@ class _QuotaAwareCliProvider(_CheapCliProvider):
 
 
 def test_loop0_runner_records_coordination_deferral():
-    settings = load_settings(Path("/Users/jon/Projects/Astrata"))
-    db = AstrataDatabase(settings.paths.data_dir / "test-loop0-coordinator.db")
-    db.initialize()
-    registry = ProviderRegistry({"codex": _DeferredCodexProvider()})
-    runner = Loop0Runner(settings=settings, db=db, registry=registry)
-    result = runner.run_once()
-    if result["status"] == "complete":
-        assert result["message"]
-        return
-    assert result["attempt"]["outcome"] in {"blocked", "failed"}
-    coordination = result["coordination_report"]["content_summary"]
-    assert "controller" in coordination
-    artifact_types = {record["artifact_type"] for record in db.list_records("artifacts")}
-    assert "loop0_coordination_report" in artifact_types
+    with TemporaryDirectory() as tmp:
+        settings = load_settings(Path("/Users/jon/Projects/Astrata"))
+        db = AstrataDatabase(Path(tmp) / "astrata.db")
+        db.initialize()
+        registry = ProviderRegistry({"codex": _DeferredCodexProvider()})
+        runner = Loop0Runner(settings=settings, db=db, registry=registry)
+        result = runner.run_once()
+        if result["status"] == "complete":
+            assert result["message"]
+            return
+        assert result["attempt"]["outcome"] in {"blocked", "failed"}
+        coordination = result["coordination_report"]["content_summary"]
+        assert "controller" in coordination
+        artifact_types = {record["artifact_type"] for record in db.list_records("artifacts")}
+        assert "loop0_coordination_report" in artifact_types
 
 
 def test_loop0_runner_finds_strengthening_candidate_when_repo_is_complete():
@@ -336,11 +463,14 @@ def test_loop0_runner_unifies_pending_message_tasks():
         )
         assert worker_task["status"] == "working"
         assert worker_task["parent_task_id"] == "message-task-1"
+        assert worker_task["completion_policy"]["approval"]["approver"] == "parent_task"
+        assert worker_task["permissions"]["approval"]["required"] is True
         communications = db.list_records("communications")
         worker_requests = [payload for payload in communications if payload.get("intent") == "worker_delegation_request"]
         assert worker_requests
         assert worker_requests[-1]["recipient"] == "worker.kilocode"
         assert worker_requests[-1]["payload"]["worker_task_id"] == implementation["worker_task_id"]
+        assert worker_requests[-1]["payload"]["approval"]["authority_chain"] == ["prime", "constitution"]
         worker_results = [payload for payload in communications if payload.get("intent") == "worker_delegation_result"]
         assert not worker_results
         runner.worker_runtime.process_pending(worker_id="worker.kilocode")

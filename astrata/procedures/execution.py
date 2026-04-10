@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
+from astrata.git import GitWorkspaceManager
 from astrata.providers.base import CompletionRequest, Message
 from astrata.procedures.health import RouteHealthStore
 from astrata.procedures.registry import ProcedureCapability
@@ -53,6 +54,9 @@ class ProcedureExecutionResult(BaseModel):
     provider_error: str | None = None
     attempt_count: int = 0
     procedure_metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace_path: str | None = None
+    workspace_branch: str | None = None
+    workspace_mode: str | None = None
 
 
 class BoundedFileGenerationProcedure:
@@ -135,6 +139,21 @@ class BoundedFileGenerationProcedure:
         elif force_fallback_only:
             degraded_reason = "planner_selected_fallback_only"
 
+        workspace_path: Path | None = None
+        workspace_branch: str | None = None
+        workspace_mode: str | None = None
+        mirrored_to_project_root = False
+        target_root = project_root
+        if bool(request.procedure_metadata.get("use_git_worktree")):
+            workspace = GitWorkspaceManager(project_root).prepare_workspace(
+                task_name=request.title,
+                task_id=str(request.procedure_metadata.get("task_id") or "").strip() or None,
+            )
+            workspace_path = workspace.path
+            workspace_branch = workspace.branch
+            workspace_mode = workspace.mode
+            target_root = workspace.path
+
         if generated_files is None and fallback_builder is not None:
             generated_files = fallback_builder(request)
             generation_mode = "fallback"
@@ -156,16 +175,24 @@ class BoundedFileGenerationProcedure:
                 provider_error=provider_error,
                 attempt_count=attempt_count,
                 procedure_metadata=dict(request.procedure_metadata),
+                workspace_path=None if workspace_path is None else str(workspace_path),
+                workspace_branch=workspace_branch,
+                workspace_mode=workspace_mode,
             )
 
         written_paths: list[str] = []
         for rel_path, content in generated_files.items():
             if rel_path not in request.expected_paths:
                 continue
-            path = project_root / rel_path
+            path = target_root / rel_path
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
             written_paths.append(rel_path)
+            if target_root != project_root:
+                mirrored_to_project_root = True
+                mirror_path = project_root / rel_path
+                mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                mirror_path.write_text(content)
 
         return ProcedureExecutionResult(
             status="applied" if written_paths else "unsupported",
@@ -182,7 +209,13 @@ class BoundedFileGenerationProcedure:
             degraded_reason=degraded_reason,
             provider_error=provider_error,
             attempt_count=attempt_count,
-            procedure_metadata=dict(request.procedure_metadata),
+            procedure_metadata={
+                **dict(request.procedure_metadata),
+                "mirrored_to_project_root": mirrored_to_project_root,
+            },
+            workspace_path=None if workspace_path is None else str(workspace_path),
+            workspace_branch=workspace_branch,
+            workspace_mode=workspace_mode,
         )
 
     def _preflight_provider(self, provider: Any, route: dict[str, Any]) -> dict[str, Any]:

@@ -24,6 +24,8 @@ class CoordinatorController:
         self._route_advisor = route_advisor
 
     def coordinate(self, envelope: ControllerEnvelope) -> tuple[ControllerDecision, ExecutionRoute]:
+        preferred_model = str(envelope.metadata.get("preferred_model") or "").strip() or None
+        prime_quota = self._quota_policy.assess({"provider": "codex", "model": preferred_model})
         preferred_providers = tuple(
             str(item).strip().lower()
             for item in list(envelope.metadata.get("preferred_providers") or [])
@@ -39,7 +41,6 @@ class CoordinatorController:
             for item in list(envelope.metadata.get("preferred_cli_tools") or [])
             if str(item).strip()
         )
-        preferred_model = str(envelope.metadata.get("preferred_model") or "").strip() or None
         avoided_cli_tools = tuple(
             str(item).strip().lower()
             for item in list(envelope.metadata.get("avoided_cli_tools") or [])
@@ -53,6 +54,8 @@ class CoordinatorController:
                 **dict(envelope.metadata),
                 "priority": envelope.priority,
                 "urgency": envelope.urgency,
+                "prime_budget_healthy": prime_quota.allowed,
+                "prime_budget_abundant": self._prime_budget_abundant(prime_quota.active_window),
             },
         )
         if self._route_advisor is not None and not preferred_providers and not preferred_cli_tools:
@@ -61,14 +64,8 @@ class CoordinatorController:
                 preferred_providers = advice.preferred_providers
             preferred_cli_tools = advice.preferred_cli_tools
         require_prime_route = bool(envelope.metadata.get("require_prime_route"))
-        if (
-            not require_prime_route
-            and envelope.risk not in {"high", "critical"}
-            and task_class in {"coding", "general", "review", "verification", "audit", "maintenance"}
-            and "codex" not in preferred_providers
-        ):
-            avoided_providers = tuple(dict.fromkeys([*avoided_providers, "codex"]))
-            avoided_cli_tools = tuple(dict.fromkeys([*avoided_cli_tools, "codex-cli"]))
+        if work_policy.get("prefer_prime") and "codex" not in preferred_providers:
+            preferred_providers = tuple(dict.fromkeys(["codex", *preferred_providers]))
         try:
             route = self._router.choose(
                 priority=envelope.priority,
@@ -103,6 +100,14 @@ class CoordinatorController:
     ) -> ControllerDecision:
         quota = self._quota_policy.assess(route.__dict__)
         followup_actions: list[dict[str, Any]] = []
+        if work_policy.get("prime_admission_basis"):
+            followup_actions.append(
+                {
+                    "type": "prime_admission_basis",
+                    "basis": list(work_policy.get("prime_admission_basis") or []),
+                    "reason": "Prime should be invoked only when it is safer, cheaper overall, or quota-backed for course correction.",
+                }
+            )
         if work_policy.get("consensus_eligible"):
             followup_actions.append(
                 {
@@ -175,3 +180,14 @@ class CoordinatorController:
                 *followup_actions,
             ],
         )
+
+    def _prime_budget_abundant(self, window: dict[str, Any] | None) -> bool:
+        payload = dict(window or {})
+        try:
+            remaining = int(payload.get("requests_remaining") or 0)
+            limit = int(payload.get("requests_limit") or 0)
+        except Exception:
+            return False
+        if limit <= 0:
+            return False
+        return remaining >= max(3, limit // 5)

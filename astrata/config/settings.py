@@ -17,7 +17,8 @@ class AstrataPaths:
 
 @dataclass(frozen=True)
 class RuntimeLimits:
-    codex_requests_per_hour: int = 12
+    codex_direct_requests_per_hour: int = 6
+    codex_cli_requests_per_hour: int = 4
     kilocode_requests_per_hour: int = 200
     gemini_requests_per_hour: int = 60
     claude_requests_per_hour: int = 30
@@ -63,6 +64,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     ]
     if str(install_dir) not in configured_search_paths:
         configured_search_paths.append(str(install_dir))
+    shared_codex_limit = os.environ.get("ASTRATA_CODEX_REQUESTS_PER_HOUR")
     return Settings(
         paths=AstrataPaths(
             project_root=root,
@@ -71,7 +73,16 @@ def load_settings(project_root: Path | None = None) -> Settings:
             provider_secrets_path=data_dir / "provider_secrets.json",
         ),
         runtime_limits=RuntimeLimits(
-            codex_requests_per_hour=int(os.environ.get("ASTRATA_CODEX_REQUESTS_PER_HOUR", "12")),
+            codex_direct_requests_per_hour=int(
+                os.environ.get("ASTRATA_CODEX_DIRECT_REQUESTS_PER_HOUR")
+                or shared_codex_limit
+                or "6"
+            ),
+            codex_cli_requests_per_hour=int(
+                os.environ.get("ASTRATA_CODEX_CLI_REQUESTS_PER_HOUR")
+                or shared_codex_limit
+                or "4"
+            ),
             kilocode_requests_per_hour=int(os.environ.get("ASTRATA_KILOCODE_REQUESTS_PER_HOUR", "200")),
             gemini_requests_per_hour=int(os.environ.get("ASTRATA_GEMINI_REQUESTS_PER_HOUR", "60")),
             claude_requests_per_hour=int(os.environ.get("ASTRATA_CLAUDE_REQUESTS_PER_HOUR", "30")),

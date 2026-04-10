@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 from astrata.providers.base import CompletionResponse, Provider
 from astrata.procedures.execution import BoundedFileGenerationProcedure, ProcedureExecutionRequest
@@ -126,3 +127,39 @@ def test_infer_actor_capability_distinguishes_shortcut_eligible_routes():
     assert infer_actor_capability(provider="codex") == "expert"
     assert infer_actor_capability(provider="google") == "strong"
     assert infer_actor_capability(provider="cli", cli_tool="kilocode") == "basic"
+
+
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "astrata@example.com"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Astrata"], check=True, capture_output=True)
+    (root / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-m", "init"], check=True, capture_output=True)
+
+
+def test_bounded_file_generation_procedure_can_write_via_git_worktree(tmp_path: Path):
+    _init_git_repo(tmp_path)
+    procedure = BoundedFileGenerationProcedure(
+        registry=ProviderRegistry({}),
+        router=RouteChooser(ProviderRegistry({})),
+        health_store=RouteHealthStore(tmp_path / "route-health.json"),
+    )
+    request = ProcedureExecutionRequest(
+        procedure_id="test",
+        title="Create test file in worktree",
+        description="Write one bounded file using an isolated workspace",
+        expected_paths=["astrata/generated.py"],
+        procedure_metadata={"use_git_worktree": True, "task_id": "task-worktree-1"},
+    )
+    result = procedure.execute(
+        project_root=tmp_path,
+        request=request,
+        fallback_builder=lambda _: {"astrata/generated.py": 'VALUE = "ok"\n'},
+    )
+    assert result.status == "applied"
+    assert result.workspace_mode == "git"
+    assert result.workspace_path
+    assert Path(str(result.workspace_path)).exists()
+    assert (tmp_path / "astrata/generated.py").exists()
+    assert result.procedure_metadata["mirrored_to_project_root"] is True

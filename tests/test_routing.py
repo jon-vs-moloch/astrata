@@ -56,3 +56,15 @@ def test_route_chooser_prefers_cheapest_capable_route_before_codex():
     route = RouteChooser(registry).choose(priority=1, urgency=1, risk="low", prefer_local=False)
     assert route.provider == "cli"
     assert route.cli_tool == "kilocode"
+
+
+def test_route_chooser_keeps_codex_cli_as_terminal_fallback():
+    registry = ProviderRegistry(
+        {
+            "cli": _FakeProvider("cli", None),
+        }
+    )
+    registry._providers["cli"].available_tools = lambda: ["codex-cli", "gemini-cli"]  # type: ignore[attr-defined]
+    route = RouteChooser(registry).choose(priority=1, urgency=1, risk="high", prefer_local=False)
+    assert route.provider == "cli"
+    assert route.cli_tool == "gemini-cli"

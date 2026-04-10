@@ -139,3 +139,41 @@ def create_worker_authority(delegated_via: str = "assistant") -> AuthorityChain:
 def create_controller_authority(controller_name: str, domain: str = "federated") -> AuthorityChain:
     """Create an authority chain for a federated controller."""
     return AuthorityChain(source=f"controller:{controller_name}", delegated_via=f"{domain}_control")
+
+
+def delegated_task_approval(
+    *,
+    task_payload: dict[str, object] | None,
+    delegated_by: str = "prime",
+    default_approver: str = "parent_task",
+) -> dict[str, object]:
+    """Return the approval authority policy for delegated work.
+
+    Delegated tasks should carry explicit approval semantics so downstream workers,
+    audit paths, and history views can all answer the same question: who can accept
+    or merge the result. We preserve any existing parent policy, but default to a
+    conservative parent-controlled approval requirement.
+    """
+
+    payload = dict(task_payload or {})
+    permissions = dict(payload.get("permissions") or {})
+    completion_policy = dict(payload.get("completion_policy") or {})
+    parent_policy = dict(completion_policy.get("approval") or {})
+    parent_chain = list(parent_policy.get("authority_chain") or [])
+    if not parent_chain:
+        parent_chain = [str(delegated_by or "prime"), "constitution"]
+    return {
+        "mode": str(parent_policy.get("mode") or "explicit"),
+        "required": bool(parent_policy.get("required", True)),
+        "approver": str(parent_policy.get("approver") or default_approver),
+        "delegated_by": str(parent_policy.get("delegated_by") or delegated_by),
+        "authority_chain": parent_chain,
+        "self_approval_allowed": bool(parent_policy.get("self_approval_allowed", False)),
+        "consensus_allowed": bool(parent_policy.get("consensus_allowed", False)),
+        "override_required_for_protected_write": bool(
+            parent_policy.get(
+                "override_required_for_protected_write",
+                bool(permissions.get("require_prime_route")),
+            )
+        ),
+    }

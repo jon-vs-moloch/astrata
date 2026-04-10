@@ -57,6 +57,16 @@ def test_worker_runtime_executes_delegated_message_task():
                 "description": "Do the thing carefully.",
                 "message": "Do the thing carefully.",
                 "task_payload": {"completion_policy": {"type": "respond_or_execute"}},
+                "approval": {
+                    "mode": "explicit",
+                    "required": True,
+                    "approver": "parent_task",
+                    "delegated_by": "prime",
+                    "authority_chain": ["prime", "constitution"],
+                    "self_approval_allowed": False,
+                    "consensus_allowed": False,
+                    "override_required_for_protected_write": False,
+                },
                 "route": route,
             },
             related_task_ids=["task-1"],
@@ -73,6 +83,9 @@ def test_worker_runtime_executes_delegated_message_task():
         assert worker_results
         assert worker_results[-1]["recipient"] == "astrata"
         assert worker_results[-1]["payload"]["route"]["cli_tool"] == "kilocode"
+        prompt = runtime._delegated_message_task_prompt(dict(inbound.payload or {}))  # noqa: SLF001
+        assert "approval" in prompt[-1].content
+        assert "parent_task" in prompt[-1].content
         resolved = lane.get_message(inbound.communication_id)
         assert resolved is not None
         assert resolved.status == "resolved"

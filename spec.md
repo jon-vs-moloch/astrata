@@ -1226,6 +1226,10 @@ Useful response classes include:
 
 These responses should be durable and inspectable.
 
+This likely wants to converge with the broader internal "we noticed this" substrate:
+surprises, problems, drift, and opportunities should be representable in the same
+durable response/event layer rather than living only inside audit-specific machinery.
+
 ### Refusal Semantics
 
 Refusal should be treated as a meaningful response, not an implementation failure by default.
@@ -1330,6 +1334,54 @@ At minimum, Astrata should expose:
 - final resolutions
 
 Without this, federation becomes hidden complexity instead of useful self-exposure.
+
+Observability should not stop at Codex or provider spend.
+Astrata should make it easy to answer questions like:
+
+- what the system did
+- what bottlenecks constrained it
+- where time and scarce routes were spent
+- how efficiently it used those resources
+- what should be corrected next
+
+This implies a durable operational history rather than only transient dashboards.
+
+### History View
+
+Astrata should maintain a durable History view built from snapshot reports and annotations.
+
+That history should make it easy to inspect:
+
+- operational summaries for a time window
+- noteworthy events and annotations
+- bottlenecks and recurring failure modes
+- route and resource usage
+- review, audit, and verification outcomes
+- follow-up work opened as a consequence
+
+History should support both human inspection and machine consumption.
+It should preserve enough structure that later review, scheduling, and improvement passes can reuse it without reconstructing the entire world from raw logs.
+
+### Progressive Disclosure
+
+Operational surfaces should use progressive disclosure by default to stay friendly to context windows.
+
+The default presentation should prefer:
+
+- titles
+- short descriptions
+- compact summaries
+- compressed aggregates
+
+Raw payloads, verbose traces, and large evidence blobs should be loaded only on request.
+
+This matters both for UI ergonomics and for model efficiency:
+
+- large operational records should not be injected into working context by default
+- summary-first access should be the normal path
+- deeper detail should remain available without polluting every turn
+
+Strata-style response layering is the right direction here: concise top-level representations, with drill-down to detailed evidence only when needed.
 
 ### Self-Regulation Value
 
@@ -1686,6 +1738,9 @@ Astrata should assume:
 - visible reasons for change
 
 At minimum, the common artifact record should point to a full edit history even if the history itself is stored elsewhere.
+
+Observability and operations artifacts should follow the same rule.
+Snapshot reports, annotations, summaries, and later corrections should accumulate as inspectable lineage rather than replacing one another in place.
 
 ### Typed Payloads
 
@@ -2342,6 +2397,7 @@ Context management should own:
 - **Context shaping**: deciding what to include, exclude, summarize, or defer based on the task at hand, the model being used, and the current token budget
 - **Artifact scanning**: identifying oversized context artifacts (specs, knowledge pages, conversation histories) that impose a disproportionate token tax, so they can be compacted, split, or excluded
 - **Retrieval integration**: coordinating with the memory and knowledge layers to load the most relevant context without exceeding budget
+- **Representation discipline**: preferring shorthand, structural compression, append-oriented updates, and summary-first representations so that both generated tokens and loaded tokens stay low
 
 ### Context Pressure as Signal
 
@@ -2356,11 +2412,37 @@ The routing layer, the scheduling layer, and the improvement layer should all be
 
 This is especially important for procedure-guided pipeline execution, where decomposition depth and verification overhead both consume context budget.
 
+Astrata should aggressively look for ways to reduce tokens per task, including:
+
+- fewer generated tokens when equivalent shorter outputs are available
+- fewer loaded tokens by preferring summaries, shorthand, and structural compression
+- append-oriented histories instead of repeatedly replaying rewritten blobs
+- representations that preserve stable prefixes and minimize churn
+
+Token efficiency is not a narrow prompt-writing concern.
+It is an across-the-board throughput concern.
+
 ### Relationship to Routing
 
 Context management informs routing but is not subordinate to it.
 
 The routing layer decides which execution surface to use. Context management tells the routing layer what context constraints apply and what context-shaping work has been done. Both cooperate, but context management maintains its own state and diagnostic surfaces.
+
+### Throughput and KV-Cache Friendliness
+
+Increasing throughput is a system-wide goal, not only a backend concern.
+
+Astrata should therefore prefer designs that are friendly to append-heavy execution and KV reuse where plausible.
+
+That includes:
+
+- stable prefixes over frequently rewritten large prompts
+- append-oriented event and history models
+- compact structural representations over verbose repeated prose
+- successor or snapshot patterns that preserve lineage without forcing full replay
+- retrieval and disclosure policies that load only the depth actually needed
+
+Learnings from local inference experiments about throughput, cache behavior, and prompt stability should be propagated back into general system design rather than remaining isolated in backend-specific work.
 
 ---
 

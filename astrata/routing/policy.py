@@ -95,7 +95,7 @@ class RouteChooser:
                     reason="prefer_local",
                 )
         if risk in {"high", "critical"}:
-            route = _pick(("codex", "openai", "google", "anthropic", "cli"))
+            route = _pick(("codex", "openai", "google", "anthropic"))
             if route:
                 return ExecutionRoute(
                     provider=route.provider,
@@ -103,9 +103,17 @@ class RouteChooser:
                     cli_tool=route.cli_tool,
                     reason="high_risk_prefers_stronger_inference",
                 )
-            route = _pick_cli(("gemini-cli", "claude-code", "kilocode", "codex-cli"), reason="high_risk_cli_backup")
+            route = _pick_cli(("gemini-cli", "claude-code", "kilocode"), reason="high_risk_cli_backup")
             if route:
                 return route
+            route = _pick(("cli",))
+            if route:
+                return ExecutionRoute(
+                    provider=route.provider,
+                    model=route.model,
+                    cli_tool=route.cli_tool,
+                    reason="high_risk_generic_cli_backup",
+                )
         if urgency > priority:
             route = _pick_cli(("kilocode", "gemini-cli", "claude-code"), reason="urgency_prefers_cli")
             if route:

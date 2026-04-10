@@ -68,8 +68,8 @@ class LaneRuntime:
         self.principal_lane = PrincipalMessageLane(db=db)
         self.router = RouteChooser(self.registry)
         limits = default_source_limits()
-        limits["codex"] = settings.runtime_limits.codex_requests_per_hour
-        limits["cli:codex-cli"] = settings.runtime_limits.codex_requests_per_hour
+        limits["codex"] = settings.runtime_limits.codex_direct_requests_per_hour
+        limits["cli:codex-cli"] = settings.runtime_limits.codex_cli_requests_per_hour
         limits["cli:kilocode"] = settings.runtime_limits.kilocode_requests_per_hour
         limits["cli:gemini-cli"] = settings.runtime_limits.gemini_requests_per_hour
         limits["cli:claude-code"] = settings.runtime_limits.claude_requests_per_hour
