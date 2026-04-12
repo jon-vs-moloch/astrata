@@ -16,13 +16,9 @@
         <div class="icon-rail-brand"></div>
 
         <!-- Conversations -->
-        <button class="rail-btn active" data-view="chat-prime" id="railChatPrime" title="Prime">
+        <button class="rail-btn active" data-view="chat" id="railChat" title="Chat">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          <span class="rail-btn-badge" id="railPrimeBadge" hidden></span>
-        </button>
-        <button class="rail-btn" data-view="chat-local" id="railChatLocal" title="Local">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-          <span class="rail-btn-badge" id="railLocalBadge" hidden></span>
+          <span class="rail-btn-badge" id="railChatBadge" hidden></span>
         </button>
 
         <div class="rail-section-sep"></div>
@@ -102,69 +98,32 @@
       <!-- ══ COL 3: MAIN CONTENT (1fr) ════════════════════════════ -->
       <main class="main-content" id="mainContent">
 
-        <!-- Chat: Prime -->
-        <div class="chat-container" id="viewChatPrime">
-          <div class="chat-header">
-            <div class="chat-header-left">
-              <div class="message-avatar agent">P</div>
-              <div>
-                <div class="chat-header-title">Prime</div>
-                <div class="chat-header-subtitle" id="primeRouteLabel">Cloud agent — coordinating intelligence</div>
-              </div>
+        <!-- Chat View -->
+        <div class="chat-container" id="viewChat">
+          <div class="chat-header" style="align-items:flex-end;padding-bottom:0;">
+            <div class="agent-tabs" id="chatAgentTabs" style="display:flex;gap:16px;flex:1;overflow-x:auto;">
+              <!-- Dynamically populated Agent Tabs -->
             </div>
-            <div style="display:flex;gap:8px;align-items:center;">
+            <div style="display:flex;gap:8px;align-items:center;padding-bottom:12px;">
+              <span id="runtimeIndicator" class="pill pill-neutral" hidden></span>
               <button class="btn btn-ghost btn-sm" id="runLoopBtn">⟳ Loop</button>
               <button class="btn btn-ghost btn-sm" id="refreshBtn">↻</button>
             </div>
           </div>
-          <div class="chat-messages" id="primeMessages"></div>
+          <div class="chat-messages" id="chatMessages"></div>
           <div class="chat-composer">
             <div class="composer-mode-row">
-              <div class="mode-toggle" id="primeModeToggle">
+              <div class="mode-toggle" id="chatModeToggle">
                 <button class="mode-btn active" data-mode="agent">Agent</button>
                 <button class="mode-btn" data-mode="ephemeral">Ephemeral</button>
               </div>
-              <span class="mode-label" id="primeModeLabel">Sends to Prime · creates tasks</span>
+              <span class="mode-label" id="chatModeLabel">Sends to Agent · creates tasks</span>
             </div>
             <div class="composer-inner">
               <div class="composer-input-wrap">
-                <textarea class="composer-textarea" id="primeInput" placeholder="Talk to Prime… (Enter to send)" rows="1"></textarea>
+                <textarea class="composer-textarea" id="chatInput" placeholder="Talk… (Enter to send)" rows="1"></textarea>
               </div>
-              <button class="btn-send" id="primeSendBtn">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Chat: Local -->
-        <div class="chat-container" id="viewChatLocal" hidden>
-          <div class="chat-header">
-            <div class="chat-header-left">
-              <div class="message-avatar" style="background:rgba(0,217,255,0.14);border:1px solid rgba(0,217,255,0.2);color:#9fefff;">L</div>
-              <div>
-                <div class="chat-header-title">Local</div>
-                <div class="chat-header-subtitle" id="localRouteLabel">Local runtime agent</div>
-              </div>
-            </div>
-            <div style="display:flex;gap:8px;align-items:center;">
-              <span id="localRuntimeIndicator" class="pill pill-neutral"></span>
-            </div>
-          </div>
-          <div class="chat-messages" id="localMessages"></div>
-          <div class="chat-composer">
-            <div class="composer-mode-row">
-              <div class="mode-toggle" id="localModeToggle">
-                <button class="mode-btn active" data-mode="agent">Agent</button>
-                <button class="mode-btn" data-mode="ephemeral">Ephemeral</button>
-              </div>
-              <span class="mode-label" id="localModeLabel">Sends to Local · creates tasks</span>
-            </div>
-            <div class="composer-inner">
-              <div class="composer-input-wrap">
-                <textarea class="composer-textarea" id="localInput" placeholder="Talk to Local… (Enter to send)" rows="1"></textarea>
-              </div>
-              <button class="btn-send" id="localSendBtn" style="background:linear-gradient(135deg,#0097b2,#00d9ff);">
+              <button class="btn-send" id="chatSendBtn">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
             </div>
@@ -207,11 +166,45 @@
           <div class="view-header">
             <div><h1>Models &amp; Runtime</h1><p>Local model catalogue and runtime control</p></div>
             <div style="display:flex;gap:8px;">
+              <span id="desktopBackendIndicator" class="pill pill-neutral">backend: unknown</span>
+              <button class="btn btn-secondary btn-sm" id="resumeAppBackendBtn">↻ Resume Backend</button>
+              <button class="btn btn-danger btn-sm" id="stopAppBackendBtn">■ Stop Backend</button>
               <button class="btn btn-secondary btn-sm" id="startRuntimeBtn">▶ Start</button>
               <button class="btn btn-danger btn-sm" id="stopRuntimeBtn">■ Stop</button>
             </div>
           </div>
           <div id="runtimeStatus"></div>
+          <div class="panel" style="margin-top:8px;">
+            <div class="panel-header">
+              <div class="panel-title">Connect ChatGPT</div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <button class="btn btn-ghost btn-sm" id="linkDesktopBtn">Link This Desktop</button>
+                <button class="btn btn-secondary btn-sm" id="generatePairingBtn">Generate Pairing Code</button>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px;">
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Astrata account email
+                <input id="accountEmailInput" type="email" placeholder="you@example.com" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Display name
+                <input id="accountDisplayNameInput" type="text" placeholder="Optional" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Device label
+                <input id="accountDeviceLabelInput" type="text" placeholder="This Desktop" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+            </div>
+            <div style="display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;margin-bottom:12px;align-items:end;">
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Invite code
+                <input id="accountInviteCodeInput" type="text" placeholder="ASTRATA-INVITE-..." style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+              <button class="btn btn-ghost btn-sm" id="redeemInviteBtn">Redeem Invite</button>
+            </div>
+            <div id="connectorStatus"></div>
+          </div>
           <div class="panel" style="margin-top:8px;">
             <div class="panel-title">Discovered Models</div>
             <div class="model-grid" id="modelGrid"></div>
@@ -246,6 +239,18 @@
         </div>
 
       </main>
+
+      <div class="desktop-overlay" id="desktopBackendOverlay" hidden>
+        <div class="desktop-overlay-panel">
+          <div class="desktop-overlay-kicker">Desktop Backend</div>
+          <h2 id="desktopBackendOverlayTitle">Backend stopped</h2>
+          <p id="desktopBackendOverlayBody">Astrata's desktop backend is offline.</p>
+          <div class="desktop-overlay-actions">
+            <button class="btn btn-secondary btn-sm" id="desktopOverlayResumeBtn">↻ Resume Backend</button>
+            <button class="btn btn-ghost btn-sm" id="desktopOverlayDismissBtn">Dismiss</button>
+          </div>
+        </div>
+      </div>
 
       <!-- ══ COL 4: TASK RAIL (320px, chat-only) ══════════════════ -->
       <aside class="task-rail" id="taskRail" hidden>

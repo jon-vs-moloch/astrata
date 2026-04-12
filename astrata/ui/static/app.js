@@ -36,6 +36,7 @@ function createNewSession(lane) {
   // Keep up to 10 sessions
   saveSessions(lane, sessions.slice(0, 10));
   persistActiveSession(lane, id);
+  APP.getSessions(lane); // ensure initialized
   APP.sessions[lane] = sessions.slice(0, 10);
   APP.activeSession[lane] = id;
   return session;
@@ -45,7 +46,8 @@ function createNewSession(lane) {
 
 const APP = {
   summary: null,
-  currentView: 'chat-prime',
+  currentView: 'chat',
+  activeLane: 'prime', // currently selected agent tab
   selectedTaskId: null,
   pollInterval: null,
   refreshInFlight: null,
@@ -57,17 +59,30 @@ const APP = {
   accountLinkResult: null,
 
   // Per-lane chat state
-  pendingResponse: { prime: false, local: false },
-  lastSentAt:      { prime: null,  local: null },
-  composerMode:    { prime: 'agent', local: 'agent' },
+  pendingResponse: {},
+  lastSentAt: {},
+  composerMode: {},
 
   // Sessions
-  sessions:      { prime: loadSessions('prime'), local: loadSessions('local') },
-  activeSession: { prime: getActiveSessionId('prime'), local: getActiveSessionId('local') },
+  sessions: {},
+  activeSession: {},
 
   // Settings (cached from last fetch)
   registryConfig: null,
   generalSettings: null,
+
+  getSessions(lane) {
+    if (!this.sessions[lane]) this.sessions[lane] = loadSessions(lane);
+    return this.sessions[lane];
+  },
+  getActiveSession(lane) {
+    if (!this.activeSession[lane]) this.activeSession[lane] = getActiveSessionId(lane);
+    return this.activeSession[lane];
+  },
+  getComposerMode(lane) {
+    if (!this.composerMode[lane]) this.composerMode[lane] = 'agent';
+    return this.composerMode[lane];
+  }
 };
 
 /* ─── API HELPERS ───────────────────────────────────── */
@@ -204,8 +219,7 @@ function autoResizeTextarea(ta) {
 /* ─── NAVIGATION ────────────────────────────────────── */
 
 const VIEW_MAP = {
-  'chat-prime': 'viewChatPrime',
-  'chat-local': 'viewChatLocal',
+  chat:         'viewChat',
   tasks:        'viewTasks',
   attempts:     'viewAttempts',
   artifacts:    'viewArtifacts',
@@ -216,7 +230,7 @@ const VIEW_MAP = {
   'task-detail':'viewTaskDetail',
 };
 
-const CHAT_VIEWS = new Set(['chat-prime', 'chat-local']);
+const CHAT_VIEWS = new Set(['chat']);
 
 function switchView(viewId) {
   APP.currentView = viewId;
@@ -259,21 +273,13 @@ function renderContextPanel(viewId) {
   body.innerHTML = '';
   actBtn.hidden  = true;
 
-  if (viewId === 'chat-prime') {
-    title.textContent = 'Prime';
+  if (viewId === 'chat') {
+    title.textContent = APP.activeLane === 'prime' ? 'Prime' : (APP.activeLane === 'local' ? 'Local' : humanLane(APP.activeLane));
     sub.textContent   = 'Conversations';
     actBtn.hidden     = false;
     actBtn.title      = 'New Chat';
-    actBtn.onclick    = () => { createNewSession('prime'); renderContextPanel('chat-prime'); };
-    renderSessionListInto(body, 'prime');
-
-  } else if (viewId === 'chat-local') {
-    title.textContent = 'Local';
-    sub.textContent   = 'Conversations';
-    actBtn.hidden     = false;
-    actBtn.title      = 'New Chat';
-    actBtn.onclick    = () => { createNewSession('local'); renderContextPanel('chat-local'); };
-    renderSessionListInto(body, 'local');
+    actBtn.onclick    = () => { createNewSession(APP.activeLane); renderContextPanel('chat'); };
+    renderSessionListInto(body, APP.activeLane);
 
   } else if (viewId === 'tasks' || viewId === 'task-detail' || viewId === 'attempts' || viewId === 'artifacts' || viewId === 'history') {
     title.textContent = 'Workspace';
@@ -292,8 +298,8 @@ function renderContextPanel(viewId) {
 }
 
 function renderSessionListInto(container, lane) {
-  const sessions = APP.sessions[lane];
-  const activeId = APP.activeSession[lane];
+  const sessions = APP.getSessions(lane) || [];
+  const activeId = APP.getActiveSession(lane) || 'default';
 
   sessions.forEach(session => {
     const item = el('div', {
@@ -352,34 +358,44 @@ function switchSession(lane, sessionId) {
   persistActiveSession(lane, sessionId);
   APP.activeSession[lane] = sessionId;
   APP.pendingResponse[lane] = false;
-  renderContextPanel(`chat-${lane}`);
-  switchView(`chat-${lane}`);
+  
+  // Set global lane before rendering
+  APP.activeLane = lane;
+  
+  renderContextPanel('chat');
+  switchView('chat');
   if (APP.summary) {
     const key = lane === 'local' ? 'local_conversation' : 'prime_conversation';
     const messages = APP.summary.communications?.[key] || [];
     renderChatMessages(
-      document.getElementById(lane === 'prime' ? 'primeMessages' : 'localMessages'),
+      document.getElementById('chatMessages'),
       messages, lane
     );
   }
 }
 
+function switchAgent(lane) {
+  APP.activeLane = lane;
+  const activeId = APP.getActiveSession(lane);
+  switchSession(lane, activeId);
+}
+
+
 /* ─── MODE TOGGLE ───────────────────────────────────── */
 
-function setupModeToggle(lane) {
-  const toggleId = lane === 'prime' ? 'primeModeToggle' : 'localModeToggle';
-  const labelId  = lane === 'prime' ? 'primeModeLabel'  : 'localModeLabel';
-  const toggle   = document.getElementById(toggleId);
+function setupModeToggle() {
+  const toggle = document.getElementById('chatModeToggle');
+  const labelObj = document.getElementById('chatModeLabel');
   if (!toggle) return;
 
   toggle.querySelectorAll('.mode-btn').forEach(btn => {
     btn.addEventListener('click', () => {
+      const lane = APP.activeLane;
       toggle.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       APP.composerMode[lane] = btn.dataset.mode;
-      const label = document.getElementById(labelId);
-      if (label) {
-        label.textContent = btn.dataset.mode === 'ephemeral'
+      if (labelObj) {
+        labelObj.textContent = btn.dataset.mode === 'ephemeral'
           ? `Sends to ${humanLane(lane)} · no task created`
           : `Sends to ${humanLane(lane)} · creates tasks`;
       }
@@ -389,26 +405,28 @@ function setupModeToggle(lane) {
 
 /* ─── SENDING MESSAGES ──────────────────────────────── */
 
-async function sendMessage(lane, inputId) {
-  const input = document.getElementById(inputId);
+async function sendMessage() {
+  const lane = APP.activeLane;
+  const input = document.getElementById('chatInput');
   const message = input.value.trim();
   if (!message || APP.pendingResponse[lane]) return;
 
-  const btnId = lane === 'prime' ? 'primeSendBtn' : 'localSendBtn';
-  const sendBtn = document.getElementById(btnId);
+  const sendBtn = document.getElementById('chatSendBtn');
   sendBtn.disabled = true;
   APP.pendingResponse[lane] = true;
   APP.lastSentAt[lane]      = Date.now();
 
   // Optimistically render user bubble
-  const msgContainer = document.getElementById(lane === 'prime' ? 'primeMessages' : 'localMessages');
-  appendUserBubble(msgContainer, message);
-  appendGeneratingBubble(msgContainer, lane);
+  const msgContainer = document.getElementById('chatMessages');
+  if (msgContainer) {
+    appendUserBubble(msgContainer, message);
+    appendGeneratingBubble(msgContainer, lane);
+  }
   input.value = '';
   autoResizeTextarea(input);
 
-  const mode = APP.composerMode[lane];
-  const sessionId = APP.activeSession[lane];
+  const mode = APP.getComposerMode(lane);
+  const sessionId = APP.getActiveSession(lane);
 
   try {
     await api('/api/messages', {
@@ -493,6 +511,8 @@ function renderChatMessages(container, messages, lane) {
   removeGeneratingBubble(lane);
 
   if (!messages || messages.length === 0) {
+    if (container.dataset.lastMsgIds === 'empty') return;
+    container.dataset.lastMsgIds = 'empty';
     clearAndAppend(container, el('div', { className: 'chat-empty' },
       el('div', { className: 'chat-empty-icon' }, el('span', {}, '✦')),
       el('h2', {}, `Talk to ${humanLane(lane)}`),
@@ -500,6 +520,15 @@ function renderChatMessages(container, messages, lane) {
     ));
     return;
   }
+
+  const msgIds = messages.map(m => m.communication_id || m.created_at || '').join(',');
+  const isPending = APP.pendingResponse[lane] || false;
+  const sig = `${lane}-${msgIds}-pending:${isPending}`;
+  
+  if (container.dataset.lastMsgIds === sig) {
+      return; // Skip re-rendering if nothing changed
+  }
+  container.dataset.lastMsgIds = sig;
 
   const frag = document.createDocumentFragment();
   messages.forEach((msg, i) => {
@@ -661,9 +690,15 @@ function renderTasks(summary) {
 
   const list = document.getElementById('taskList');
   if (!tasks.length) {
+    if (list.dataset.lastSig === 'empty') return;
+    list.dataset.lastSig = 'empty';
     clearAndAppend(list, el('div', { className: 'empty-state' }, 'No tasks yet. Send a message to Prime or Local to generate work.'));
     return;
   }
+
+  const sig = tasks.map(t => `${t.task_id}-${t.status}-${t.updated_at}`).join(',');
+  if (list.dataset.lastSig === sig) return;
+  list.dataset.lastSig = sig;
 
   const tree = buildTaskTree(tasks);
   clearAndAppend(list, tree.map(task => renderTaskNode(task, 0)));
@@ -684,9 +719,16 @@ function renderAttempts(summary) {
 
   const list = document.getElementById('attemptList');
   if (!attempts.length) {
+    if (list.dataset.lastSig === 'empty') return;
+    list.dataset.lastSig = 'empty';
     clearAndAppend(list, el('div', { className: 'empty-state' }, 'No attempts recorded yet.'));
     return;
   }
+
+  const sig = attempts.map(a => `${a.attempt_id || a.started_at}-${a.outcome}`).join(',');
+  if (list.dataset.lastSig === sig) return;
+  list.dataset.lastSig = sig;
+
   clearAndAppend(list, attempts.map(a =>
     el('div', { className: 'transcript-item' },
       el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
@@ -712,9 +754,16 @@ function renderArtifacts(summary) {
 
   const list = document.getElementById('artifactList');
   if (!artifacts.length) {
+    if (list.dataset.lastSig === 'empty') return;
+    list.dataset.lastSig = 'empty';
     clearAndAppend(list, el('div', { className: 'empty-state' }, 'No artifacts produced yet.'));
     return;
   }
+
+  const sig = artifacts.map(a => `${a.artifact_id || a.updated_at}-${a.status}`).join(',');
+  if (list.dataset.lastSig === sig) return;
+  list.dataset.lastSig = sig;
+
   clearAndAppend(list, artifacts.map(a =>
     el('div', { className: 'transcript-item' },
       el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
@@ -1675,32 +1724,51 @@ async function refresh() {
     APP.summary   = summary;
     hideDesktopOverlay();
 
-    // Chat lanes
-    const primeConv = summary?.communications?.prime_conversation || [];
-    const localConv = summary?.communications?.local_conversation || [];
-    renderChatMessages(document.getElementById('primeMessages'), primeConv, 'prime');
-    renderChatMessages(document.getElementById('localMessages'), localConv, 'local');
-
-    // Prime route label
-    const primeAgent = summary?.agents?.prime;
-    const primeRoute = primeAgent?.display_route || null;
-    const primeFallback = primeAgent?.fallback_title || 'continuity fallback';
-    const primeLabel = document.getElementById('primeRouteLabel');
-    if (primeLabel) {
-      if (primeRoute?.label) {
-        primeLabel.textContent = `${primeRoute.label} — coordinating intelligence`;
-      } else {
-        primeLabel.textContent = `Prime route unavailable — falls back to ${primeFallback}`;
-      }
+    // Render Agent Tabs
+    const agentTabsContainer = document.getElementById('chatAgentTabs');
+    if (agentTabsContainer) {
+      agentTabsContainer.innerHTML = '';
+      const agents = Object.keys(summary?.agents || { prime: {}, local: {} });
+      if (!agents.includes('prime')) agents.unshift('prime');
+      if (!agents.includes('local') && agents.indexOf('prime') === 0) agents.splice(1, 0, 'local');
+      else if (!agents.includes('local')) agents.push('local');
+      
+      agents.forEach(agentId => {
+        const agentDef = summary?.agents?.[agentId] || {};
+        const label = agentId === 'prime' ? 'Prime' : (agentId === 'local' ? 'Local' : (agentDef.display_route?.label || humanLane(agentId)));
+        
+        const tab = el('div', {
+          className: `agent-tab${APP.activeLane === agentId ? ' active' : ''}`,
+          onClick: () => switchAgent(agentId),
+          style: {
+            padding: '8px 16px',
+            cursor: 'pointer',
+            borderBottom: APP.activeLane === agentId ? '2px solid var(--accent)' : '2px solid transparent',
+            color: APP.activeLane === agentId ? 'var(--text)' : 'var(--text-dim)',
+            fontWeight: APP.activeLane === agentId ? '600' : '400',
+            whiteSpace: 'nowrap',
+          }
+        }, label);
+        
+        agentTabsContainer.appendChild(tab);
+      });
     }
 
+    // Chat rendering for active agent
+    const lane = APP.activeLane || 'prime';
+    const key = lane + '_conversation';
+    const conv = summary?.communications?.[key] || [];
+    renderChatMessages(document.getElementById('chatMessages'), conv, lane);
+
     // Unread badges (icon rail)
-    const primeMsgCount = (summary?.communications?.prime_inbox || []).length;
-    const localMsgCount = (summary?.communications?.local_inbox || []).length;
-    const railPrimeBadge = document.getElementById('railPrimeBadge');
-    const railLocalBadge = document.getElementById('railLocalBadge');
-    if (railPrimeBadge) railPrimeBadge.hidden = primeMsgCount === 0;
-    if (railLocalBadge) railLocalBadge.hidden = localMsgCount === 0;
+    let totalUnread = 0;
+    Object.keys(summary?.communications || {}).forEach(k => {
+       if (k.endsWith('_inbox')) totalUnread += summary.communications[k].length;
+    });
+    const railChatBadge = document.getElementById('railChatBadge');
+    if (railChatBadge) {
+       railChatBadge.hidden = totalUnread === 0;
+    }
 
     // Other views
     renderTasks(summary);
@@ -1791,19 +1859,16 @@ window.addEventListener('DOMContentLoaded', async () => {
     finally { btn.disabled = false; btn.textContent = '⟳ Loop'; }
   });
 
-  // Prime composer
-  document.getElementById('primeSendBtn').addEventListener('click', () => sendMessage('prime', 'primeInput'));
-  document.getElementById('primeInput').addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage('prime', 'primeInput'); }
-  });
-  document.getElementById('primeInput').addEventListener('input', e => autoResizeTextarea(e.target));
-
-  // Local composer
-  document.getElementById('localSendBtn').addEventListener('click', () => sendMessage('local', 'localInput'));
-  document.getElementById('localInput').addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage('local', 'localInput'); }
-  });
-  document.getElementById('localInput').addEventListener('input', e => autoResizeTextarea(e.target));
+  // Chat composer
+  const chatSendBtn = document.getElementById('chatSendBtn');
+  const chatInput = document.getElementById('chatInput');
+  if (chatSendBtn) chatSendBtn.addEventListener('click', () => sendMessage());
+  if (chatInput) {
+    chatInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+    chatInput.addEventListener('input', e => autoResizeTextarea(e.target));
+  }
 
   // Runtime controls
   document.getElementById('startRuntimeBtn').addEventListener('click', async () => {
@@ -1924,11 +1989,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
 
   // Mode toggles
-  setupModeToggle('prime');
-  setupModeToggle('local');
+  setupModeToggle();
 
   // Context panel
-  renderContextPanel('chat-prime');
+  renderContextPanel('chat');
 
   // Initial load
   await refresh();
