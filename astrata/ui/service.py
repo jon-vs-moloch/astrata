@@ -2,27 +2,63 @@
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Update-channel constants (mirrors astrata.distribution.release.CHANNELS).
+# Kept here so the UI service has no import dependency on the release module.
+# ---------------------------------------------------------------------------
+_UPDATE_CHANNELS: dict[str, dict[str, object]] = {
+    "edge": {
+        "cadence": "every_build",
+        "invite_required": True,
+        "description": "Every successful build. Highest velocity, highest risk.",
+    },
+    "nightly": {
+        "cadence": "nightly",
+        "invite_required": True,
+        "description": "Latest promoted daily build for fast-follow testers.",
+    },
+    "tester": {
+        "cadence": "manual_promote",
+        "invite_required": True,
+        "description": "Friendly-tester channel before monetization.",
+    },
+    "stable": {
+        "cadence": "manual_release",
+        "invite_required": False,
+        "description": "General-availability release channel.",
+    },
+}
+_DEFAULT_UPDATE_CHANNEL = "tester"
+
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import platform
+import socket
 import subprocess
 from typing import Any
+import urllib.error
+import urllib.request
 
+from astrata.accounts.service import AccountControlPlaneRegistry
 from astrata.comms.intake import process_inbound_messages
 from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
 from astrata.config.settings import Settings, load_settings
 from astrata.context import build_quota_snapshot, summarize_inference_activity
+from astrata.agents import DurableAgentRegistry
 from astrata.governance.documents import load_governance_bundle
 from astrata.local.backends.llama_cpp import LlamaCppBackend
 from astrata.local.hardware import probe_thermal_state
 from astrata.local.runtime.client import LocalRuntimeClient
 from astrata.local.runtime.manager import LocalRuntimeManager
+from astrata.local.runtime.models import RuntimeHealthSnapshot
 from astrata.local.runtime.processes import ManagedProcessController
 from astrata.local.thermal import ThermalController
 from astrata.loop0.runner import Loop0Runner
+from astrata.mcp.relay import HostedMCPRelayService
 from astrata.providers.registry import build_default_registry
 from astrata.records.communications import CommunicationRecord
 from astrata.records.models import AttemptRecord, ArtifactRecord, TaskRecord, VerificationRecord
@@ -35,6 +71,7 @@ from astrata.startup.diagnostics import (
     load_runtime_report,
     run_startup_reflection,
 )
+from astrata.voice import VoiceService
 
 
 def _now_iso() -> str:
@@ -111,11 +148,20 @@ class AstrataUIService:
                 "inference_sources": registry.list_available_inference_sources(),
                 "default_route": default_route,
             },
+            "agents": {
+                "prime": self._agent_snapshot("prime"),
+                "reception": self._agent_snapshot("reception"),
+                "local": self._agent_snapshot("local"),
+            },
             "startup": {
                 "preflight": startup_preflight,
                 "runtime": startup_runtime,
             },
+            "desktop_backend": self._desktop_backend_snapshot(),
+            "relay": self._relay_snapshot(),
+            "account_auth": self._account_auth_snapshot(),
             "local_runtime": self._local_runtime_snapshot(),
+            "voice": VoiceService(settings=self.settings).status(),
             "queue": {
                 "counts": dict(Counter(task.status for task in tasks)),
                 "recent_tasks": [self._task_summary(task) for task in tasks[:8]],
@@ -150,6 +196,7 @@ class AstrataUIService:
                 "counts": dict(Counter(verification.result for verification in verifications)),
                 "recent": [verification.model_dump(mode="json") for verification in verifications[:6]],
             },
+            "update_channel": self._update_channel_snapshot(),
         }
 
     def send_message(self, draft: MessageDraft) -> dict[str, Any]:
@@ -275,6 +322,53 @@ class AstrataUIService:
             "managed_process": None if status is None else self._managed_process_summary(status),
         }
 
+    def ensure_local_runtime(self, *, model_id: str | None = None, profile_id: str | None = None) -> dict[str, Any]:
+        manager = self._local_runtime_manager()
+        recommendation = manager.recommend(thermal_preference=self.settings.local_runtime.thermal_preference)
+        thermal_state = probe_thermal_state(preference=self.settings.local_runtime.thermal_preference)
+        thermal_controller = ThermalController(state_path=self.settings.paths.data_dir / "thermal_state.json")
+        thermal_decision = thermal_controller.evaluate(thermal_state)
+        managed = manager.managed_status()
+        health = manager.health(
+            config={
+                "host": self.settings.local_runtime.llama_cpp_host,
+                "port": self.settings.local_runtime.llama_cpp_port,
+            }
+        )
+        if managed is not None and managed.running and health is not None and health.ok:
+            return {
+                "status": "already_running",
+                "managed_process": self._managed_process_summary(managed),
+                "health": None if health is None else health.model_dump(mode="json"),
+            }
+        direct_health = self._configured_local_runtime_health(manager)
+        if direct_health is not None and direct_health.ok:
+            manager.select_runtime(
+                backend_id=direct_health.backend_id,
+                model_id=model_id or (None if recommendation.model is None else recommendation.model.model_id),
+                mode="external",
+                profile_id=profile_id or recommendation.profile_id,
+                endpoint=direct_health.endpoint,
+                metadata={"adopted_existing_endpoint": True},
+            )
+            return {
+                "status": "already_running",
+                "managed_process": None if managed is None else self._managed_process_summary(managed),
+                "health": direct_health.model_dump(mode="json"),
+                "adopted_existing_endpoint": True,
+            }
+        if not thermal_decision.should_start_new_local_work:
+            return {
+                "status": "deferred_for_thermal",
+                "thermal_state": {
+                    "preference": thermal_state.preference,
+                    "thermal_pressure": thermal_state.thermal_pressure,
+                    "detail": thermal_state.detail,
+                },
+                "thermal_decision": thermal_decision.__dict__,
+            }
+        return self.start_local_runtime(model_id=model_id, profile_id=profile_id)
+
     def stop_local_runtime(self) -> dict[str, Any]:
         manager = self._local_runtime_manager()
         status = manager.stop_managed()
@@ -283,10 +377,298 @@ class AstrataUIService:
             "managed_process": self._managed_process_summary(status),
         }
 
+    def relay_pairing(self, *, profile_id: str | None = None, label: str = "Astrata Desktop", ttl_minutes: int = 15) -> dict[str, Any]:
+        profile = self._preferred_relay_profile(profile_id=profile_id)
+        if profile is None:
+            return {"status": "unavailable", "reason": "no_relay_profile"}
+        relay_endpoint = str(profile.relay_endpoint or "").strip().rstrip("/")
+        auth_token = str(profile.auth_token or "").strip()
+        if not relay_endpoint:
+            return {"status": "unavailable", "reason": "missing_relay_endpoint", "profile": profile.model_dump(mode="json")}
+        if not auth_token:
+            return {"status": "unavailable", "reason": "missing_relay_auth_token", "profile": profile.model_dump(mode="json")}
+        payload = {
+            "profile_id": profile.profile_id,
+            "label": label,
+            "ttl_minutes": max(1, min(60, int(ttl_minutes or 15))),
+        }
+        account = self._account_auth_snapshot(profile_id=profile.profile_id)
+        linked_user = account.get("user") or {}
+        linked_device = account.get("device") or {}
+        if account.get("status") in {"linked", "partial"}:
+            if linked_user.get("user_id"):
+                payload["user_id"] = str(linked_user["user_id"])
+            if linked_device.get("device_id"):
+                payload["device_id"] = str(linked_device["device_id"])
+        request = urllib.request.Request(
+            relay_endpoint + "/relay/pairing/create",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Authorization": f"Bearer {auth_token}",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/135.0.0.0 Safari/537.36 AstrataDesktop/0.1"
+                ),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10.0) as response:
+                body = json.loads(response.read().decode("utf-8") or "{}")
+            return {
+                "status": "ok",
+                "profile": profile.model_dump(mode="json"),
+                "pairing": body,
+                "connector_urls": self._relay_connector_urls(relay_endpoint),
+            }
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            return {
+                "status": "failed",
+                "reason": f"http_{exc.code}",
+                "detail": detail,
+                "profile": profile.model_dump(mode="json"),
+                "connector_urls": self._relay_connector_urls(relay_endpoint),
+            }
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": str(exc),
+                "profile": profile.model_dump(mode="json"),
+                "connector_urls": self._relay_connector_urls(relay_endpoint),
+            }
+
+    def register_account_device(
+        self,
+        *,
+        email: str,
+        display_name: str = "",
+        device_label: str | None = None,
+        profile_id: str | None = None,
+    ) -> dict[str, Any]:
+        profile = self._preferred_relay_profile(profile_id=profile_id)
+        if profile is None:
+            return {"status": "unavailable", "reason": "no_relay_profile"}
+        relay_endpoint = str(profile.relay_endpoint or "").strip().rstrip("/")
+        registry = self._account_registry()
+        try:
+            result = registry.register_desktop_device(
+                email=email,
+                display_name=display_name,
+                device_label=(device_label or self._default_device_label()).strip(),
+                profile_id=profile.profile_id,
+                relay_endpoint=relay_endpoint,
+                profile_label=str(profile.label or "").strip(),
+                control_posture=str(profile.control_posture or "").strip() or "true_remote_prime",
+                disclosure_tier=str(profile.max_disclosure_tier or "").strip() or "trusted_remote",
+                device_platform=self._device_platform_label(),
+            )
+        except ValueError as exc:
+            return {"status": "failed", "reason": str(exc)}
+        return {
+            **result,
+            "connector_urls": self._relay_connector_urls(relay_endpoint),
+        }
+
+    def redeem_invite_code(
+        self,
+        *,
+        email: str,
+        invite_code: str,
+        display_name: str = "",
+    ) -> dict[str, Any]:
+        registry = self._account_registry()
+        try:
+            result = registry.redeem_invite_code(
+                email=email,
+                code=invite_code,
+                display_name=display_name,
+            )
+        except ValueError as exc:
+            return {
+                "status": "failed",
+                "reason": str(exc),
+                "hosted_bridge_eligibility": registry.hosted_bridge_eligibility(email=email),
+                "access_policy": registry.access_policy(),
+            }
+        return {
+            **result,
+            "access_policy": registry.access_policy(),
+        }
+
+    # ── Preferences (persisted user settings) ────────────────────────────
+
+    def get_preferences(self) -> dict[str, Any]:
+        """Return the current persisted preferences, with defaults filled in."""
+        prefs = self._load_preferences()
+        channel = str(prefs.get("update_channel") or _DEFAULT_UPDATE_CHANNEL).strip().lower()
+        if channel not in _UPDATE_CHANNELS:
+            channel = _DEFAULT_UPDATE_CHANNEL
+        prefs["update_channel"] = channel
+        return prefs
+
+    def set_preferences(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Merge *data* into the persisted preferences and return the updated state."""
+        prefs = self._load_preferences()
+        if "update_channel" in data:
+            channel = str(data["update_channel"] or _DEFAULT_UPDATE_CHANNEL).strip().lower()
+            if channel not in _UPDATE_CHANNELS:
+                raise ValueError(f"Unknown update channel: {channel!r}. Valid: {list(_UPDATE_CHANNELS)}")
+            prefs["update_channel"] = channel
+        self._save_preferences(prefs)
+        return self.get_preferences()
+
+    def _preferences_path(self) -> Path:
+        return self.settings.paths.data_dir / "preferences.json"
+
+    def _load_preferences(self) -> dict[str, Any]:
+        path = self._preferences_path()
+        if not path.exists():
+            return {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_preferences(self, prefs: dict[str, Any]) -> None:
+        path = self._preferences_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+
+    def _update_channel_snapshot(self) -> dict[str, Any]:
+        prefs = self.get_preferences()
+        current = str(prefs.get("update_channel") or _DEFAULT_UPDATE_CHANNEL)
+        channels = [
+            {
+                "channel_id": channel_id,
+                **{k: v for k, v in meta.items()},
+                "selected": channel_id == current,
+            }
+            for channel_id, meta in _UPDATE_CHANNELS.items()
+        ]
+        return {
+            "selected": current,
+            "channels": channels,
+        }
+
     def _db(self) -> AstrataDatabase:
         db = AstrataDatabase(self.settings.paths.data_dir / "astrata.db")
         db.initialize()
         return db
+
+    def _account_registry(self) -> AccountControlPlaneRegistry:
+        return AccountControlPlaneRegistry.from_settings(self.settings)
+
+    def _relay_service(self) -> HostedMCPRelayService:
+        return HostedMCPRelayService.from_settings(self.settings)
+
+    def _relay_snapshot(self) -> dict[str, Any]:
+        relay = self._relay_service()
+        summary = relay.telemetry_summary()
+        selected = self._preferred_relay_profile()
+        return {
+            **summary,
+            "selected_profile": None if selected is None else selected.model_dump(mode="json"),
+            "connector_urls": {} if selected is None else self._relay_connector_urls(str(selected.relay_endpoint or "").strip()),
+        }
+
+    def _account_auth_snapshot(self, *, profile_id: str | None = None) -> dict[str, Any]:
+        selected = self._preferred_relay_profile(profile_id=profile_id)
+        relay_endpoint = "" if selected is None else str(selected.relay_endpoint or "").strip()
+        registry = self._account_registry()
+        snapshot = registry.desktop_status(
+            profile_id=None if selected is None else selected.profile_id,
+            relay_endpoint=relay_endpoint,
+        )
+        return {
+            **snapshot,
+            "access_policy": registry.access_policy(),
+            "device_label_suggestion": self._default_device_label(),
+            "selected_relay_profile": None if selected is None else selected.model_dump(mode="json"),
+            "connector_urls": {} if selected is None else self._relay_connector_urls(relay_endpoint),
+        }
+
+    def _preferred_relay_profile(self, profile_id: str | None = None):
+        relay = self._relay_service()
+        if profile_id:
+            return relay.get_profile(profile_id)
+        profiles = relay.list_profiles()
+        if not profiles:
+            return None
+        chatgpt_profiles = [profile for profile in profiles if str(profile.exposure or "").strip().lower() == "chatgpt"]
+        return (chatgpt_profiles or profiles)[0]
+
+    def _relay_connector_urls(self, relay_endpoint: str) -> dict[str, str]:
+        base = str(relay_endpoint or "").strip().rstrip("/")
+        if not base:
+            return {}
+        return {
+            "relay": f"{base}/mcp",
+            "openapi": f"{base}/gpt/openapi.json",
+            "privacy": f"{base}/privacy",
+            "oauth_authorization_server": f"{base}/.well-known/oauth-authorization-server",
+            "oauth_protected_resource": f"{base}/.well-known/oauth-protected-resource",
+        }
+
+    def _default_device_label(self) -> str:
+        host = str(socket.gethostname() or "").strip()
+        if not host:
+            host = "This Desktop"
+        return host
+
+    def _device_platform_label(self) -> str:
+        system = str(platform.system() or "").strip().lower()
+        if system == "darwin":
+            return "desktop-macos"
+        if system == "windows":
+            return "desktop-windows"
+        if system == "linux":
+            return "desktop-linux"
+        return "desktop"
+
+    def _agent_snapshot(self, agent_id: str) -> dict[str, Any] | None:
+        registry = DurableAgentRegistry.from_settings(self.settings)
+        registry.ensure_bootstrap_agents()
+        agent = registry.get(agent_id)
+        if agent is None:
+            return None
+        binding = dict(agent.inference_binding or {})
+        fallback_policy = dict(agent.fallback_policy or {})
+        fallback_id = str(fallback_policy.get("fallback_agent_id") or "").strip() or None
+        fallback_agent = registry.get(fallback_id) if fallback_id else None
+        display_route = self._route_display(binding)
+        return {
+            "agent_id": agent.agent_id,
+            "title": agent.title,
+            "role": agent.role,
+            "status": agent.status,
+            "inference_binding": binding,
+            "display_route": display_route,
+            "fallback_agent_id": fallback_id,
+            "fallback_title": None if fallback_agent is None else fallback_agent.title,
+            "fallback_route": None if fallback_agent is None else self._route_display(dict(fallback_agent.inference_binding or {})),
+            "queue_if_unavailable": bool(fallback_policy.get("queue_if_unavailable", False)),
+        }
+
+    def _route_display(self, route: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(route or {})
+        provider = str(payload.get("provider") or "").strip()
+        cli_tool = str(payload.get("cli_tool") or "").strip()
+        model = str(payload.get("model") or "").strip() or None
+        label = provider or "unknown"
+        if cli_tool:
+            label = f"{provider}:{cli_tool}" if provider else cli_tool
+        return {
+            "provider": provider or None,
+            "cli_tool": cli_tool or None,
+            "model": model,
+            "label": label,
+        }
 
     def _local_runtime_manager(self) -> LocalRuntimeManager:
         process_controller = ManagedProcessController(
@@ -305,6 +687,25 @@ class AstrataUIService:
                 endpoint=self.settings.local_runtime.llama_cpp_base_url,
             )
         return manager
+
+    def _configured_local_runtime_health(self, manager: LocalRuntimeManager) -> RuntimeHealthSnapshot | None:
+        backend = manager.backend("llama_cpp")
+        if backend is None:
+            return None
+        health = backend.healthcheck(
+            config={
+                "host": self.settings.local_runtime.llama_cpp_host,
+                "port": self.settings.local_runtime.llama_cpp_port,
+            }
+        )
+        return RuntimeHealthSnapshot(
+            backend_id=backend.backend_id,
+            ok=health.ok,
+            status=health.status,
+            endpoint=health.endpoint,
+            detail=health.detail,
+            metadata=dict(health.metadata or {}),
+        )
 
     def _local_runtime_snapshot(self) -> dict[str, Any]:
         manager = self._local_runtime_manager()
@@ -333,24 +734,47 @@ class AstrataUIService:
             "models": [model.model_dump(mode="json") for model in manager.model_registry().list_models()[:12]],
         }
 
+    def _desktop_backend_snapshot(self) -> dict[str, Any]:
+        session_path = self.settings.paths.data_dir / "desktop-session.json"
+        payload: dict[str, Any] = {}
+        if session_path.exists():
+            try:
+                loaded = json.loads(session_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except Exception:
+                payload = {}
+        return {
+            "session_path": str(session_path),
+            "session_present": session_path.exists(),
+            "backend_url": payload.get("backend_url"),
+            "ui_port": payload.get("ui_port"),
+            "started_by_desktop_shell": bool(payload.get("started_by_desktop_shell", False)),
+            "backend_pid": payload.get("backend_pid"),
+            "frontend_deliberately_closed": bool(payload.get("frontend_deliberately_closed", False)),
+            "backend_deliberately_stopped": bool(payload.get("backend_deliberately_stopped", False)),
+            "last_action": payload.get("last_action"),
+            "started_at_unix_ms": payload.get("started_at_unix_ms"),
+        }
+
     def _tasks(self, db: AstrataDatabase) -> list[TaskRecord]:
-        tasks = [TaskRecord(**payload) for payload in db.list_records("tasks")]
+        tasks = [TaskRecord(**payload) for payload in db.iter_records("tasks")]
         return sorted(tasks, key=lambda item: item.updated_at, reverse=True)
 
     def _attempts(self, db: AstrataDatabase) -> list[AttemptRecord]:
-        attempts = [AttemptRecord(**payload) for payload in db.list_records("attempts")]
+        attempts = [AttemptRecord(**payload) for payload in db.iter_records("attempts")]
         return sorted(attempts, key=lambda item: item.started_at, reverse=True)
 
     def _artifacts(self, db: AstrataDatabase) -> list[ArtifactRecord]:
-        artifacts = [ArtifactRecord(**payload) for payload in db.list_records("artifacts")]
+        artifacts = [ArtifactRecord(**payload) for payload in db.iter_records("artifacts")]
         return sorted(artifacts, key=lambda item: item.updated_at, reverse=True)
 
     def _verifications(self, db: AstrataDatabase) -> list[VerificationRecord]:
-        verifications = [VerificationRecord(**payload) for payload in db.list_records("verifications")]
+        verifications = [VerificationRecord(**payload) for payload in db.iter_records("verifications")]
         return sorted(verifications, key=lambda item: item.created_at, reverse=True)
 
     def _communications(self, db: AstrataDatabase) -> list[CommunicationRecord]:
-        communications = [CommunicationRecord(**payload) for payload in db.list_records("communications")]
+        communications = [CommunicationRecord(**payload) for payload in db.iter_records("communications")]
         return sorted(communications, key=lambda item: item.created_at, reverse=True)
 
     def _quota_policy(self, db: AstrataDatabase, registry: ProviderRegistry) -> QuotaPolicy:

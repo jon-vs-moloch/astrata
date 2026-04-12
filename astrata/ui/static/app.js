@@ -48,6 +48,13 @@ const APP = {
   currentView: 'chat-prime',
   selectedTaskId: null,
   pollInterval: null,
+  refreshInFlight: null,
+  desktopBackendStatus: null,
+  desktopAvailable: typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__?.invoke),
+  desktopOverlayDismissed: false,
+  lastBackendRecoveryAt: 0,
+  relayPairing: null,
+  accountLinkResult: null,
 
   // Per-lane chat state
   pendingResponse: { prime: false, local: false },
@@ -75,6 +82,12 @@ async function api(url, options = {}) {
     throw new Error(detail || `HTTP ${resp.status}`);
   }
   return resp.json();
+}
+
+async function desktopInvoke(command, args = {}) {
+  const invoke = window.__TAURI_INTERNALS__?.invoke;
+  if (!invoke) throw new Error('Astrata desktop controls are unavailable.');
+  return invoke(command, args);
 }
 
 /* ─── FORMATTING ────────────────────────────────────── */
@@ -854,6 +867,7 @@ function renderHistory(summary) {
 
 function renderModels(summary) {
   const runtime  = summary?.local_runtime || {};
+  const desktop  = APP.desktopBackendStatus || summary?.desktop_backend || {};
   const models   = runtime?.models || [];
   const thermal  = runtime?.thermal_state || {};
   const decision = runtime?.thermal_decision || {};
@@ -875,7 +889,24 @@ function renderModels(summary) {
       metricTile(rec?.model?.display_name || 'None', 'Recommended'),
       metricTile(models.length, 'Models Found'),
     ),
+    APP.desktopAvailable ? el('div', { style: { marginTop: '12px', fontSize: '12px', color: 'var(--text-muted)' } },
+      `Desktop backend: ${desktop?.backend_running ? 'running' : (desktop?.backend_deliberately_stopped ? 'stopped deliberately' : 'recovering')}.`) : null,
   ));
+
+  const desktopIndicator = document.getElementById('desktopBackendIndicator');
+  if (desktopIndicator) {
+    const runningText = desktop?.backend_running ? 'backend: running'
+      : (desktop?.backend_deliberately_stopped ? 'backend: stopped' : 'backend: recovering');
+    desktopIndicator.textContent = runningText;
+    desktopIndicator.className = `pill pill-${desktop?.backend_running ? 'success' : (desktop?.backend_deliberately_stopped ? 'warning' : 'neutral')}`;
+  }
+
+  const stopBackendBtn = document.getElementById('stopAppBackendBtn');
+  const resumeBackendBtn = document.getElementById('resumeAppBackendBtn');
+  if (stopBackendBtn) stopBackendBtn.disabled = !APP.desktopAvailable || !desktop?.backend_running;
+  if (resumeBackendBtn) resumeBackendBtn.disabled = !APP.desktopAvailable || Boolean(desktop?.backend_running);
+
+  renderConnectorStatus(summary);
 
   // Local runtime indicator in Local chat header
   const indicator = document.getElementById('localRuntimeIndicator');
@@ -924,6 +955,249 @@ function renderModels(summary) {
       ),
     );
   }));
+}
+
+function setDesktopOverlay({ title, body, dismissible = true } = {}) {
+  const overlay = document.getElementById('desktopBackendOverlay');
+  if (!overlay) return;
+  const titleNode = document.getElementById('desktopBackendOverlayTitle');
+  const bodyNode = document.getElementById('desktopBackendOverlayBody');
+  const dismissBtn = document.getElementById('desktopOverlayDismissBtn');
+  if (titleNode) titleNode.textContent = title || 'Backend offline';
+  if (bodyNode) bodyNode.textContent = body || 'Astrata desktop backend is offline.';
+  if (dismissBtn) dismissBtn.hidden = !dismissible;
+  overlay.hidden = false;
+}
+
+function hideDesktopOverlay() {
+  const overlay = document.getElementById('desktopBackendOverlay');
+  if (overlay) overlay.hidden = true;
+}
+
+function renderConnectorStatus(summary) {
+  const container = document.getElementById('connectorStatus');
+  if (!container) return;
+  const relay = summary?.relay || {};
+  const account = summary?.account_auth || {};
+  const accessPolicy = account?.access_policy || {};
+  const hostedEligibility = account?.hosted_bridge_eligibility || {};
+  const selected = relay?.selected_profile || null;
+  const urls = relay?.connector_urls || {};
+  const pairing = APP.relayPairing;
+  const accountEmailInput = document.getElementById('accountEmailInput');
+  const displayNameInput = document.getElementById('accountDisplayNameInput');
+  const deviceLabelInput = document.getElementById('accountDeviceLabelInput');
+  const inviteCodeInput = document.getElementById('accountInviteCodeInput');
+
+  if (accountEmailInput && !accountEmailInput.value && account?.user?.email) accountEmailInput.value = account.user.email;
+  if (displayNameInput && !displayNameInput.value && account?.user?.display_name) displayNameInput.value = account.user.display_name;
+  if (deviceLabelInput && !deviceLabelInput.value && account?.device_label_suggestion) deviceLabelInput.value = account.device_label_suggestion;
+  if (inviteCodeInput && APP.accountLinkResult?.invite?.code && !inviteCodeInput.value) inviteCodeInput.value = APP.accountLinkResult.invite.code;
+
+  const blocks = [];
+
+  const eligibilityStatus = String(hostedEligibility?.status || '').trim() || 'invite_required';
+  const eligibilityTone = eligibilityStatus === 'active' || eligibilityStatus === 'eligible'
+    ? 'success'
+    : eligibilityStatus === 'disabled'
+      ? 'danger'
+      : 'warning';
+
+  blocks.push(
+    el('div', { className: 'runtime-card', style: { marginBottom: '12px' } },
+      el('div', { className: 'runtime-status-row' },
+        el('span', { style: { fontWeight: '700', fontSize: '14px' } }, 'Access State'),
+        pill(eligibilityStatus.replaceAll('_', ' '), eligibilityTone),
+      ),
+      el('div', { style: { fontSize: '13px', color: 'var(--text-muted)', marginTop: '10px', lineHeight: '1.7' } },
+        hostedEligibility?.reason
+          || 'Astrata should explain which parts of setup are public and which parts are still gated.'),
+      el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' } },
+        accessPolicy?.public_access?.download ? routePill('public', 'download', 'success') : null,
+        accessPolicy?.public_access?.desktop_install ? routePill('public', 'install', 'success') : null,
+        accessPolicy?.public_access?.local_onboarding ? routePill('public', 'onboarding', 'success') : null,
+        accessPolicy?.invite_gated_access?.gpt_bridge_sign_in ? routePill('invite', 'bridge sign-in', 'warning') : null,
+        accessPolicy?.invite_gated_access?.remote_queue_usage ? routePill('invite', 'remote queue', 'warning') : null,
+      ),
+      el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '10px' } },
+        accessPolicy?.policy_rule || 'Download/install is public; hosted bridge activation is gated.'),
+    ),
+  );
+
+  if (!selected) {
+    blocks.push(
+      el('div', { className: 'empty-state' },
+        'No hosted relay profile is registered yet. Once a ChatGPT relay profile exists locally, this panel can generate pairing codes for it.')
+    );
+    clearAndAppend(container, blocks);
+    return;
+  }
+
+  blocks.push(
+    el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px' } },
+      pill(selected.exposure || 'generic', 'accent'),
+      pill(selected.control_posture || 'unknown', 'neutral'),
+      pill(selected.local_prime_behavior || 'unknown', 'neutral'),
+      pill(`queue ${relay.queue_depth || 0}`, 'neutral'),
+    ),
+    el('div', { style: { fontSize: '13px', color: 'var(--text-muted)', lineHeight: '1.7' } },
+      `Astrata will pair ChatGPT against ${selected.label || selected.profile_id}. The desktop should be linked to an Astrata account first so new pairing codes carry user and device context.`),
+  );
+
+  if (account?.status === 'linked' || account?.status === 'partial') {
+    blocks.push(
+      el('div', { className: 'runtime-card', style: { marginTop: '12px' } },
+        el('div', { className: 'runtime-status-row' },
+          el('span', { style: { fontWeight: '700', fontSize: '14px' } }, 'Desktop Account Link'),
+          pill(account.status === 'linked' ? 'linked' : 'partial', account.status === 'linked' ? 'success' : 'warning'),
+        ),
+        el('div', { style: { fontSize: '13px', color: 'var(--text-muted)', marginTop: '10px', lineHeight: '1.7' } },
+          `${account?.user?.display_name || account?.user?.email || 'Astrata user'} is linked to ${account?.device?.label || account?.device_label_suggestion || 'this desktop'} for ${account?.profile?.label || selected.label || selected.profile_id}.`),
+        el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' } },
+          account?.user?.email ? routePill('account', account.user.email, 'accent') : null,
+          account?.device?.label ? routePill('device', account.device.label, 'neutral') : null,
+          account?.profile?.profile_id ? routePill('profile', account.profile.profile_id.slice(0, 8), 'neutral') : null,
+        ),
+        el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '10px' } },
+          eligibilityStatus === 'eligible' || eligibilityStatus === 'active'
+            ? 'This desktop is linked and the account is eligible for hosted bridge activation.'
+            : 'This makes pairing codes device-aware, but hosted bridge activation still needs invite-backed account eligibility.'),
+      ),
+    );
+  } else {
+    blocks.push(
+      el('div', { className: 'transcript-item', style: { marginTop: '12px' } },
+        el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+          pill('account link needed', 'warning'),
+        ),
+        el('div', { className: 'transcript-body' },
+          'Link this desktop to the selected relay profile first. That gives the connector a real user, profile, and device binding instead of a floating pairing code.'),
+      ),
+    );
+  }
+
+  if (APP.accountLinkResult?.status === 'failed') {
+    blocks.push(
+      el('div', { className: 'transcript-item', style: { marginTop: '12px' } },
+        el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+          pill('link failed', 'danger'),
+        ),
+        el('div', { className: 'transcript-body' }, APP.accountLinkResult.reason || 'Desktop account link failed.'),
+      ),
+    );
+  }
+
+  if (APP.accountLinkResult?.status === 'ok' && APP.accountLinkResult?.invite) {
+    blocks.push(
+      el('div', { className: 'transcript-item', style: { marginTop: '12px' } },
+        el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+          pill('invite redeemed', 'success'),
+        ),
+        el('div', { className: 'transcript-body' },
+          'Hosted bridge access for this account is now eligible. You can keep onboarding locally, then activate the bridge when ready.'),
+      ),
+    );
+  }
+
+  if (pairing?.status === 'ok') {
+    const code = pairing?.pairing?.pairing_code || '—';
+    const expires = pairing?.pairing?.expires_at ? `${formatTime(pairing.pairing.expires_at)} (${relativeTime(pairing.pairing.expires_at)})` : '—';
+    blocks.push(
+      el('div', { className: 'runtime-card', style: { marginTop: '12px' } },
+        el('div', { className: 'runtime-status-row' },
+          el('span', { style: { fontWeight: '700', fontSize: '14px' } }, 'Current Pairing Code'),
+          pill('ready', 'success'),
+        ),
+        el('div', { style: { fontFamily: 'var(--font-mono)', fontSize: '22px', letterSpacing: '0.04em', marginTop: '12px' } }, code),
+        el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '8px' } }, `Expires ${expires}`),
+        el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '8px' } },
+          pairing?.pairing?.user_id && pairing?.pairing?.device_id
+            ? 'This code is bound to the linked Astrata user and desktop device.'
+            : 'This code is not carrying account/device context yet.'),
+        el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' } },
+          el('button', {
+            className: 'btn btn-secondary btn-sm',
+            onClick: async () => {
+              try {
+                await navigator.clipboard.writeText(code);
+              } catch (err) {
+                console.error('Copy pairing code failed:', err);
+              }
+            },
+          }, 'Copy Code'),
+          urls.openapi ? el('a', { className: 'btn btn-ghost btn-sm', href: urls.openapi, target: '_blank', rel: 'noreferrer' }, 'Open Schema') : null,
+          urls.privacy ? el('a', { className: 'btn btn-ghost btn-sm', href: urls.privacy, target: '_blank', rel: 'noreferrer' }, 'Privacy') : null,
+        ),
+      ),
+    );
+  } else if (pairing?.status === 'failed' || pairing?.status === 'unavailable') {
+    blocks.push(
+      el('div', { className: 'transcript-item', style: { marginTop: '12px' } },
+        el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+          pill(pairing.status, pairing.status === 'failed' ? 'danger' : 'warning'),
+        ),
+        el('div', { className: 'transcript-body' }, pairing.reason || pairing.detail || 'Pairing could not be created.'),
+      ),
+    );
+  }
+
+  blocks.push(
+    el('div', { className: 'transcript-item', style: { marginTop: '12px' } },
+      el('div', { className: 'task-item-title' }, 'Next Step'),
+      el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '6px', lineHeight: '1.7' } },
+        account?.status === 'linked' && (eligibilityStatus === 'eligible' || eligibilityStatus === 'active')
+          ? 'This account can activate the hosted bridge. Next: reconnect the GPT with OAuth and use the pairing code as a device selector.'
+          : account?.status === 'linked'
+            ? 'This desktop is linked, but hosted bridge activation still needs an invite. Redeem one here when you have it.'
+            : 'Link this desktop first. Local install and onboarding can continue without an invite; hosted bridge activation comes later.'),
+    ),
+  );
+
+  if (urls.relay || urls.oauth_authorization_server) {
+    blocks.push(
+      el('div', { className: 'transcript-item', style: { marginTop: '12px' } },
+        el('div', { className: 'task-item-title' }, 'Connector URLs'),
+        urls.relay ? el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '6px' } }, `Relay: ${urls.relay}`) : null,
+        urls.openapi ? el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '4px' } }, `OpenAPI: ${urls.openapi}`) : null,
+        urls.oauth_authorization_server ? el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '4px' } }, `OAuth metadata: ${urls.oauth_authorization_server}`) : null,
+      ),
+    );
+  }
+
+  clearAndAppend(container, blocks);
+}
+
+async function refreshDesktopBackendStatus() {
+  if (!APP.desktopAvailable) return null;
+  const status = await desktopInvoke('desktop_backend_status_command');
+  APP.desktopBackendStatus = status;
+  return status;
+}
+
+async function stopDesktopBackend() {
+  if (!APP.desktopAvailable) return;
+  const confirmed = window.confirm("Stop Astrata's desktop backend now? The app shell will stay open and you can resume it later.");
+  if (!confirmed) return;
+  const status = await desktopInvoke('desktop_stop_backend');
+  APP.desktopBackendStatus = status;
+  APP.desktopOverlayDismissed = false;
+  setDesktopOverlay({
+    title: 'Backend stopped',
+    body: "Astrata's desktop backend was stopped deliberately. Resume it when you want the full app surface back.",
+    dismissible: true,
+  });
+  renderModels(APP.summary || {});
+}
+
+async function resumeDesktopBackend() {
+  if (!APP.desktopAvailable) return;
+  const status = await desktopInvoke('desktop_resume_backend');
+  APP.desktopBackendStatus = status;
+  APP.desktopOverlayDismissed = false;
+  hideDesktopOverlay();
+  if (status?.backend_url) {
+    window.location.replace(status.backend_url);
+  }
 }
 
 /* ─── SETTINGS / REGISTRY EDITOR ───────────────────── */
@@ -997,6 +1271,69 @@ function renderSettings(summary) {
         ),
       ));
     }
+  }
+
+  // ── Update channel ──
+  const updateChannelData = summary?.update_channel || {};
+  const selectedChannel = updateChannelData.selected || 'tester';
+  const availableChannels = Array.isArray(updateChannelData.channels) ? updateChannelData.channels : [];
+
+  const channelDescriptions = {
+    edge:    'Every successful build — highest velocity, highest risk.',
+    nightly: 'Latest promoted daily build for fast-follow testers.',
+    tester:  'Friendly-tester channel — promoted builds before GA.',
+    stable:  'General-availability release channel.',
+  };
+  const channelLabels = {
+    edge:    'Edge',
+    nightly: 'Nightly',
+    tester:  'Tester',
+    stable:  'Stable',
+  };
+
+  if (availableChannels.length) {
+    sections.push(el('div', { className: 'panel', id: 'updateChannelPanel' },
+      el('div', { className: 'panel-title' }, 'Update Channel'),
+      el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginBottom: '10px', lineHeight: '1.6' } },
+        'Choose which release channel Astrata checks for updates. Edge and Nightly require an invite for automatic updates.'),
+      el('div', { className: 'toggle-btn-row' },
+        ...availableChannels.map(ch => {
+          const isSelected = ch.channel_id === selectedChannel;
+          const btn = el('button', {
+            className: `toggle-btn${isSelected ? ' active' : ''}`,
+            id: `channelBtn-${ch.channel_id}`,
+          },
+            el('div', { style: { fontWeight: '700', fontSize: '12px', marginBottom: '2px' } },
+              channelLabels[ch.channel_id] || ch.channel_id),
+            el('div', { style: { fontSize: '11px', color: 'var(--text-dim)' } },
+              channelDescriptions[ch.channel_id] || ch.description || ch.cadence),
+            ch.invite_required
+              ? el('div', { style: { fontSize: '10px', color: 'var(--accent)', marginTop: '4px', fontWeight: '600' } }, 'invite-gated')
+              : null,
+          );
+          btn.addEventListener('click', async () => {
+            // Optimistic UI update
+            document.querySelectorAll('#updateChannelPanel .toggle-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const indicator = document.getElementById('savingIndicator');
+            if (indicator) indicator.hidden = false;
+            try {
+              await api('/api/settings', {
+                method: 'POST',
+                body: JSON.stringify({ update_channel: ch.channel_id }),
+              });
+              // Sync APP.generalSettings so any re-render picks up the new value
+              if (APP.generalSettings) APP.generalSettings.update_channel = ch.channel_id;
+            } catch (err) {
+              console.error('Failed to save update channel:', err);
+            } finally {
+              if (indicator) indicator.hidden = true;
+            }
+          });
+          return btn;
+        }),
+      ),
+    ));
   }
 
   // ── Throttle mode ──
@@ -1310,9 +1647,33 @@ async function openTaskDetail(taskId) {
 /* ─── MAIN REFRESH ──────────────────────────────────── */
 
 async function refresh() {
+  if (APP.refreshInFlight) {
+    return APP.refreshInFlight;
+  }
+  APP.refreshInFlight = (async () => {
+  if (APP.desktopAvailable) {
+    try {
+      await refreshDesktopBackendStatus();
+    } catch (err) {
+      console.error('Desktop backend status failed:', err);
+    }
+    if (APP.desktopBackendStatus?.backend_deliberately_stopped && !APP.desktopBackendStatus?.backend_running) {
+      if (!APP.desktopOverlayDismissed) {
+        setDesktopOverlay({
+          title: 'Backend stopped',
+          body: "Astrata's desktop backend is intentionally offline. Resume it when you want the live local surface back.",
+          dismissible: true,
+        });
+      }
+      renderModels(APP.summary || {});
+      return;
+    }
+  }
+
   try {
     const summary = await api('/api/summary');
     APP.summary   = summary;
+    hideDesktopOverlay();
 
     // Chat lanes
     const primeConv = summary?.communications?.prime_conversation || [];
@@ -1320,11 +1681,17 @@ async function refresh() {
     renderChatMessages(document.getElementById('primeMessages'), primeConv, 'prime');
     renderChatMessages(document.getElementById('localMessages'), localConv, 'local');
 
-    // Route label
-    const route = summary?.providers?.default_route;
-    if (route) {
-      document.getElementById('primeRouteLabel').textContent =
-        `${route.provider || 'cloud'}${route.cli_tool ? ':' + route.cli_tool : ''} — coordinating intelligence`;
+    // Prime route label
+    const primeAgent = summary?.agents?.prime;
+    const primeRoute = primeAgent?.display_route || null;
+    const primeFallback = primeAgent?.fallback_title || 'continuity fallback';
+    const primeLabel = document.getElementById('primeRouteLabel');
+    if (primeLabel) {
+      if (primeRoute?.label) {
+        primeLabel.textContent = `${primeRoute.label} — coordinating intelligence`;
+      } else {
+        primeLabel.textContent = `Prime route unavailable — falls back to ${primeFallback}`;
+      }
     }
 
     // Unread badges (icon rail)
@@ -1348,7 +1715,27 @@ async function refresh() {
 
   } catch (err) {
     console.error('Refresh failed:', err);
+    if (APP.desktopAvailable) {
+      try {
+        await refreshDesktopBackendStatus();
+      } catch (statusErr) {
+        console.error('Desktop status retry failed:', statusErr);
+      }
+      if (!APP.desktopBackendStatus?.backend_running) {
+        setDesktopOverlay({
+          title: APP.desktopBackendStatus?.backend_deliberately_stopped ? 'Backend stopped' : 'Recovering backend',
+          body: APP.desktopBackendStatus?.backend_deliberately_stopped
+            ? "Astrata's desktop backend is intentionally offline."
+            : "Astrata's desktop backend appears to be down. The shell is trying to recover it.",
+          dismissible: Boolean(APP.desktopBackendStatus?.backend_deliberately_stopped),
+        });
+      }
+    }
+  } finally {
+    APP.refreshInFlight = null;
   }
+  })();
+  return APP.refreshInFlight;
 }
 
 /* ─── CONTEXT PANEL TELEMETRY ────────────────────────────── */
@@ -1433,6 +1820,108 @@ window.addEventListener('DOMContentLoaded', async () => {
     catch (err) { console.error(err); }
     finally { btn.disabled = false; btn.textContent = '■ Stop'; }
   });
+  document.getElementById('linkDesktopBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('linkDesktopBtn');
+    const email = document.getElementById('accountEmailInput')?.value?.trim() || '';
+    const displayName = document.getElementById('accountDisplayNameInput')?.value?.trim() || '';
+    const deviceLabel = document.getElementById('accountDeviceLabelInput')?.value?.trim() || '';
+    if (!email) {
+      window.alert('Enter an Astrata account email first.');
+      return;
+    }
+    btn.disabled = true; btn.textContent = 'Linking…';
+    try {
+      const response = await api('/api/account/device/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          email,
+          display_name: displayName,
+          device_label: deviceLabel || undefined,
+        }),
+      });
+      APP.accountLinkResult = response?.detail || null;
+      await refresh();
+    } catch (err) {
+      console.error('Desktop account link failed:', err);
+      APP.accountLinkResult = { status: 'failed', reason: String(err?.message || err) };
+      renderConnectorStatus(APP.summary || {});
+    } finally {
+      btn.disabled = false; btn.textContent = 'Link This Desktop';
+    }
+  });
+  document.getElementById('redeemInviteBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('redeemInviteBtn');
+    const email = document.getElementById('accountEmailInput')?.value?.trim() || '';
+    const displayName = document.getElementById('accountDisplayNameInput')?.value?.trim() || '';
+    const inviteCode = document.getElementById('accountInviteCodeInput')?.value?.trim() || '';
+    if (!email) {
+      window.alert('Enter an Astrata account email first.');
+      return;
+    }
+    if (!inviteCode) {
+      window.alert('Enter an invite code first.');
+      return;
+    }
+    btn.disabled = true; btn.textContent = 'Redeeming…';
+    try {
+      const response = await api('/api/account/invite/redeem', {
+        method: 'POST',
+        body: JSON.stringify({
+          email,
+          display_name: displayName,
+          invite_code: inviteCode,
+        }),
+      });
+      APP.accountLinkResult = response?.detail || null;
+      await refresh();
+    } catch (err) {
+      console.error('Invite redemption failed:', err);
+      APP.accountLinkResult = { status: 'failed', reason: String(err?.message || err) };
+      renderConnectorStatus(APP.summary || {});
+    } finally {
+      btn.disabled = false; btn.textContent = 'Redeem Invite';
+    }
+  });
+  document.getElementById('generatePairingBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('generatePairingBtn');
+    btn.disabled = true; btn.textContent = 'Generating…';
+    try {
+      const response = await api('/api/relay/pairing', {
+        method: 'POST',
+        body: JSON.stringify({ label: 'Astrata Desktop', ttl_minutes: 15 }),
+      });
+      APP.relayPairing = response?.detail || null;
+      renderConnectorStatus(APP.summary || {});
+    } catch (err) {
+      console.error('Relay pairing failed:', err);
+      APP.relayPairing = { status: 'failed', reason: String(err?.message || err) };
+      renderConnectorStatus(APP.summary || {});
+    } finally {
+      btn.disabled = false; btn.textContent = 'Generate Pairing Code';
+    }
+  });
+
+  const stopAppBackendBtn = document.getElementById('stopAppBackendBtn');
+  const resumeAppBackendBtn = document.getElementById('resumeAppBackendBtn');
+  const overlayResumeBtn = document.getElementById('desktopOverlayResumeBtn');
+  const overlayDismissBtn = document.getElementById('desktopOverlayDismissBtn');
+
+  if (stopAppBackendBtn) stopAppBackendBtn.addEventListener('click', async () => {
+    try { await stopDesktopBackend(); }
+    catch (err) { console.error('Desktop backend stop failed:', err); }
+  });
+  if (resumeAppBackendBtn) resumeAppBackendBtn.addEventListener('click', async () => {
+    try { await resumeDesktopBackend(); }
+    catch (err) { console.error('Desktop backend resume failed:', err); }
+  });
+  if (overlayResumeBtn) overlayResumeBtn.addEventListener('click', async () => {
+    try { await resumeDesktopBackend(); }
+    catch (err) { console.error('Desktop backend resume failed:', err); }
+  });
+  if (overlayDismissBtn) overlayDismissBtn.addEventListener('click', () => {
+    APP.desktopOverlayDismissed = true;
+    hideDesktopOverlay();
+  });
 
   // Mode toggles
   setupModeToggle('prime');
@@ -1443,7 +1932,39 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   // Initial load
   await refresh();
-
-  // Poll every 12s
-  APP.pollInterval = setInterval(refresh, 12000);
 });
+
+window.addEventListener('focus', () => { void refresh(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    void refresh();
+  }
+});
+
+window.__astrataDesktopHandleCloseRequest = async function () {
+  if (!APP.desktopAvailable) {
+    window.close();
+    return;
+  }
+  const stopBackend = window.confirm(
+    "Stop Astrata's backend too?\n\nPress OK to stop the backend and close the app. Press Cancel to keep the backend running and just close the app."
+  );
+  try {
+    await desktopInvoke('desktop_handle_close_decision', { stopBackend });
+  } catch (err) {
+    console.error('Desktop close handling failed:', err);
+  }
+};
+
+window.__astrataDesktopHandleBackendRecovered = function (backendUrl) {
+  const now = Date.now();
+  if (now - APP.lastBackendRecoveryAt < 30000) {
+    return;
+  }
+  APP.lastBackendRecoveryAt = now;
+  APP.desktopOverlayDismissed = false;
+  hideDesktopOverlay();
+  setTimeout(() => {
+    window.location.replace(backendUrl || 'http://127.0.0.1:8891/');
+  }, 250);
+};

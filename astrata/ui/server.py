@@ -27,6 +27,30 @@ class UISendMessageRequest(BaseModel):
     kind: str = "request"
 
 
+class UIRelayPairingRequest(BaseModel):
+    profile_id: str | None = None
+    label: str = "Astrata Desktop"
+    ttl_minutes: int = 15
+
+
+class UIAccountDeviceRegisterRequest(BaseModel):
+    email: str = Field(min_length=3)
+    display_name: str = ""
+    device_label: str | None = None
+    profile_id: str | None = None
+
+
+class UIInviteRedeemRequest(BaseModel):
+    email: str = Field(min_length=3)
+    display_name: str = ""
+    invite_code: str = Field(min_length=3)
+
+
+class UISettingsRequest(BaseModel):
+    """Partial settings update — only provided keys are changed."""
+    update_channel: str | None = None
+
+
 class UIActionResponse(BaseModel):
     status: str
     detail: dict
@@ -119,6 +143,49 @@ def create_app() -> FastAPI:
     def stop_local_runtime() -> UIActionResponse:
         result = service.stop_local_runtime()
         return UIActionResponse(status="stopped", detail=result)
+
+    @app.post("/api/relay/pairing")
+    def relay_pairing(payload: UIRelayPairingRequest) -> UIActionResponse:
+        result = service.relay_pairing(
+            profile_id=payload.profile_id,
+            label=payload.label,
+            ttl_minutes=payload.ttl_minutes,
+        )
+        return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
+
+    @app.post("/api/account/device/register")
+    def register_account_device(payload: UIAccountDeviceRegisterRequest) -> UIActionResponse:
+        result = service.register_account_device(
+            email=payload.email,
+            display_name=payload.display_name,
+            device_label=payload.device_label,
+            profile_id=payload.profile_id,
+        )
+        return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
+
+    @app.post("/api/account/invite/redeem")
+    def redeem_invite(payload: UIInviteRedeemRequest) -> UIActionResponse:
+        result = service.redeem_invite_code(
+            email=payload.email,
+            display_name=payload.display_name,
+            invite_code=payload.invite_code,
+        )
+        return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
+
+    @app.get("/api/settings")
+    def get_settings() -> dict:
+        return service.get_preferences()
+
+    @app.post("/api/settings")
+    def update_settings(payload: UISettingsRequest) -> UIActionResponse:
+        data: dict = {}
+        if payload.update_channel is not None:
+            data["update_channel"] = payload.update_channel
+        try:
+            result = service.set_preferences(data)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"status": "invalid", "reason": str(exc)}) from exc
+        return UIActionResponse(status="ok", detail=result)
 
     return app
 
