@@ -351,6 +351,19 @@ class AstrataUIService:
                 endpoint=direct_health.endpoint,
                 metadata={"adopted_existing_endpoint": True},
             )
+            
+            from astrata.local.runtime.processes import find_matching_process
+            port = self.settings.local_runtime.llama_cpp_port
+            pid, cmd = find_matching_process(("--port", str(port)))
+            if pid is not None and cmd is not None:
+                controller = manager.managed_controller()
+                # Use manager._controller_for_runtime to lazily create it if it doesn't exist
+                if controller is None:
+                    controller = manager._controller_for_runtime(manager._active_runtime_key or "default", create=True)
+                if controller is not None:
+                    controller.adopt(pid, endpoint=direct_health.endpoint, command=cmd.split())
+                    managed = controller.status()
+
             return {
                 "status": "already_running",
                 "managed_process": None if managed is None else self._managed_process_summary(managed),

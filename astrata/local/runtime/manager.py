@@ -193,6 +193,10 @@ class LocalRuntimeManager:
             self._active_runtime_key = remaining[0] if remaining else None
         return status
 
+    def managed_controller(self, runtime_key: str | None = None) -> ManagedProcessController | None:
+        key = runtime_key or self._active_runtime_key or "default"
+        return self._controller_for_runtime(key, create=False)
+
     def managed_status(self, runtime_key: str | None = None) -> ManagedProcessStatus | None:
         key = runtime_key or self._active_runtime_key or "default"
         controller = self._controller_for_runtime(key, create=False)

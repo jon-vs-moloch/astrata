@@ -6,12 +6,45 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use url::form_urlencoded::byte_serialize;
 use url::Url;
 
-struct BackendChild(Mutex<Option<Child>>);
+#[derive(Serialize, Deserialize)]
+struct DesktopSessionState {
+    ui_port: u16,
+    backend_url: String,
+    started_by_desktop_shell: bool,
+    backend_pid: Option<u32>,
+    frontend_deliberately_closed: bool,
+    backend_deliberately_stopped: bool,
+    last_action: String,
+    started_at_unix_ms: u128,
+}
+
+struct BackendChildState(Mutex<Option<Child>>);
+
+struct CloseGuardState(Mutex<bool>);
+
+struct DesktopRuntimeState {
+    root_dir: PathBuf,
+    ui_port: u16,
+}
+
+#[derive(Serialize)]
+struct DesktopBackendStatus {
+    backend_running: bool,
+    backend_url: String,
+    started_by_desktop_shell: bool,
+    backend_pid: Option<u32>,
+    frontend_deliberately_closed: bool,
+    backend_deliberately_stopped: bool,
+    recovery_needed: bool,
+    stop_supported: bool,
+    ui_port: u16,
+    last_action: String,
+}
 
 #[derive(Serialize)]
 struct PreflightCheck {
@@ -50,6 +83,10 @@ fn startup_preflight_path(root_dir: &Path) -> PathBuf {
     runtime_dir(root_dir).join("startup-preflight.json")
 }
 
+fn desktop_session_path(root_dir: &Path) -> PathBuf {
+    runtime_dir(root_dir).join("desktop-session.json")
+}
+
 fn append_launcher_log(root_dir: &Path, message: &str) {
     let _ = std::fs::create_dir_all(runtime_dir(root_dir));
     if let Ok(mut handle) = OpenOptions::new()
@@ -78,6 +115,49 @@ fn write_preflight_report(root_dir: &Path, report: &StartupPreflightReport) {
     if let Ok(payload) = serde_json::to_string_pretty(report) {
         let _ = std::fs::write(startup_preflight_path(root_dir), payload);
     }
+}
+
+fn write_desktop_session(root_dir: &Path, session: &DesktopSessionState) {
+    let _ = std::fs::create_dir_all(runtime_dir(root_dir));
+    if let Ok(payload) = serde_json::to_string_pretty(session) {
+        let _ = std::fs::write(desktop_session_path(root_dir), payload);
+    }
+}
+
+fn clear_desktop_session(root_dir: &Path) {
+    let _ = std::fs::remove_file(desktop_session_path(root_dir));
+}
+
+fn read_desktop_session(root_dir: &Path) -> Option<DesktopSessionState> {
+    let payload = std::fs::read_to_string(desktop_session_path(root_dir)).ok()?;
+    serde_json::from_str::<DesktopSessionState>(&payload).ok()
+}
+
+fn upsert_desktop_session(
+    root_dir: &Path,
+    ui_port: u16,
+    update: impl FnOnce(&mut DesktopSessionState),
+) -> DesktopSessionState {
+    let mut session = read_desktop_session(root_dir).unwrap_or(DesktopSessionState {
+        ui_port,
+        backend_url: format!("http://127.0.0.1:{ui_port}/"),
+        started_by_desktop_shell: false,
+        backend_pid: None,
+        frontend_deliberately_closed: false,
+        backend_deliberately_stopped: false,
+        last_action: "unknown".into(),
+        started_at_unix_ms: now_unix_ms(),
+    });
+    update(&mut session);
+    write_desktop_session(root_dir, &session);
+    session
+}
+
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn resolve_project_root() -> Result<PathBuf, String> {
@@ -232,6 +312,16 @@ fn build_preflight_report(root_dir: &Path, selected_python: Option<&Path>, boots
     }
 }
 
+fn ui_port_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}")
+            .parse()
+            .expect("valid localhost socket address"),
+        Duration::from_millis(750),
+    )
+    .is_ok()
+}
+
 fn ui_health_ok(port: u16) -> bool {
     let mut stream = match std::net::TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}")
@@ -248,17 +338,35 @@ fn ui_health_ok(port: u16) -> bool {
     if std::io::Write::write_all(&mut stream, request).is_err() {
         return false;
     }
-    let mut response = String::new();
-    if std::io::Read::read_to_string(&mut stream, &mut response).is_err() {
-        return false;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match std::io::Read::read(&mut stream, &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if response.windows(12).any(|window| window == b"HTTP/1.1 200")
+                    || response.windows(12).any(|window| window == b"HTTP/1.0 200")
+                {
+                    return true;
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(_) => return false,
+        }
     }
-    response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
+    false
 }
 
 fn wait_for_ui(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if ui_health_ok(port) {
+        if ui_port_open(port) || ui_health_ok(port) {
             return true;
         }
         thread::sleep(Duration::from_millis(750));
@@ -267,9 +375,22 @@ fn wait_for_ui(port: u16, timeout: Duration) -> bool {
 }
 
 fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
-    if ui_health_ok(port) {
+    if ui_port_open(port) || ui_health_ok(port) {
         append_launcher_log(root_dir, &format!("reusing existing ui backend on port {port}"));
         write_preflight_report(root_dir, &build_preflight_report(root_dir, None, None));
+        write_desktop_session(
+            root_dir,
+            &DesktopSessionState {
+                ui_port: port,
+                backend_url: format!("http://127.0.0.1:{port}/"),
+                started_by_desktop_shell: false,
+                backend_pid: None,
+                frontend_deliberately_closed: false,
+                backend_deliberately_stopped: false,
+                last_action: "reuse_backend".into(),
+                started_at_unix_ms: now_unix_ms(),
+            },
+        );
         return Ok(None);
     }
 
@@ -293,22 +414,22 @@ fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
         .try_clone()
         .map_err(|err| format!("Failed to clone desktop UI log file handle: {err}"))?;
 
-    let child = Command::new(&python)
+    let mut child = Command::new(&python)
         .current_dir(root_dir)
         .arg("-m")
-        .arg("astrata.ui.server")
-        .arg("--host")
+        .arg("astrata.main")
+        .arg("supervisor-reconcile")
+        .arg("--ui-host")
         .arg("127.0.0.1")
-        .arg("--port")
+        .arg("--ui-port")
         .arg(port.to_string())
-        .arg("--no-open")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|err| {
             let message = format!(
-                "Failed to launch Astrata UI backend with {:?}: {err}",
+                "Failed to launch Astrata supervisor with {:?}: {err}",
                 python
             );
             write_preflight_report(root_dir, &build_preflight_report(root_dir, Some(&python), Some(&message)));
@@ -317,10 +438,23 @@ fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
     append_launcher_log(
         root_dir,
         &format!(
-            "spawned ui backend with {:?} on http://127.0.0.1:{port}, pid={}",
+            "ran supervisor-reconcile with {:?} on http://127.0.0.1:{port}, pid={}",
             python,
             child.id()
         ),
+    );
+    write_desktop_session(
+        root_dir,
+        &DesktopSessionState {
+            ui_port: port,
+            backend_url: format!("http://127.0.0.1:{port}/"),
+            started_by_desktop_shell: true,
+            backend_pid: Some(child.id()),
+            frontend_deliberately_closed: false,
+            backend_deliberately_stopped: false,
+            last_action: "start_backend".into(),
+            started_at_unix_ms: now_unix_ms(),
+        },
     );
 
     if !wait_for_ui(port, Duration::from_secs(90)) {
@@ -328,6 +462,8 @@ fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
             "Astrata UI backend did not become healthy on http://127.0.0.1:{port} within 90 seconds. Check {:?} for startup logs.",
             log_path
         );
+        let _ = child.kill();
+        clear_desktop_session(root_dir);
         write_preflight_report(root_dir, &build_preflight_report(root_dir, Some(&python), Some(&message)));
         return Err(message);
     }
@@ -335,6 +471,155 @@ fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
     write_preflight_report(root_dir, &build_preflight_report(root_dir, Some(&python), None));
 
     Ok(Some(child))
+}
+
+fn desktop_backend_status(root_dir: &Path, ui_port: u16) -> DesktopBackendStatus {
+    let session = read_desktop_session(root_dir);
+    let backend_running = ui_port_open(ui_port) || ui_health_ok(ui_port);
+    let backend_url = session
+        .as_ref()
+        .map(|item| item.backend_url.clone())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{ui_port}/"));
+    let started_by_desktop_shell = session
+        .as_ref()
+        .map(|item| item.started_by_desktop_shell)
+        .unwrap_or(false);
+    let backend_pid = session.as_ref().and_then(|item| item.backend_pid);
+    let frontend_deliberately_closed = session
+        .as_ref()
+        .map(|item| item.frontend_deliberately_closed)
+        .unwrap_or(false);
+    let backend_deliberately_stopped = session
+        .as_ref()
+        .map(|item| item.backend_deliberately_stopped)
+        .unwrap_or(false);
+    let last_action = session
+        .as_ref()
+        .map(|item| item.last_action.clone())
+        .unwrap_or_else(|| "unknown".into());
+    DesktopBackendStatus {
+        backend_running,
+        backend_url,
+        started_by_desktop_shell,
+        backend_pid,
+        frontend_deliberately_closed,
+        backend_deliberately_stopped,
+        recovery_needed: !backend_running && !backend_deliberately_stopped,
+        stop_supported: backend_pid.is_some(),
+        ui_port,
+        last_action,
+    }
+}
+
+fn stop_backend_process(root_dir: &Path, child_state: &BackendChildState, ui_port: u16) -> Result<(), String> {
+    if let Ok(mut maybe_child) = child_state.0.lock() {
+        if let Some(mut child) = maybe_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    
+    if let Some(python) = find_python(root_dir) {
+        let _ = Command::new(&python)
+            .current_dir(root_dir)
+            .arg("-m")
+            .arg("astrata.main")
+            .arg("supervisor-stop")
+            .arg("--ui-port")
+            .arg(ui_port.to_string())
+            .arg("--include-adopted")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    
+    let mut stopped = true;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !ui_port_open(ui_port) && !ui_health_ok(ui_port) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    upsert_desktop_session(root_dir, ui_port, |session| {
+        session.backend_pid = None;
+        session.backend_deliberately_stopped = true;
+        session.last_action = "stop_backend".into();
+    });
+    if stopped {
+        Ok(())
+    } else {
+        Err("Desktop shell could not identify a stoppable backend process.".into())
+    }
+}
+
+fn close_main_window(app: &AppHandle, close_guard: &CloseGuardState) -> Result<(), String> {
+    if let Ok(mut allow) = close_guard.0.lock() {
+        *allow = true;
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Astrata desktop window is not available.".to_string())?;
+    window.close().map_err(|err| format!("Failed to close Astrata window: {err}"))
+}
+
+#[tauri::command]
+fn desktop_backend_status_command(runtime: State<DesktopRuntimeState>) -> DesktopBackendStatus {
+    desktop_backend_status(&runtime.root_dir, runtime.ui_port)
+}
+
+#[tauri::command]
+fn desktop_handle_close_decision(
+    app: AppHandle,
+    runtime: State<DesktopRuntimeState>,
+    child_state: State<BackendChildState>,
+    close_guard: State<CloseGuardState>,
+    stop_backend: bool,
+) -> Result<(), String> {
+    upsert_desktop_session(&runtime.root_dir, runtime.ui_port, |session| {
+        session.frontend_deliberately_closed = true;
+        session.backend_deliberately_stopped = stop_backend;
+        session.last_action = if stop_backend {
+            "close_and_stop_backend".into()
+        } else {
+            "close_keep_backend_running".into()
+        };
+    });
+    if stop_backend {
+        stop_backend_process(&runtime.root_dir, &child_state, runtime.ui_port)?;
+    }
+    close_main_window(&app, &close_guard)
+}
+
+#[tauri::command]
+fn desktop_stop_backend(
+    runtime: State<DesktopRuntimeState>,
+    child_state: State<BackendChildState>,
+) -> Result<DesktopBackendStatus, String> {
+    upsert_desktop_session(&runtime.root_dir, runtime.ui_port, |session| {
+        session.frontend_deliberately_closed = false;
+        session.backend_deliberately_stopped = true;
+        session.last_action = "stop_backend".into();
+    });
+    stop_backend_process(&runtime.root_dir, &child_state, runtime.ui_port)?;
+    Ok(desktop_backend_status(&runtime.root_dir, runtime.ui_port))
+}
+
+#[tauri::command]
+fn desktop_resume_backend(
+    runtime: State<DesktopRuntimeState>,
+    child_state: State<BackendChildState>,
+) -> Result<DesktopBackendStatus, String> {
+    upsert_desktop_session(&runtime.root_dir, runtime.ui_port, |session| {
+        session.frontend_deliberately_closed = false;
+        session.backend_deliberately_stopped = false;
+        session.last_action = "resume_backend".into();
+    });
+    let child = start_backend(&runtime.root_dir, runtime.ui_port)?;
+    if let Ok(mut slot) = child_state.0.lock() {
+        *slot = child;
+    }
+    Ok(desktop_backend_status(&runtime.root_dir, runtime.ui_port))
 }
 
 fn encode_query_value(value: &str) -> String {
@@ -385,7 +670,18 @@ fn main() {
     };
 
     tauri::Builder::default()
-        .manage(BackendChild(Mutex::new(child)))
+        .manage(BackendChildState(Mutex::new(child)))
+        .manage(CloseGuardState(Mutex::new(false)))
+        .manage(DesktopRuntimeState {
+            root_dir: root_dir.clone(),
+            ui_port,
+        })
+        .invoke_handler(tauri::generate_handler![
+            desktop_backend_status_command,
+            desktop_handle_close_decision,
+            desktop_stop_backend,
+            desktop_resume_backend
+        ])
         .setup(move |app| {
             WebviewWindowBuilder::new(app, "main", target_url.clone())
                 .title(window_title)
@@ -394,20 +690,88 @@ fn main() {
                 .resizable(true)
                 .build()
                 .map_err(|err| format!("Failed to create Astrata desktop window: {err}"))?;
+            let app_handle = app.handle().clone();
+            let root_dir = root_dir.clone();
+            const RECOVERY_FAILURE_THRESHOLD: u8 = 3;
+            thread::spawn(move || {
+                let mut consecutive_failures: u8 = 0;
+                loop {
+                    thread::sleep(Duration::from_secs(3));
+                    let Some(window) = app_handle.get_webview_window("main") else {
+                        break;
+                    };
+                    let status = desktop_backend_status(&root_dir, ui_port);
+                    if status.backend_running || status.backend_deliberately_stopped {
+                        consecutive_failures = 0;
+                        continue;
+                    }
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures < RECOVERY_FAILURE_THRESHOLD {
+                        continue;
+                    }
+                    consecutive_failures = 0;
+                    append_launcher_log(&root_dir, "desktop monitor detected backend down; attempting recovery");
+                    match start_backend(&root_dir, ui_port) {
+                        Ok(Some(child)) => {
+                            if let Ok(mut slot) = app_handle.state::<BackendChildState>().0.lock() {
+                                *slot = Some(child);
+                            }
+                            let _ = window.eval(&format!(
+                                "window.__astrataDesktopHandleBackendRecovered && window.__astrataDesktopHandleBackendRecovered({:?});",
+                                format!("http://127.0.0.1:{ui_port}/")
+                            ));
+                        }
+                        Ok(None) => {
+                            append_launcher_log(
+                                &root_dir,
+                                "desktop monitor found backend reachable on retry; skipping recovery overlay",
+                            );
+                        }
+                        Err(err) => {
+                            append_launcher_log(&root_dir, &format!("desktop monitor recovery failed: {err}"));
+                        }
+                    }
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building Astrata desktop shell")
         .run(|app, event| {
-            if let RunEvent::Exit = event {
-                {
-                    let state = app.state::<BackendChild>();
-                    if let Ok(mut maybe_child) = state.0.lock() {
-                        if let Some(child) = maybe_child.as_mut() {
-                            let _ = child.kill();
+            match event {
+                RunEvent::WindowEvent { label, event, .. } if label == "main" => {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        let mut allow_close = false;
+                        if let Ok(guard) = app.state::<CloseGuardState>().0.lock() {
+                            allow_close = *guard;
                         }
-                    };
+                        if !allow_close {
+                            api.prevent_close();
+                            if let Some(window) = app.get_webview_window("main") {
+                                if window
+                                    .eval("window.__astrataDesktopHandleCloseRequest && window.__astrataDesktopHandleCloseRequest();")
+                                    .is_err()
+                                {
+                                    let runtime = app.state::<DesktopRuntimeState>();
+                                    upsert_desktop_session(&runtime.root_dir, runtime.ui_port, |session| {
+                                        session.frontend_deliberately_closed = true;
+                                        session.backend_deliberately_stopped = false;
+                                        session.last_action = "close_keep_backend_running".into();
+                                    });
+                                    let _ = close_main_window(&app.app_handle().clone(), &app.state::<CloseGuardState>());
+                                }
+                            }
+                        }
+                    }
                 }
+                RunEvent::Exit => {
+                    let runtime = app.state::<DesktopRuntimeState>();
+                    append_launcher_log(
+                        &runtime.root_dir,
+                        "desktop window exited; backend state preserved unless it was deliberately stopped",
+                    );
+                }
+                _ => {}
             }
         });
 }

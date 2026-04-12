@@ -13,6 +13,39 @@ import time
 from astrata.local.backends.base import BackendLaunchSpec
 
 
+def find_process_command_map() -> dict[int, str]:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return {}
+    processes: dict[int, str] = {}
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        processes[pid] = command.strip()
+    return processes
+
+
+def find_matching_process(tokens: tuple[str, ...]) -> tuple[int | None, str | None]:
+    for pid, command in find_process_command_map().items():
+        if all(token in command for token in tokens):
+            return pid, command
+    return None, None
+
+
+
 @dataclass(frozen=True)
 class ManagedProcessStatus:
     running: bool
@@ -79,7 +112,7 @@ class ManagedProcessController:
         pid = int(state.get("pid") or 0)
         running = pid > 0 and self._pid_alive(pid)
         detail = None if running else ("not_running" if not state else "stale_pid")
-        return ManagedProcessStatus(
+        result = ManagedProcessStatus(
             running=running,
             pid=pid or None,
             endpoint=state.get("endpoint"),
@@ -88,6 +121,23 @@ class ManagedProcessController:
             started_at=state.get("started_at"),
             detail=detail,
         )
+        if not running and pid > 0:
+            self.state_path.unlink(missing_ok=True)
+        return result
+
+    def adopt(self, pid: int, endpoint: str | None, command: list[str]) -> ManagedProcessStatus:
+        if not self._pid_alive(pid):
+            return self.status()
+        state = {
+            "pid": pid,
+            "endpoint": endpoint,
+            "command": list(command),
+            "log_path": str(self.log_path),
+            "started_at": time.time(),
+            "adopted": True,
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return self.status()
 
     def _load_state(self) -> dict[str, object]:
         if not self.state_path.exists():
