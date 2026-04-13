@@ -673,8 +673,13 @@ function renderTaskNode(task, depth = 0) {
 function renderTasks(summary) {
   const tasks  = summary?.queue?.recent_tasks || [];
   const counts = summary?.queue?.counts || {};
+  const metrics = document.getElementById('taskMetrics');
+  const badge = document.getElementById('tasksBadge');
+  const list = document.getElementById('taskList');
 
-  clearAndAppend(document.getElementById('taskMetrics'), [
+  if (!metrics || !list) return;
+
+  clearAndAppend(metrics, [
     metricTile(counts.working || 0, 'Running'),
     metricTile(counts.pending || 0, 'Queued'),
     metricTile(counts.blocked || 0, 'Blocked'),
@@ -683,12 +688,12 @@ function renderTasks(summary) {
   ]);
 
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  const badge = document.getElementById('tasksBadge');
   const working = Number(counts.working || counts.Working || 0);
-  badge.textContent = total;
-  badge.hidden = total === 0;
+  if (badge) {
+    badge.textContent = total;
+    badge.hidden = total === 0;
+  }
 
-  const list = document.getElementById('taskList');
   if (!tasks.length) {
     if (list.dataset.lastSig === 'empty') return;
     list.dataset.lastSig = 'empty';
@@ -923,6 +928,8 @@ function renderModels(summary) {
   const rec      = runtime?.recommendation || {};
   const managed  = runtime?.managed_process || {};
   const running  = Boolean(managed?.running);
+  const backendRunning = Boolean(desktop?.backend_running) || Boolean(summary);
+  const backendStopped = Boolean(desktop?.backend_deliberately_stopped) && !backendRunning;
 
   clearAndAppend(document.getElementById('runtimeStatus'), el('div', { className: 'runtime-card' },
     el('div', { className: 'runtime-status-row' },
@@ -939,21 +946,21 @@ function renderModels(summary) {
       metricTile(models.length, 'Models Found'),
     ),
     APP.desktopAvailable ? el('div', { style: { marginTop: '12px', fontSize: '12px', color: 'var(--text-muted)' } },
-      `Desktop backend: ${desktop?.backend_running ? 'running' : (desktop?.backend_deliberately_stopped ? 'stopped deliberately' : 'recovering')}.`) : null,
+      `Desktop backend: ${backendRunning ? 'running' : (backendStopped ? 'stopped deliberately' : 'recovering')}.`) : null,
   ));
 
   const desktopIndicator = document.getElementById('desktopBackendIndicator');
   if (desktopIndicator) {
-    const runningText = desktop?.backend_running ? 'backend: running'
-      : (desktop?.backend_deliberately_stopped ? 'backend: stopped' : 'backend: recovering');
+    const runningText = backendRunning ? 'backend: running'
+      : (backendStopped ? 'backend: stopped' : 'backend: recovering');
     desktopIndicator.textContent = runningText;
-    desktopIndicator.className = `pill pill-${desktop?.backend_running ? 'success' : (desktop?.backend_deliberately_stopped ? 'warning' : 'neutral')}`;
+    desktopIndicator.className = `pill pill-${backendRunning ? 'success' : (backendStopped ? 'warning' : 'neutral')}`;
   }
 
   const stopBackendBtn = document.getElementById('stopAppBackendBtn');
   const resumeBackendBtn = document.getElementById('resumeAppBackendBtn');
-  if (stopBackendBtn) stopBackendBtn.disabled = !APP.desktopAvailable || !desktop?.backend_running;
-  if (resumeBackendBtn) resumeBackendBtn.disabled = !APP.desktopAvailable || Boolean(desktop?.backend_running);
+  if (stopBackendBtn) stopBackendBtn.disabled = !APP.desktopAvailable || !backendRunning;
+  if (resumeBackendBtn) resumeBackendBtn.disabled = !APP.desktopAvailable || backendRunning;
 
   renderConnectorStatus(summary);
 
