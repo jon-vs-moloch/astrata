@@ -641,7 +641,7 @@ Variants may differ in:
 Variants are not special lab-only objects.
 They are normal runtime objects that can be tested in bounded ways against real and synthetic work.
 
-### 7. Communication
+### 8. Communication
 
 A `Communication` is a routed message with provenance, intended recipient, and lifecycle state.
 
@@ -697,13 +697,13 @@ Useful additional fields may include:
 - `trust_level`
 - `notes`
 
-### 8. Approval
+### 9. Approval
 
 An `Approval` is a gated authorization event for risky actions.
 
 Approvals are first-class system objects, not ad hoc interruptions.
 
-### 9. Memory
+### 10. Memory
 
 `Memory` is the fast, operational retrieval substrate.
 
@@ -715,8 +715,10 @@ It stores:
 - preferences
 - recent work state
 - embeddings and retrieval indices
+- tiered summaries and disclosure views
+- provenance and revision history
 
-### 10. Knowledge
+### 11. Knowledge
 
 `Knowledge` is the synthesized, compacted, provenance-aware understanding layer.
 

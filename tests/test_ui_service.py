@@ -44,11 +44,192 @@ def test_ui_service_snapshot_and_message_flow():
         assert snapshot["product"]["name"] == "Astrata"
         assert snapshot["startup"]["preflight"]["phase"] == "pre_inference"
         assert snapshot["startup"]["runtime"]["phase"] == "post_boot"
+        assert "voice" in snapshot
         assert snapshot["queue"]["counts"]["pending"] == 1
         assert snapshot["inference"]["window_hours"] == 24
         assert "quota_pressure" in snapshot["inference"]
         assert snapshot["communications"]["astrata_inbox"][0]["message"] == "Hello from UI"
         assert snapshot["communications"]["prime_conversation"] == []
+        assert snapshot["account_auth"]["access_policy"]["public_access"]["download"] is True
+        assert snapshot["account_auth"]["hosted_bridge_eligibility"]["status"] == "invite_required"
+
+
+def test_ui_service_snapshot_reports_desktop_backend_session():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        session_path = settings.paths.data_dir / "desktop-session.json"
+        session_path.write_text(
+            '{"ui_port":8891,"backend_url":"http://127.0.0.1:8891/","started_by_desktop_shell":true,"backend_pid":321,"frontend_deliberately_closed":false,"backend_deliberately_stopped":true,"last_action":"stop_backend","started_at_unix_ms":123}',
+            encoding="utf-8",
+        )
+
+        snapshot = AstrataUIService(settings=settings).snapshot()
+
+        assert snapshot["desktop_backend"]["session_present"] is True
+        assert snapshot["desktop_backend"]["backend_url"] == "http://127.0.0.1:8891/"
+        assert snapshot["desktop_backend"]["backend_deliberately_stopped"] is True
+
+
+def test_ui_service_ensure_local_runtime_reports_existing_healthy_lane(monkeypatch):
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        service = AstrataUIService(settings=settings)
+
+        class _Managed:
+            running = True
+            pid = 123
+            endpoint = "http://127.0.0.1:8080/health"
+            command = ["llama-server"]
+            log_path = str(root / "runtime.log")
+            started_at = 1.0
+            detail = None
+
+        class _Health:
+            ok = True
+
+            def model_dump(self, mode="json"):
+                return {"ok": True, "status": "healthy"}
+
+        class _Recommendation:
+            model = None
+            profile_id = "quiet"
+            reason = "ok"
+
+        class _Manager:
+            def recommend(self, thermal_preference="quiet"):
+                return _Recommendation()
+
+            def managed_status(self):
+                return _Managed()
+
+            def health(self, config=None):
+                return _Health()
+
+        monkeypatch.setattr(service, "_local_runtime_manager", lambda: _Manager())
+        monkeypatch.setattr("astrata.ui.service.probe_thermal_state", lambda preference="quiet": type("Thermal", (), {
+            "preference": preference,
+            "thermal_pressure": "nominal",
+            "detail": None,
+        })())
+
+        class _Decision:
+            sample = "nominal"
+            latched = "nominal"
+            action = "allow"
+            should_start_new_local_work = True
+            should_throttle_background = False
+            reason = "ok"
+
+        monkeypatch.setattr("astrata.ui.service.ThermalController.evaluate", lambda self, thermal: _Decision())
+
+        result = service.ensure_local_runtime()
+
+        assert result["status"] == "already_running"
+        assert result["health"]["ok"] is True
+
+
+def test_ui_service_ensure_local_runtime_adopts_existing_endpoint(monkeypatch):
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        service = AstrataUIService(settings=settings)
+
+        class _Health:
+            ok = True
+            status = "healthy"
+            endpoint = "http://127.0.0.1:8080/health"
+            detail = "http_status=200"
+            metadata = {"backend_id": "llama_cpp"}
+
+            def model_dump(self, mode="json"):
+                return {
+                    "backend_id": "llama_cpp",
+                    "ok": True,
+                    "status": "healthy",
+                    "endpoint": self.endpoint,
+                    "detail": self.detail,
+                    "metadata": self.metadata,
+                }
+
+        class _Recommendation:
+            class _Model:
+                model_id = "model-1"
+
+            model = _Model()
+            profile_id = "quiet"
+            reason = "ok"
+
+        class _Backend:
+            backend_id = "llama_cpp"
+
+            def healthcheck(self, config=None):
+                return _Health()
+
+        class _Manager:
+            def __init__(self):
+                self.selected = None
+
+            def recommend(self, thermal_preference="quiet"):
+                return _Recommendation()
+
+            def managed_status(self):
+                return None
+
+            def health(self, config=None):
+                return None
+
+            def backend(self, backend_id):
+                assert backend_id == "llama_cpp"
+                return _Backend()
+
+            def select_runtime(self, **kwargs):
+                self.selected = kwargs
+
+        manager = _Manager()
+
+        monkeypatch.setattr(service, "_local_runtime_manager", lambda: manager)
+        monkeypatch.setattr("astrata.ui.service.probe_thermal_state", lambda preference="quiet": type("Thermal", (), {
+            "preference": preference,
+            "thermal_pressure": "nominal",
+            "detail": None,
+        })())
+
+        class _Decision:
+            sample = "nominal"
+            latched = "nominal"
+            action = "allow"
+            should_start_new_local_work = True
+            should_throttle_background = False
+            reason = "ok"
+
+        monkeypatch.setattr("astrata.ui.service.ThermalController.evaluate", lambda self, thermal: _Decision())
+
+        result = service.ensure_local_runtime()
+
+        assert result["status"] == "already_running"
+        assert result["adopted_existing_endpoint"] is True
+        assert manager.selected is not None
+        assert manager.selected["mode"] == "external"
+        assert manager.selected["metadata"]["adopted_existing_endpoint"] is True
+
+
+def test_ui_service_redeem_invite_code_enables_hosted_bridge():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        service = AstrataUIService(settings=settings)
+
+        invite = service._account_registry().issue_invite_code(label="test")
+        result = service.redeem_invite_code(
+            email="tester@example.com",
+            display_name="Tester",
+            invite_code=invite["invite"]["code"],
+        )
+
+        assert result["status"] == "ok"
+        assert result["hosted_bridge_eligibility"]["status"] == "eligible"
 
 
 def test_ui_service_task_detail_and_lane_views():
@@ -105,7 +286,7 @@ def test_ui_service_task_detail_and_lane_views():
         assert detail["verifications"][0]["verification_id"] == "verification-1"
         assert "children" in detail["relationships"]
         assert "same_source" in detail["relationships"]
-        assert prime_result["turn"]["action"] in {"direct_reply", "deferred"}
+        assert prime_result["turn"]["action"] in {"direct_reply", "deferred", "failover_reply"}
         assert local_result["turn"]["action"] in {"direct_reply", "degraded_reply"}
         assert snapshot["communications"]["prime_inbox"][0]["message"] == "Hello Prime"
         assert snapshot["communications"]["local_inbox"][0]["message"] == "Hello Local"

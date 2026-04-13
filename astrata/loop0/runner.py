@@ -301,7 +301,7 @@ class Loop0Runner:
     def _supervise_worker_tasks(self) -> list[TaskRecord]:
         reconciled: list[TaskRecord] = []
         tasks_by_id = self._tasks_by_id()
-        for task_payload in self.db.list_records("tasks"):
+        for task_payload in self.db.iter_records("tasks"):
             provenance = dict(task_payload.get("provenance") or {})
             if provenance.get("source") != "worker_delegation":
                 continue
@@ -344,7 +344,7 @@ class Loop0Runner:
             return None
         matches = [
             payload
-            for payload in self.db.list_records("communications")
+            for payload in self.db.iter_records("communications")
             if payload.get("intent") == "worker_delegation_request"
             and payload.get("status") not in {"acknowledged", "resolved"}
             and str(dict(payload.get("payload") or {}).get("worker_task_id") or "").strip() == normalized_task_id
@@ -631,13 +631,9 @@ class Loop0Runner:
                 },
             },
         )
-        refreshed_parent = next(
-            (
-                TaskRecord(**payload)
-                for payload in self.db.list_records("tasks")
-                if str(payload.get("task_id") or "").strip() == parent_task_id
-            ),
-            None,
+        refreshed_parent_payload = self.db.get_record("tasks", "task_id", parent_task_id)
+        refreshed_parent = (
+            TaskRecord(**refreshed_parent_payload) if refreshed_parent_payload is not None else None
         )
         if refreshed_parent is not None:
             results.insert(0, refreshed_parent)
@@ -647,7 +643,7 @@ class Loop0Runner:
         reconciled: list[TaskRecord] = []
         reconciled.extend(self._reconcile_worker_results())
         reconciled.extend(self._supervise_worker_tasks())
-        for task_payload in self.db.list_records("tasks"):
+        for task_payload in self.db.iter_records("tasks"):
             if task_payload.get("status") not in {"pending", "working"}:
                 continue
             update = self._reconciled_task_payload(task_payload)
@@ -712,7 +708,7 @@ class Loop0Runner:
                 consensus_task_payload = next(
                     (
                         item
-                        for item in self.db.list_records("tasks")
+                        for item in self.db.iter_records("tasks")
                         if str(item.get("task_id") or "").strip() == worker_task_id
                         and str(dict(item.get("provenance") or {}).get("role") or "").strip() == "consensus_review"
                     ),
@@ -729,10 +725,7 @@ class Loop0Runner:
                 self._record_worker_completion_attempt(task=TaskRecord(**consensus_task_payload), message_payload=payload)
                 self.principal_lane.acknowledge(message.communication_id)
                 continue
-            task_payload = next(
-                (item for item in self.db.list_records("tasks") if str(item.get("task_id") or "").strip() == task_id),
-                None,
-            )
+            task_payload = self.db.get_record("tasks", "task_id", task_id)
             if not task_payload:
                 self.principal_lane.acknowledge(message.communication_id)
                 continue
@@ -830,7 +823,7 @@ class Loop0Runner:
                 message_payload=message_payload,
                 attempts=[
                     attempt
-                    for attempt in self.db.list_records("attempts")
+                    for attempt in self.db.iter_records("attempts")
                     if str(attempt.get("task_id") or "").strip() == str(payload.get("task_id") or "").strip()
                 ],
             )
@@ -882,7 +875,7 @@ class Loop0Runner:
             worker_task_payload = next(
                 (
                     item
-                    for item in self.db.list_records("tasks")
+                    for item in self.db.iter_records("tasks")
                     if str(item.get("task_id") or "").strip() == worker_task_id
                 ),
                 None,
@@ -939,10 +932,7 @@ class Loop0Runner:
         }
         worker_task = TaskRecord(**worker_payload)
         parent_task_id = str(worker_task.parent_task_id or dict(worker_payload.get("provenance") or {}).get("parent_task_id") or "").strip()
-        parent_payload = next(
-            (item for item in self.db.list_records("tasks") if str(item.get("task_id") or "").strip() == parent_task_id),
-            None,
-        )
+        parent_payload = self.db.get_record("tasks", "task_id", parent_task_id) if parent_task_id else None
         if not parent_payload:
             return [worker_task]
         parent_update = dict(parent_payload)
@@ -1074,7 +1064,7 @@ class Loop0Runner:
         ]
         if not batched_task_ids:
             return
-        for task_payload in self.db.list_records("tasks"):
+        for task_payload in self.db.iter_records("tasks"):
             task_id = str(task_payload.get("task_id") or "").strip()
             if task_id not in batched_task_ids or task_id == parent_task.task_id:
                 continue
@@ -1266,7 +1256,7 @@ class Loop0Runner:
             attempt_payload = next(
                 (
                     item
-                    for item in self.db.list_records("attempts")
+                    for item in self.db.iter_records("attempts")
                     if str(item.get("attempt_id") or "").strip() == attempt_id
                 ),
                 None,
@@ -1276,27 +1266,17 @@ class Loop0Runner:
             route = self._route_from_attempt_payload(attempt_payload)
             if not route:
                 return []
-            task_payload = next(
-                (
-                    item
-                    for item in self.db.list_records("tasks")
-                    if str(item.get("task_id") or "").strip() == str(attempt_payload.get("task_id") or "").strip()
-                ),
-                None,
+            task_payload = self.db.get_record(
+                "tasks",
+                "task_id",
+                str(attempt_payload.get("task_id") or "").strip(),
             )
             return [{"route": route, "task_class": self._task_class_from_payload(task_payload or {})}]
         if subject_kind == "consensus_judgment":
             task_id = str(provenance.get("task_id") or review.subject_id or "").strip()
             if not task_id:
                 return []
-            task_payload = next(
-                (
-                    item
-                    for item in self.db.list_records("tasks")
-                    if str(item.get("task_id") or "").strip() == task_id
-                ),
-                None,
-            )
+            task_payload = self.db.get_record("tasks", "task_id", task_id)
             if not task_payload:
                 return []
             consensus = dict(dict(task_payload.get("provenance") or {}).get("consensus_review") or {})
@@ -1483,7 +1463,7 @@ class Loop0Runner:
     def _task_has_historical_file_write(self, task_id: str) -> bool:
         if not task_id:
             return False
-        for attempt_payload in self.db.list_records("attempts"):
+        for attempt_payload in self.db.iter_records("attempts"):
             if str(attempt_payload.get("task_id") or "").strip() != task_id:
                 continue
             implementation = dict(dict(attempt_payload.get("resource_usage") or {}).get("implementation") or {})
@@ -1495,7 +1475,7 @@ class Loop0Runner:
         if not task_id:
             return False
         saw_attempt = False
-        for attempt_payload in self.db.list_records("attempts"):
+        for attempt_payload in self.db.iter_records("attempts"):
             if str(attempt_payload.get("task_id") or "").strip() != task_id:
                 continue
             saw_attempt = True
@@ -1528,7 +1508,7 @@ class Loop0Runner:
         parent_task_id = str(provenance.get("parent_task_id") or "").strip()
         title = str(task_payload.get("title") or "").strip().lower()
         description = str(task_payload.get("description") or "").strip().lower()
-        for other in self.db.list_records("tasks"):
+        for other in self.db.iter_records("tasks"):
             if other.get("status") != "complete":
                 continue
             if str(other.get("task_id") or "") == str(task_payload.get("task_id") or ""):
@@ -1607,7 +1587,7 @@ class Loop0Runner:
         if not task_id or group_key is None:
             return False
         peers: list[dict[str, Any]] = []
-        for other in self.db.list_records("tasks"):
+        for other in self.db.iter_records("tasks"):
             if other.get("status") != "pending":
                 continue
             if self._duplicate_group_key(other) != group_key:
@@ -1628,7 +1608,7 @@ class Loop0Runner:
     def _pending_message_task_candidates(self) -> list[Loop0TaskCandidate]:
         tasks_by_id = self._tasks_by_id()
         raw_candidates: list[Loop0TaskCandidate] = []
-        for task_payload in self.db.list_records("tasks"):
+        for task_payload in self.db.iter_records("tasks"):
             provenance = dict(task_payload.get("provenance") or {})
             if task_payload.get("status") != "pending":
                 continue
@@ -1733,7 +1713,7 @@ class Loop0Runner:
         if not tasks_by_id:
             return []
         latest_attempt_by_task: dict[str, dict[str, Any]] = {}
-        for attempt_payload in self.db.list_records("attempts"):
+        for attempt_payload in self.db.iter_records("attempts"):
             task_id = str(attempt_payload.get("task_id") or "").strip()
             if not task_id:
                 continue
@@ -1757,7 +1737,7 @@ class Loop0Runner:
             synthetic_task["updated_at"] = str(attempt_payload.get("ended_at") or synthetic_task.get("updated_at") or "")
             retry_count = 1 + sum(
                 1
-                for payload in self.db.list_records("attempts")
+                for payload in self.db.iter_records("attempts")
                 if str(payload.get("task_id") or "").strip() == task_id
             )
             synthetic_task["provenance"] = {
@@ -1789,11 +1769,11 @@ class Loop0Runner:
                 str(dict(task_payload.get("provenance") or {}).get("parent_task_id") or ""),
                 str(task_payload.get("description") or "").strip().lower(),
             )
-            for task_payload in self.db.list_records("tasks")
+            for task_payload in self.db.iter_records("tasks")
             if task_payload.get("status") == "pending"
         }
         candidates: list[Loop0TaskCandidate] = []
-        for artifact_payload in self.db.list_records("artifacts"):
+        for artifact_payload in self.db.iter_records("artifacts"):
             artifact_type = str(artifact_payload.get("artifact_type") or "").strip()
             if artifact_type not in {"spec_review", "review_report", "message_analysis"}:
                 continue
@@ -1861,10 +1841,198 @@ class Loop0Runner:
                 )
         return candidates
 
+    def _alignment_maintenance_candidates(self) -> list[Loop0TaskCandidate]:
+        tasks_by_id = self._tasks_by_id()
+        pending_subjects = self._pending_alignment_subject_keys(tasks_by_id=tasks_by_id)
+        candidates: list[Loop0TaskCandidate] = []
+        for artifact_payload in self.db.iter_records("artifacts"):
+            candidate = self._alignment_candidate_from_artifact(
+                artifact_payload,
+                tasks_by_id=tasks_by_id,
+                pending_subjects=pending_subjects,
+            )
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+            metadata = dict(candidate.metadata or {})
+            subject_key = self._alignment_subject_key_from_payload(metadata)
+            if subject_key is not None:
+                pending_subjects.add(subject_key)
+        return candidates
+
+    def _alignment_candidate_from_artifact(
+        self,
+        artifact_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+        pending_subjects: set[tuple[str, ...]],
+    ) -> Loop0TaskCandidate | None:
+        artifact_type = str(artifact_payload.get("artifact_type") or "").strip()
+        if artifact_type in {"loop0_review_signal", "loop0_inference_signal"}:
+            return self._alignment_candidate_from_signal_artifact(
+                artifact_payload,
+                tasks_by_id=tasks_by_id,
+                pending_subjects=pending_subjects,
+            )
+        if artifact_type == "governance_drift_alert":
+            return self._alignment_candidate_from_governance_drift_artifact(
+                artifact_payload,
+                tasks_by_id=tasks_by_id,
+                pending_subjects=pending_subjects,
+            )
+        return None
+
+    def _alignment_candidate_from_signal_artifact(
+        self,
+        artifact_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+        pending_subjects: set[tuple[str, ...]],
+    ) -> Loop0TaskCandidate | None:
+        parsed = _try_parse_json(str(artifact_payload.get("content_summary") or "")) or {}
+        if not parsed:
+            return None
+        signal = ObservationSignal.model_validate(parsed)
+        if signal.status != "open":
+            return None
+        subject_key = ("subject", str(signal.subject_kind), str(signal.subject_id))
+        if subject_key in pending_subjects:
+            return None
+        policy = select_signal_followup_policy(signal=signal)
+        specs = [spec for spec in list(policy.get("followup_specs") or []) if isinstance(spec, dict)]
+        if not specs:
+            return None
+        spec = specs[0]
+        task_payload = {
+            "task_id": f"alignment-maintenance-{artifact_payload.get('artifact_id')}",
+            "title": str(spec.get("title") or f"Alignment maintenance: {signal.subject_id}"),
+            "description": str(spec.get("description") or signal.summary),
+            "priority": int(spec.get("priority") or 6),
+            "urgency": int(spec.get("urgency") or 3),
+            "risk": str(spec.get("risk") or "moderate"),
+            "status": "pending",
+            "provenance": {
+                "source": "alignment_maintenance",
+                "maintenance_kind": "signal_followup",
+                "source_artifact_id": artifact_payload.get("artifact_id"),
+                "signal_id": signal.signal_id,
+                "signal_kind": signal.signal_kind,
+                "subject_kind": signal.subject_kind,
+                "subject_id": signal.subject_id,
+            },
+            "success_criteria": dict(spec.get("success_criteria") or {"signal_addressed": True}),
+            "completion_policy": {
+                "type": str(spec.get("completion_type") or "review_or_audit"),
+                "route_preferences": dict(spec.get("route_preferences") or {}),
+            },
+            "created_at": str(artifact_payload.get("created_at") or ""),
+            "updated_at": str(artifact_payload.get("updated_at") or ""),
+        }
+        if not self._task_is_ready_for_selection(task_payload, tasks_by_id=tasks_by_id):
+            return None
+        return Loop0TaskCandidate(
+            key=f"alignment:{artifact_payload.get('artifact_id')}",
+            title=str(task_payload["title"]),
+            description=str(task_payload["description"]),
+            expected_paths=(),
+            strategy="message_task",
+            priority=int(task_payload["priority"]),
+            urgency=int(task_payload["urgency"]),
+            risk=str(task_payload["risk"]),
+            source_task_id=str(task_payload["task_id"]),
+            metadata=task_payload,
+        )
+
+    def _alignment_candidate_from_governance_drift_artifact(
+        self,
+        artifact_payload: dict[str, Any],
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+        pending_subjects: set[tuple[str, ...]],
+    ) -> Loop0TaskCandidate | None:
+        subject_key = ("governance_drift", "protected_governance")
+        if subject_key in pending_subjects:
+            return None
+        parsed = _try_parse_json(str(artifact_payload.get("content_summary") or "")) or {}
+        drifted_paths = [
+            str(path).strip()
+            for path in list(parsed.get("newly_reported_paths") or parsed.get("drifted_paths") or [])
+            if str(path).strip()
+        ]
+        if not drifted_paths:
+            return None
+        task_payload = {
+            "task_id": f"alignment-maintenance-{artifact_payload.get('artifact_id')}",
+            "title": "Correct detected system drift: protected_governance",
+            "description": (
+                "Investigate protected governance drift and either repair it or explicitly ratify it. "
+                f"Impacted paths: {', '.join(drifted_paths[:5])}"
+            ),
+            "priority": 9,
+            "urgency": 9,
+            "risk": "high",
+            "status": "pending",
+            "provenance": {
+                "source": "alignment_maintenance",
+                "maintenance_kind": "governance_drift",
+                "source_artifact_id": artifact_payload.get("artifact_id"),
+                "subject_kind": "governance_drift",
+                "subject_id": "protected_governance",
+                "drifted_paths": drifted_paths,
+            },
+            "success_criteria": {"governance_drift_addressed": True},
+            "completion_policy": {
+                "type": "review_or_audit",
+                "route_preferences": {"preferred_cli_tools": ["kilocode", "gemini-cli"]},
+            },
+            "created_at": str(artifact_payload.get("created_at") or ""),
+            "updated_at": str(artifact_payload.get("updated_at") or ""),
+        }
+        if not self._task_is_ready_for_selection(task_payload, tasks_by_id=tasks_by_id):
+            return None
+        return Loop0TaskCandidate(
+            key=f"alignment:{artifact_payload.get('artifact_id')}",
+            title=str(task_payload["title"]),
+            description=str(task_payload["description"]),
+            expected_paths=(),
+            strategy="message_task",
+            priority=int(task_payload["priority"]),
+            urgency=int(task_payload["urgency"]),
+            risk=str(task_payload["risk"]),
+            source_task_id=str(task_payload["task_id"]),
+            metadata=task_payload,
+        )
+
+    def _pending_alignment_subject_keys(
+        self,
+        *,
+        tasks_by_id: dict[str, dict[str, Any]],
+    ) -> set[tuple[str, ...]]:
+        subjects: set[tuple[str, ...]] = set()
+        for task_payload in tasks_by_id.values():
+            if str(task_payload.get("status") or "").strip().lower() not in {"pending", "working", "blocked"}:
+                continue
+            subject_key = self._alignment_subject_key_from_payload(task_payload)
+            if subject_key is not None:
+                subjects.add(subject_key)
+        return subjects
+
+    def _alignment_subject_key_from_payload(self, task_payload: dict[str, Any]) -> tuple[str, ...] | None:
+        provenance = dict(task_payload.get("provenance") or {})
+        source = str(provenance.get("source") or "").strip().lower()
+        subject_kind = str(provenance.get("subject_kind") or "").strip()
+        subject_id = str(provenance.get("subject_id") or "").strip()
+        if source in {"observation_signal", "alignment_maintenance"} and subject_kind and subject_id:
+            if subject_kind == "governance_drift":
+                return ("governance_drift", subject_id)
+            return ("subject", subject_kind, subject_id)
+        if source == "audit_followup" and subject_kind and subject_id:
+            return ("subject", subject_kind, subject_id)
+        return None
     def _tasks_by_id(self) -> dict[str, dict[str, Any]]:
         return {
             str(task_payload.get("task_id") or "").strip(): task_payload
-            for task_payload in self.db.list_records("tasks")
+            for task_payload in self.db.iter_records("tasks")
             if str(task_payload.get("task_id") or "").strip()
         }
 
@@ -1935,7 +2103,7 @@ class Loop0Runner:
         candidates: list[Loop0TaskCandidate] = list(SEED_LOOP0_CANDIDATES)
         route_health_store = self.procedures._health_store
         route_health = dict(route_health_store._load().get("routes") or {})
-        recent_attempts = self.db.list_records("attempts")
+        recent_attempts = list(self.db.iter_records("attempts"))
         available_providers = self.registry.configured_provider_names()
         for snapshot in self.planner.derive_remediation_candidates(
             project_root=self.settings.paths.project_root,
@@ -2434,8 +2602,8 @@ class Loop0Runner:
         )
 
         inference_telemetry = summarize_inference_activity(
-            attempts=self.db.list_records("attempts"),
-            tasks=self.db.list_records("tasks"),
+            attempts=list(self.db.iter_records("attempts")),
+            tasks=list(self.db.iter_records("tasks")),
             quota_snapshots=[self._quota_snapshot_for_route(route)] if route else [],
         )
         telemetry_artifact = ArtifactRecord(
@@ -2555,7 +2723,7 @@ class Loop0Runner:
 
     def _process_all_pending_worker_turns(self, *, limit_per_worker: int = 5) -> list[dict[str, Any]]:
         pending_by_worker: dict[str, int] = {}
-        for payload in self.db.list_records("communications"):
+        for payload in self.db.iter_records("communications"):
             if payload.get("channel") not in {self.principal_lane.channel, "operator"}:
                 continue
             if payload.get("intent") != "worker_delegation_request":
@@ -2594,14 +2762,7 @@ class Loop0Runner:
         if candidate.strategy == "message_task" and candidate.metadata:
             payload = dict(candidate.metadata)
             task_id = str(payload.get("task_id") or candidate.source_task_id or "").strip()
-            existing_payload = next(
-                (
-                    item
-                    for item in self.db.list_records("tasks")
-                    if str(item.get("task_id") or "").strip() == task_id
-                ),
-                None,
-            )
+            existing_payload = self.db.get_record("tasks", "task_id", task_id) if task_id else None
             if existing_payload:
                 payload = {
                     **dict(existing_payload),
@@ -3820,7 +3981,7 @@ class Loop0Runner:
     def _avoided_providers_for_strategy(self, candidate: Loop0TaskCandidate) -> list[str]:
         if candidate.strategy not in {"alternate_provider", "fallback_only"}:
             return []
-        recent_attempts = self.db.list_records("attempts")
+        recent_attempts = list(self.db.iter_records("attempts"))
         for attempt in reversed(recent_attempts):
             provenance = dict(attempt.get("provenance") or {})
             if str(provenance.get("candidate_key") or "").strip() != candidate.key:
@@ -3834,7 +3995,7 @@ class Loop0Runner:
     def _avoided_cli_tools_for_strategy(self, candidate: Loop0TaskCandidate) -> list[str]:
         if candidate.strategy not in {"alternate_provider", "fallback_only"}:
             return []
-        recent_attempts = self.db.list_records("attempts")
+        recent_attempts = list(self.db.iter_records("attempts"))
         for attempt in reversed(recent_attempts):
             provenance = dict(attempt.get("provenance") or {})
             if str(provenance.get("candidate_key") or "").strip() != candidate.key:

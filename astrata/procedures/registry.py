@@ -103,6 +103,50 @@ def build_default_procedure_registry() -> ProcedureRegistry:
     registry = ProcedureRegistry()
     registry.register(
         ProcedureTemplate(
+            procedure_id="system-onboarding",
+            title="System Onboarding",
+            description=(
+                "Guide the principal through first-run setup with as little friction as possible while "
+                "establishing inference, security, identity, autonomy, and initial staff."
+            ),
+            expected_outputs=[
+                "onboarding_plan",
+                "inference_ready",
+                "inference_source_candidates",
+                "local_model_recommendation",
+                "security_policy_seed",
+                "prime_identity_seed",
+            ],
+            default_variant_id="guided_onboarding",
+            variants=[
+                ProcedureVariantTemplate(
+                    variant_id="guided_onboarding",
+                    title="Guided Onboarding",
+                    description="Default first-run path with direct guidance, browser help, and minimal user friction.",
+                    min_capability="basic",
+                    execution_mode="careful",
+                    metadata={
+                        "first_run": True,
+                        "friction_sensitive": True,
+                        "prefer_existing_codex_auth": True,
+                        "offer_cli_bootstrap": ["kilocode", "gemini-cli", "codex-cli"],
+                        "recommend_local_model_after_probe": True,
+                    },
+                ),
+                ProcedureVariantTemplate(
+                    variant_id="operator_seeded_onboarding",
+                    title="Operator-Seeded Onboarding",
+                    description="Accept partial preconfiguration and fill the remaining gaps with bounded operator help.",
+                    min_capability="basic",
+                    execution_mode="careful",
+                    metadata={"first_run": True, "supports_partial_seed": True},
+                ),
+            ],
+            metadata={"task_class": "onboarding"},
+        )
+    )
+    registry.register(
+        ProcedureTemplate(
             procedure_id="loop0-bounded-file-generation",
             title="Loop0 Bounded File Generation",
             description=(
@@ -217,6 +261,53 @@ def build_default_procedure_registry() -> ProcedureRegistry:
                 ),
             ],
             metadata={"task_class": "decomposition"},
+        )
+    )
+    registry.register(
+        ProcedureTemplate(
+            procedure_id="publish-to-internet",
+            title="Publish To Internet",
+            description=(
+                "Take content, metadata, or a small application and put it onto the internet as a hosted "
+                "artifact, website, or simple public API surface."
+            ),
+            expected_outputs=["published_endpoint", "deployment_artifact", "public_notice"],
+            default_variant_id="static_or_api_publish",
+            variants=[
+                ProcedureVariantTemplate(
+                    variant_id="static_or_api_publish",
+                    title="Static Or API Publish",
+                    description="Default path for publishing simple content, registries, or a small application to a hosted endpoint.",
+                    min_capability="basic",
+                    execution_mode="careful",
+                    preferred_cli_tools=["kilocode", "gemini-cli"],
+                    metadata={"internet_publish": True, "public_surface": True},
+                ),
+            ],
+            metadata={"task_class": "publish"},
+        )
+    )
+    registry.register(
+        ProcedureTemplate(
+            procedure_id="ensure-local-lane",
+            title="Ensure Local Lane",
+            description=(
+                "Bring Astrata's managed local inference lane into a healthy running state when thermal and runtime conditions permit."
+            ),
+            expected_outputs=["local_lane_status", "runtime_selection", "operator_notice"],
+            default_variant_id="managed_local_recovery",
+            variants=[
+                ProcedureVariantTemplate(
+                    variant_id="managed_local_recovery",
+                    title="Managed Local Recovery",
+                    description="Recover stale runtime state, respect thermal policy, and start the recommended managed local model.",
+                    min_capability="basic",
+                    execution_mode="careful",
+                    preferred_cli_tools=["kilocode"],
+                    metadata={"local_lane": True, "runtime_recovery": True},
+                ),
+            ],
+            metadata={"task_class": "runtime"},
         )
     )
     return registry

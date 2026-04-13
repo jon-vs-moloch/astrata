@@ -1,0 +1,12 @@
+name = "astrata-distribution"
+main = "worker.js"
+compatibility_date = "2026-04-12"
+
+[vars]
+ENVIRONMENT = "development"
+PUBLIC_DOWNLOAD_SITE = "https://astrata-downloads.pages.dev"
+PUBLIC_RELEASES_HOST = "https://astrata-distribution.jonathan-c-meriwether.workers.dev/downloads"
+
+[[r2_buckets]]
+binding = "RELEASE_ARTIFACTS"
+bucket_name = "astrata-releases"

@@ -1,0 +1,34 @@
+{
+  "product": "Astrata",
+  "channel": "stable",
+  "status": "planned",
+  "invite_required": false,
+  "cadence": "manual_release",
+  "release": {
+    "version": null,
+    "published_at": null,
+    "notes_url": null,
+    "cadence": "manual_release"
+  },
+  "artifacts": {
+    "macos": {
+      "url": null,
+      "format": "zip",
+      "signature_url": null
+    },
+    "windows": {
+      "url": null,
+      "format": "msi",
+      "signature_url": null
+    },
+    "linux": {
+      "url": null,
+      "format": "AppImage",
+      "signature_url": null
+    }
+  },
+  "gating": {
+    "worker_required": false,
+    "reason": "Stable can become public once release automation is in place."
+  }
+}

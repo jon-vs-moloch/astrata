@@ -124,7 +124,7 @@ class PrincipalMessageLane:
             recipients.add("operator")
         records = [
             CommunicationRecord(**payload)
-            for payload in self._db.list_records("communications")
+            for payload in self._db.iter_records("communications")
             if payload.get("channel") in channels and payload.get("recipient") in recipients
         ]
         if not include_acknowledged:
@@ -149,16 +149,10 @@ class PrincipalMessageLane:
         channels = {self.channel}
         if self.channel == "principal":
             channels.add("operator")
-        records = [
-            CommunicationRecord(**payload)
-            for payload in self._db.list_records("communications")
-            if payload.get("channel") in channels
-        ]
-        for record in records:
-            if record.communication_id != communication_id:
-                continue
-            return record
-        return None
+        payload = self._db.get_record("communications", "communication_id", communication_id)
+        if payload is None or payload.get("channel") not in channels:
+            return None
+        return CommunicationRecord(**payload)
 
     def _update_status(
         self,

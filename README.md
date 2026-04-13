@@ -19,6 +19,10 @@ Product direction:
 
 The planning docs in this directory are the current plan of record.
 
+Current release path:
+
+- `docs/ROAD_TO_V0.md`
+
 Current local UI shell:
 
 - `astrata-ui` starts a Fast local operator surface on `http://127.0.0.1:8891`

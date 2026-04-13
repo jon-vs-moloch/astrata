@@ -1,0 +1,33 @@
+{
+  "product": "Astrata",
+  "channel": "edge",
+  "status": "planned",
+  "invite_required": true,
+  "cadence": "every_build",
+  "release": {
+    "version": null,
+    "published_at": null,
+    "notes_url": "/"
+  },
+  "artifacts": {
+    "macos": {
+      "url": null,
+      "format": "zip",
+      "signature_url": null
+    },
+    "windows": {
+      "url": null,
+      "format": "msi",
+      "signature_url": null
+    },
+    "linux": {
+      "url": null,
+      "format": "AppImage",
+      "signature_url": null
+    }
+  },
+  "gating": {
+    "worker_required": true,
+    "reason": "Edge should be invite-gated and is intended for people who want every successful build."
+  }
+}

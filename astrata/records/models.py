@@ -18,6 +18,9 @@ class TaskRecord(BaseModel):
     parent_task_id: str | None = None
     title: str
     description: str
+    assignee_agent_id: str | None = None
+    assignment_mode: Literal["unassigned", "durable_agent", "ephemeral_from_template", "worker_lane"] = "unassigned"
+    assignment_template_agent_id: str | None = None
     priority: int = 0
     urgency: int = 0
     provenance: dict[str, Any] = Field(default_factory=dict)

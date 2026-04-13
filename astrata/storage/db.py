@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from astrata.records.communications import CommunicationRecord
 from astrata.records.models import ArtifactRecord, AttemptRecord, TaskRecord, VerificationRecord
@@ -72,13 +72,122 @@ class AstrataDatabase:
                     status TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS archive_summaries (
+                    summary_id TEXT PRIMARY KEY,
+                    record_kind TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
                 """
             )
 
+    def initialize_archive_summaries(self) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS archive_summaries (
+                    summary_id TEXT PRIMARY KEY,
+                    record_kind TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+
+    def _validated_table_name(self, table: str) -> str:
+        allowed = {
+            "tasks",
+            "attempts",
+            "artifacts",
+            "verifications",
+            "communications",
+            "archive_summaries",
+        }
+        if table not in allowed:
+            raise ValueError(f"Unsupported table: {table}")
+        return table
+
+    def _validated_column_name(self, column: str) -> str:
+        allowed = {
+            "task_id",
+            "attempt_id",
+            "artifact_id",
+            "verification_id",
+            "communication_id",
+            "summary_id",
+            "status",
+            "recipient",
+            "channel",
+            "record_kind",
+            "record_id",
+            "target_kind",
+            "target_id",
+        }
+        if column not in allowed:
+            raise ValueError(f"Unsupported column: {column}")
+        return column
+
     def list_records(self, table: str) -> list[dict[str, Any]]:
-        query = f"SELECT payload_json FROM {table}"
+        table_name = self._validated_table_name(table)
+        query = f"SELECT payload_json FROM {table_name}"
         with self.connect() as conn:
             rows = conn.execute(query).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def iter_records(
+        self,
+        table: str,
+        *,
+        where: dict[str, Any] | None = None,
+        order_by: str | None = None,
+        descending: bool = False,
+        limit: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        table_name = self._validated_table_name(table)
+        query = f"SELECT payload_json FROM {table_name}"
+        params: list[Any] = []
+        if where:
+            clauses: list[str] = []
+            for key, value in where.items():
+                column_name = self._validated_column_name(key)
+                clauses.append(f"{column_name} = ?")
+                params.append(value)
+            query += f" WHERE {' AND '.join(clauses)}"
+        if order_by:
+            order_column = self._validated_column_name(order_by)
+            query += f" ORDER BY {order_column} {'DESC' if descending else 'ASC'}"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        with self.connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        for row in rows:
+            yield json.loads(row["payload_json"])
+
+    def get_record(self, table: str, id_column: str, record_id: str) -> dict[str, Any] | None:
+        table_name = self._validated_table_name(table)
+        column_name = self._validated_column_name(id_column)
+        query = f"SELECT payload_json FROM {table_name} WHERE {column_name} = ? LIMIT 1"
+        with self.connect() as conn:
+            row = conn.execute(query, (record_id,)).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload_json"])
+
+    def count_records(self, table: str) -> int:
+        table_name = self._validated_table_name(table)
+        with self.connect() as conn:
+            row = conn.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
+        return int(row["count"] or 0)
+
+    def list_archive_summaries(self, *, record_kind: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT payload_json FROM archive_summaries"
+        params: tuple[Any, ...] = ()
+        if record_kind:
+            query += " WHERE record_kind = ?"
+            params = (record_kind,)
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
 
     def upsert_task(self, task: TaskRecord) -> None:
@@ -115,6 +224,18 @@ class AstrataDatabase:
                 "channel": communication.channel,
                 "recipient": communication.recipient,
                 "status": communication.status,
+            },
+        )
+
+    def upsert_archive_summary(self, summary: dict[str, Any]) -> None:
+        self._upsert(
+            "archive_summaries",
+            "summary_id",
+            str(summary.get("summary_id") or ""),
+            summary,
+            extra={
+                "record_kind": str(summary.get("record_kind") or ""),
+                "record_id": str(summary.get("record_id") or ""),
             },
         )
 
@@ -169,6 +290,24 @@ class AstrataDatabase:
                         extra["channel"],
                         extra["recipient"],
                         extra["status"],
+                        json.dumps(payload),
+                    ),
+                )
+                return
+            if table == "archive_summaries":
+                conn.execute(
+                    """
+                    INSERT INTO archive_summaries (summary_id, record_kind, record_id, payload_json)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(summary_id) DO UPDATE SET
+                        record_kind = excluded.record_kind,
+                        record_id = excluded.record_id,
+                        payload_json = excluded.payload_json
+                    """,
+                    (
+                        record_id,
+                        extra["record_kind"],
+                        extra["record_id"],
                         json.dumps(payload),
                     ),
                 )

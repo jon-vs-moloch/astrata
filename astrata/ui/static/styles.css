@@ -352,3 +352,50 @@ textarea {
     max-width: none;
   }
 }
+
+.desktop-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 8, 7, 0.72);
+  backdrop-filter: blur(10px);
+  display: grid;
+  place-items: center;
+  z-index: 1000;
+  padding: 24px;
+}
+
+.desktop-overlay-panel {
+  width: min(520px, calc(100vw - 48px));
+  background: rgba(21, 17, 14, 0.96);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 24px;
+}
+
+.desktop-overlay-kicker {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.desktop-overlay-panel h2 {
+  margin: 0 0 10px;
+  font-size: 28px;
+}
+
+.desktop-overlay-panel p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+
+.desktop-overlay-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}

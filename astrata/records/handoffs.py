@@ -20,6 +20,9 @@ class HandoffRecord(BaseModel):
     task_id: str
     status: Literal["queued", "accepted", "deferred", "blocked", "refused"] = "queued"
     reason: str = ""
+    execution_boundary: Literal["internal", "external"] = "internal"
+    bridge_id: str | None = None
+    delegation_mode: Literal["direct", "cowork", "supervisory"] | None = None
     route: dict[str, Any] = Field(default_factory=dict)
     envelope: dict[str, Any] = Field(default_factory=dict)
     source_decision: dict[str, Any] = Field(default_factory=dict)

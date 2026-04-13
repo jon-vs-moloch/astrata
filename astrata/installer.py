@@ -11,6 +11,7 @@ import venv
 from pathlib import Path
 
 from astrata.config.settings import load_settings
+from astrata.onboarding import OnboardingService
 
 
 def _run(cmd: list[str], *, cwd: Path) -> dict[str, object]:
@@ -112,6 +113,9 @@ def bootstrap(*, prepare_runtime: bool, install_desktop_deps: bool, build_deskto
         result = _run(["npm", "run", "desktop:build"], cwd=root)
         manifest["steps"].append(result)
         manifest["desktop_built"] = result["returncode"] == 0
+    onboarding = OnboardingService.from_settings(settings).ensure_plan()
+    manifest["onboarding_plan_path"] = str(settings.paths.data_dir / "onboarding_state.json")
+    manifest["onboarding_status"] = onboarding.status
     install_manifest_path = settings.paths.data_dir / "install_manifest.json"
     install_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     manifest["install_manifest_path"] = str(install_manifest_path)

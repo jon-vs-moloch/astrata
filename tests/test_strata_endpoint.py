@@ -22,6 +22,7 @@ class _FakeSelection:
 class _FakeRuntimeManager:
     def __init__(self):
         self._selections = {}
+        self.selected_calls = []
 
     def current_selection(self, runtime_key=None):
         if runtime_key is not None:
@@ -42,6 +43,33 @@ class _FakeRuntimeManager:
 
     def start_managed(self, *, runtime_key="default", backend_id, model_id, profile_id="quiet", port=8080, activate=True):
         self._selections[runtime_key] = _FakeSelection(model_id=model_id, endpoint=f"http://127.0.0.1:{port}/health")
+
+    def select_runtime(
+        self,
+        *,
+        runtime_key="default",
+        backend_id,
+        model_id=None,
+        mode="managed",
+        profile_id=None,
+        endpoint=None,
+        metadata=None,
+        activate=True,
+    ):
+        self.selected_calls.append(
+            {
+                "runtime_key": runtime_key,
+                "backend_id": backend_id,
+                "model_id": model_id,
+                "mode": mode,
+                "profile_id": profile_id,
+                "endpoint": endpoint,
+                "metadata": dict(metadata or {}),
+                "activate": activate,
+            }
+        )
+        self._selections[runtime_key] = _FakeSelection(model_id=model_id, endpoint=endpoint or "http://127.0.0.1:8080/health")
+        return self._selections[runtime_key]
 
     def managed_status(self, runtime_key=None):
         selection = self.current_selection(runtime_key)
@@ -67,6 +95,25 @@ class _FakeRuntimeManager:
 
     def list_backend_capabilities(self):
         return [self.backend_capabilities("llama_cpp")]
+
+    def backend(self, backend_id):
+        if backend_id != "llama_cpp":
+            return None
+
+        class Backend:
+            backend_id = "llama_cpp"
+
+            def healthcheck(self, **kwargs):
+                class Health:
+                    ok = True
+                    status = "healthy"
+                    endpoint = "http://127.0.0.1:8080/health"
+                    detail = "http_status=200"
+                    metadata = {"backend_id": "llama_cpp"}
+
+                return Health()
+
+        return Backend()
 
     def model_registry(self):
         class Registry:
@@ -258,3 +305,32 @@ def test_strata_endpoint_service_records_strategy_id_in_thread_state():
         payload = (Path(tmp) / "threads.json").read_text(encoding="utf-8")
         assert '"strategy_id": "fast_then_persistent"' in payload
         assert '"runtime_key": "fast"' in payload
+
+
+def test_strata_endpoint_service_uses_single_runtime_port():
+    with TemporaryDirectory() as tmp:
+        runtime = _FakeRuntimeManager()
+        client = _FakeLocalClient()
+        service = StrataEndpointService(
+            state_path=Path(tmp) / "threads.json",
+            runtime_manager=runtime,
+            runtime_client=client,
+        )
+        assert service._runtime_port("default") == 8080
+
+
+def test_strata_endpoint_service_adopts_existing_runtime_before_starting():
+    with TemporaryDirectory() as tmp:
+        runtime = _FakeRuntimeManager()
+        client = _FakeLocalClient()
+        service = StrataEndpointService(
+            state_path=Path(tmp) / "threads.json",
+            runtime_manager=runtime,
+            runtime_client=client,
+        )
+
+        endpoint = service._ensure_runtime(model_id="model-1")
+
+        assert endpoint == "http://127.0.0.1:8080"
+        assert runtime.selected_calls[-1]["mode"] == "external"
+        assert runtime.selected_calls[-1]["metadata"]["adopted_existing_endpoint"] is True

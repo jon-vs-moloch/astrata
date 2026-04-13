@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 from typing import Literal
 
 from astrata.local.recommendation import ThermalState
@@ -25,14 +26,21 @@ class ThermalDecision:
 
 
 class ThermalController:
-    def __init__(self, *, state_path: Path) -> None:
+    def __init__(self, *, state_path: Path, cooldown_ttl_seconds: int = 300) -> None:
         self.state_path = state_path
+        self.cooldown_ttl_seconds = max(0, int(cooldown_ttl_seconds))
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
 
     def evaluate(self, thermal: ThermalState) -> ThermalDecision:
         sample = _normalize_pressure(thermal.thermal_pressure)
         previous = self._load_state()
         previous_latched = _normalize_pressure(str(previous.get("latched") or "unknown"))
+        previous_updated_at = float(previous.get("updated_at") or 0.0)
+        cooldown_expired = (
+            previous_updated_at <= 0
+            or self.cooldown_ttl_seconds <= 0
+            or (time.time() - previous_updated_at) >= self.cooldown_ttl_seconds
+        )
 
         if sample in {"severe", "critical"}:
             latched = sample
@@ -44,15 +52,23 @@ class ThermalController:
             reason = "Thermal pressure is near the nominal/fair boundary."
         elif sample == "nominal":
             if previous_latched in {"fair", "severe", "critical"}:
-                latched = "fair"
-                action = "cooldown"
-                reason = "Nominal sample observed, but hysteresis is holding a cooldown latch."
+                if cooldown_expired:
+                    latched = "nominal"
+                    action = "allow"
+                    reason = "Thermal pressure is nominal and the previous cooldown latch has expired."
+                else:
+                    latched = "fair"
+                    action = "cooldown"
+                    reason = "Nominal sample observed, but hysteresis is holding a cooldown latch."
             else:
                 latched = "nominal"
                 action = "allow"
                 reason = "Thermal pressure is nominal."
         else:
-            latched = previous_latched if previous_latched != "unknown" else "unknown"
+            if previous_latched != "unknown" and not cooldown_expired:
+                latched = previous_latched
+            else:
+                latched = "unknown"
             action = "cooldown" if latched in {"fair", "severe", "critical"} else "allow"
             reason = "Thermal telemetry is sparse; keeping the previous latch if present."
 
@@ -86,6 +102,7 @@ class ThermalController:
             "should_start_new_local_work": decision.should_start_new_local_work,
             "should_throttle_background": decision.should_throttle_background,
             "reason": decision.reason,
+            "updated_at": time.time(),
         }
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

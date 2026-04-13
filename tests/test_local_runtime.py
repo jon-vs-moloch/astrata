@@ -1,3 +1,5 @@
+import os
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -287,8 +289,8 @@ def test_local_runtime_manager_can_track_multiple_managed_runtimes():
         def fake_start(self, launch_spec):
             captured.append((self.state_path.name, self.log_path.name, list(launch_spec.command)))
             self.state_path.write_text(
-                '{"pid": 123, "endpoint": "%s", "command": [], "log_path": "%s", "started_at": 1.0}'
-                % (launch_spec.endpoint, self.log_path),
+                '{"pid": %s, "endpoint": "%s", "command": [], "log_path": "%s", "started_at": 1.0}'
+                % (os.getpid(), launch_spec.endpoint, self.log_path),
                 encoding="utf-8",
             )
             return self.status()
@@ -343,6 +345,42 @@ def test_thermal_controller_holds_cooldown_latch_after_nominal_sample():
         assert first.action == "cooldown"
         assert second.action == "cooldown"
         assert second.latched == "fair"
+
+
+def test_thermal_controller_allows_nominal_after_cooldown_expiry():
+    with TemporaryDirectory() as tmp:
+        controller = ThermalController(state_path=Path(tmp) / "thermal.json", cooldown_ttl_seconds=0)
+        first = controller.evaluate(ThermalState(preference="quiet", thermal_pressure="fair"))
+        second = controller.evaluate(ThermalState(preference="quiet", thermal_pressure="nominal"))
+        assert first.action == "cooldown"
+        assert second.action == "allow"
+        assert second.latched == "nominal"
+
+
+def test_managed_process_status_clears_stale_state():
+    with TemporaryDirectory() as tmp:
+        controller = ManagedProcessController(
+            state_path=Path(tmp) / "runtime.json",
+            log_path=Path(tmp) / "runtime.log",
+        )
+        controller.state_path.write_text(
+            json.dumps(
+                {
+                    "pid": 999999,
+                    "endpoint": "http://127.0.0.1:8080/health",
+                    "command": ["llama-server"],
+                    "log_path": str(controller.log_path),
+                    "started_at": 1.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        status = controller.status()
+
+        assert status.running is False
+        assert status.detail == "stale_pid"
+        assert controller.state_path.exists() is False
 
 
 def test_starter_catalog_contains_current_families():

@@ -77,7 +77,7 @@ class QuotaPolicy:
     def _usage_last_hour(self, source_id: str) -> int:
         cutoff = _now() - timedelta(hours=1)
         count = 0
-        for attempt in self._db.list_records("attempts"):
+        for attempt in self._iter_records("attempts"):
             ended_at = str(attempt.get("ended_at") or "").strip()
             if not ended_at:
                 continue
@@ -100,7 +100,7 @@ class QuotaPolicy:
 
     def _last_provider_attempt_time(self, source_id: str) -> datetime | None:
         latest: datetime | None = None
-        for attempt in self._db.list_records("attempts"):
+        for attempt in self._iter_records("attempts"):
             ended_at = str(attempt.get("ended_at") or "").strip()
             if not ended_at:
                 continue
@@ -120,6 +120,15 @@ class QuotaPolicy:
             if latest is None or ended > latest:
                 latest = ended
         return latest
+
+    def _iter_records(self, table_name: str):
+        iter_records = getattr(self._db, "iter_records", None)
+        if callable(iter_records):
+            return iter_records(table_name)
+        list_records = getattr(self._db, "list_records", None)
+        if callable(list_records):
+            return list_records(table_name)
+        raise AttributeError("QuotaPolicy database must provide iter_records() or list_records().")
 
     def _collect_windows(
         self,

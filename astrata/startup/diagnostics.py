@@ -233,14 +233,13 @@ def run_startup_reflection(
         )
         message_sent = True
     elif not report["issues"]:
-        for payload in db.list_records("tasks"):
-            if payload.get("task_id") != "startup-self-diagnosis":
-                continue
+        payload = db.get_record("tasks", "task_id", "startup-self-diagnosis")
+        if payload is not None:
             existing = TaskRecord(**payload)
-            if existing.status in {"complete", "satisfied", "superseded"}:
-                break
-            db.upsert_task(existing.model_copy(update={"status": "satisfied", "updated_at": _now_iso()}))
-            break
+            if existing.status not in {"complete", "satisfied", "superseded"}:
+                db.upsert_task(
+                    existing.model_copy(update={"status": "satisfied", "updated_at": _now_iso()})
+                )
 
     _write_json(
         reflection_state_path(settings),
@@ -275,6 +274,7 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
     )
     manager.discover_models(search_paths=settings.local_runtime.model_search_paths)
     managed_status = manager.managed_status()
+    adopted_existing_endpoint = False
     if settings.local_runtime.llama_cpp_base_url:
         manager.select_runtime(
             backend_id="llama_cpp",
@@ -302,6 +302,29 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
                 default_port=settings.local_runtime.llama_cpp_port,
             )
         )
+        if (
+            managed_status is not None
+            and managed_status.running
+            and managed_status.endpoint
+            and local_health is not None
+            and not local_health.ok
+            and _looks_like_local_probe_denial(local_health.detail)
+        ):
+            manager.select_runtime(
+                backend_id="llama_cpp",
+                mode="external",
+                endpoint=managed_status.endpoint,
+                metadata={"adopted_existing_endpoint": True, "source": "startup_reflection"},
+            )
+            adopted_existing_endpoint = True
+            local_health = local_health.model_copy(
+                update={
+                    "ok": True,
+                    "status": "healthy",
+                    "detail": "Managed local runtime is running; treating local probe denial as an environment limitation.",
+                    "endpoint": managed_status.endpoint,
+                }
+            )
     thermal_state = probe_thermal_state(preference=settings.local_runtime.thermal_preference)
     thermal_controller = ThermalController(state_path=settings.paths.data_dir / "thermal_state.json")
     thermal_decision = thermal_controller.evaluate(thermal_state)
@@ -337,7 +360,7 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
         add_issue("low", "thermal_throttle", thermal_decision.reason)
 
     task_counts: dict[str, int] = {}
-    for payload in db.list_records("tasks"):
+    for payload in db.iter_records("tasks"):
         status = str(payload.get("status") or "unknown")
         task_counts[status] = task_counts.get(status, 0) + 1
 
@@ -376,6 +399,7 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
                 "reason": thermal_decision.reason,
             },
             "health": None if local_health is None else local_health.model_dump(mode="json"),
+            "adopted_existing_endpoint": adopted_existing_endpoint,
             "managed_process": None if manager.managed_status() is None else {
                 "running": manager.managed_status().running,
                 "pid": manager.managed_status().pid,
@@ -405,3 +429,8 @@ def _llama_config_from_endpoint(
         host=parsed.hostname or default_host,
         port=parsed.port or default_port,
     )
+
+
+def _looks_like_local_probe_denial(detail: str | None) -> bool:
+    normalized = str(detail or "").lower()
+    return "operation not permitted" in normalized or "errno 1" in normalized

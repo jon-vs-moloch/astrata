@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
+import os
 
 from astrata.config.settings import AstrataPaths, LocalRuntimeSettings, RuntimeLimits, Settings
 from astrata.startup.diagnostics import (
@@ -80,3 +81,59 @@ def test_run_startup_reflection_uses_managed_runtime_endpoint_when_present():
         result = run_startup_reflection(settings=settings, db=db)
 
         assert result.report["local_runtime"]["health"]["endpoint"] == "http://127.0.0.1:62734/health"
+
+
+def test_run_startup_reflection_adopts_running_local_lane_on_probe_denial(monkeypatch):
+    with TemporaryDirectory() as tmp:
+        settings = _settings(Path(tmp))
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        generate_python_preflight_report(settings=settings, python_executable="python3")
+
+        class _Health:
+            ok = False
+            status = "unreachable"
+            endpoint = "http://127.0.0.1:8080/health"
+            detail = "<urlopen error [Errno 1] Operation not permitted>"
+            metadata = {"backend_id": "llama_cpp"}
+
+            def model_dump(self, mode="json"):
+                return {
+                    "ok": self.ok,
+                    "status": self.status,
+                    "endpoint": self.endpoint,
+                    "detail": self.detail,
+                    "metadata": self.metadata,
+                }
+
+            def model_copy(self, update):
+                clone = _Health()
+                for key, value in update.items():
+                    setattr(clone, key, value)
+                return clone
+
+        monkeypatch.setattr(
+            "astrata.startup.diagnostics.LocalRuntimeManager.health",
+            lambda self, config=None, runtime_key=None: _Health(),
+        )
+
+        (settings.paths.data_dir / "local_runtime.json").write_text(
+            json.dumps(
+                    {
+                    "pid": os.getpid(),
+                    "endpoint": "http://127.0.0.1:8080/health",
+                    "command": ["llama-server", "--port", "8080"],
+                    "log_path": str(settings.paths.data_dir / "local_runtime.log"),
+                    "started_at": 1.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_startup_reflection(settings=settings, db=db)
+
+        assert result.report["local_runtime"]["adopted_existing_endpoint"] is True
+        assert result.report["local_runtime"]["health"]["ok"] is True
+        assert not any(
+            issue["kind"] == "local_runtime_unhealthy" for issue in result.report["issues"]
+        )

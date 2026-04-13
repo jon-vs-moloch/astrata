@@ -329,6 +329,25 @@ class StrataEndpointService:
         if current is not None and current.endpoint and health is not None and health.ok:
             return current.endpoint.removesuffix("/health")
 
+        existing_endpoint = f"http://127.0.0.1:{self._runtime_port()}/health"
+        existing_backend = self._runtime.backend("llama_cpp")
+        if existing_backend is not None:
+            direct_health = existing_backend.healthcheck(
+                config={"host": "127.0.0.1", "port": self._runtime_port()}
+            )
+            if direct_health.ok:
+                self._runtime.select_runtime(
+                    runtime_key="default",
+                    backend_id="llama_cpp",
+                    model_id=model_id,
+                    mode="external",
+                    profile_id="quiet",
+                    endpoint=direct_health.endpoint or existing_endpoint,
+                    metadata={"adopted_existing_endpoint": True, "source": "strata_endpoint"},
+                    activate=True,
+                )
+                return (direct_health.endpoint or existing_endpoint).removesuffix("/health")
+
         chosen_model_id = model_id
         if not chosen_model_id:
             models = [model for model in self._runtime.model_registry().list_models() if model.role == "model"]
@@ -346,14 +365,35 @@ class StrataEndpointService:
                 else:
                     adopted = self._runtime.model_registry().adopt(chosen_model_id)
                     chosen_model_id = adopted.model_id
-        self._runtime.start_managed(
-            runtime_key=runtime_key,
-            backend_id="llama_cpp",
-            model_id=chosen_model_id,
-            profile_id="quiet",
-            port=self._runtime_port(runtime_key),
-            activate=runtime_key != "fast",
-        )
+        try:
+            self._runtime.start_managed(
+                runtime_key=runtime_key,
+                backend_id="llama_cpp",
+                model_id=chosen_model_id,
+                profile_id="quiet",
+                port=self._runtime_port(runtime_key),
+                activate=runtime_key != "fast",
+            )
+        except RuntimeError as exc:
+            if "already in use" not in str(exc).lower():
+                raise
+            if existing_backend is None:
+                raise
+            direct_health = existing_backend.healthcheck(
+                config={"host": "127.0.0.1", "port": self._runtime_port(runtime_key)}
+            )
+            if not direct_health.ok:
+                raise
+            self._runtime.select_runtime(
+                runtime_key=runtime_key,
+                backend_id="llama_cpp",
+                model_id=chosen_model_id,
+                mode="external",
+                profile_id="quiet",
+                endpoint=direct_health.endpoint or existing_endpoint,
+                metadata={"adopted_existing_endpoint": True, "source": "strata_endpoint"},
+                activate=runtime_key != "fast",
+            )
         current = self._runtime.current_selection(runtime_key)
         if current is None or not current.endpoint:
             raise RuntimeError("Native Strata endpoint could not acquire a local runtime endpoint.")

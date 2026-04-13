@@ -1,0 +1,17 @@
+name = "astrata-distribution"
+main = "worker.js"
+compatibility_date = "2026-04-12"
+
+[vars]
+ENVIRONMENT = "development"
+PUBLIC_DOWNLOAD_SITE = "https://download.astrata.ai"
+PUBLIC_RELEASES_HOST = "https://releases.astrata.ai"
+
+[[r2_buckets]]
+binding = "RELEASE_ARTIFACTS"
+bucket_name = "astrata-releases"
+
+[[d1_databases]]
+binding = "astrata_distribution_db"
+database_name = "astrata-distribution-db"
+database_id = "replace-me"

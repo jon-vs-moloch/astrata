@@ -1,0 +1,34 @@
+{
+  "product": "Astrata",
+  "channel": "tester",
+  "status": "live",
+  "invite_required": true,
+  "cadence": "manual_promote",
+  "release": {
+    "version": "0.1.0-dev2",
+    "published_at": "2026-04-12T16:28:03Z",
+    "notes_url": "/",
+    "cadence": "manual_promote"
+  },
+  "artifacts": {
+    "macos": {
+      "url": "https://astrata-distribution.jonathan-c-meriwether.workers.dev/downloads/tester/macos/Astrata-macos-app.zip",
+      "format": "zip",
+      "signature_url": null
+    },
+    "windows": {
+      "url": null,
+      "format": "msi",
+      "signature_url": null
+    },
+    "linux": {
+      "url": null,
+      "format": "AppImage",
+      "signature_url": null
+    }
+  },
+  "gating": {
+    "worker_required": true,
+    "reason": "Tester updates should eventually be served through the distribution worker so invite and entitlement checks can run before artifact URLs are issued."
+  }
+}

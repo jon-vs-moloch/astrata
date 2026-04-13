@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "fastapi>=0.115.0",
+    "playwright>=1.40.0",
     "pydantic>=2.7.0",
     "uvicorn>=0.30.0",
 ]
@@ -25,6 +26,9 @@ dev = [
 astrata = "astrata.main:main"
 astrata-ui = "astrata.ui.server:main"
 astrata-install = "astrata.installer:main"
+astrata-mcp = "astrata.mcp.server:main"
+astrata-web = "astrata.webpresence.server:main"
+astrata-release = "astrata.distribution.release:main"
 
 [tool.ruff]
 line-length = 100
