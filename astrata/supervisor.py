@@ -40,6 +40,12 @@ def _http_ok(url: str, *, timeout_seconds: float = 1.0) -> bool:
         return False
 
 
+def _find_matching_process(tokens: tuple[str, ...]) -> tuple[int | None, str | None]:
+    from astrata.local.runtime.processes import find_matching_process
+
+    return find_matching_process(tokens)
+
+
 @dataclass(frozen=True)
 class SupervisedService:
     service_id: str
@@ -243,12 +249,10 @@ class AstrataSupervisor:
         return {"pid": process.pid}
 
     def _service_status(self, service: SupervisedService, state: dict[str, Any]) -> dict[str, Any]:
-        from astrata.local.runtime.processes import find_matching_process
-
         service_state = dict((state.get("services") or {}).get(service.service_id) or {})
         pid = int(service_state.get("pid") or 0) or None
         running = _pid_alive(pid)
-        adopted_pid, adopted_command = (None, None) if running else find_matching_process(service.match_tokens)
+        adopted_pid, adopted_command = (None, None) if running else _find_matching_process(service.match_tokens)
         health_ok = _http_ok(service.health_url) if service.health_url else None
         if not running and adopted_pid is not None:
             pid = adopted_pid

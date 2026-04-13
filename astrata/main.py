@@ -10,6 +10,7 @@ import sys
 import time
 import urllib.request
 
+from astrata.browser import BrowserService
 from astrata.comms.intake import process_inbound_messages
 from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
@@ -23,6 +24,8 @@ from astrata.eval.ratings import RatingStore
 from astrata.eval.substrate import build_eval_domain
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
 from astrata.inference.planner import InferencePlanner
+from astrata.agents import DurableAgentRegistry
+from astrata.accounts import AccountControlPlaneRegistry
 from astrata.local.backends.llama_cpp import LlamaCppBackend, LlamaCppLaunchConfig
 from astrata.local.catalog import StarterCatalog
 from astrata.local.hardware import probe_thermal_state
@@ -36,6 +39,16 @@ from astrata.local.runtime.client import LocalRuntimeClient
 from astrata.local.runtime.processes import ManagedProcessController
 from astrata.local.strata_endpoint import StrataEndpointService
 from astrata.loop0.runner import Loop0Runner
+from astrata.mcp import (
+    HostedMCPRelayLink,
+    HostedMCPRelayProfile,
+    HostedMCPRelayRuntime,
+    HostedMCPRelayService,
+    MCPBridgeBinding,
+    MCPBridgeService,
+)
+from astrata.mcp.server import create_app as create_mcp_app
+from astrata.onboarding import OnboardingService
 from astrata.providers.registry import build_default_registry
 from astrata.records.models import ArtifactRecord
 from astrata.routing.policy import RouteChooser
@@ -46,6 +59,16 @@ from astrata.startup.diagnostics import (
     load_runtime_report,
     run_startup_reflection,
 )
+from astrata.storage.archive import (
+    RuntimeHygieneManager,
+    RuntimeStateArchiver,
+    compact_oversized_runtime_records,
+)
+from astrata.supervisor import AstrataSupervisor
+from astrata.ui.service import AstrataUIService
+from astrata.voice import VoiceService
+from astrata.webpresence.server import create_app as create_webpresence_app
+import uvicorn
 
 
 def _cmd_init_db() -> int:
@@ -379,6 +402,13 @@ def _cmd_local_runtime_start(model_id: str | None, profile_id: str | None) -> in
         )
     )
     return 0
+
+
+def _cmd_local_runtime_ensure(model_id: str | None, profile_id: str | None) -> int:
+    settings = load_settings()
+    result = AstrataUIService(settings=settings).ensure_local_runtime(model_id=model_id, profile_id=profile_id)
+    print(json.dumps(result, indent=2))
+    return 0 if str(result.get("status") or "") in {"started", "already_running"} else 1
 
 
 def _cmd_local_runtime_stop() -> int:
@@ -1037,6 +1067,12 @@ def _cmd_loop0_run(steps: int) -> int:
 
 
 def _run_loop0_cycle(*, settings, db: AstrataDatabase, steps: int) -> dict[str, object]:
+    hygiene = RuntimeHygieneManager(
+        live_db=settings.paths.data_dir / "astrata.db",
+        archive_dir=settings.paths.data_dir / "archive",
+        state_path=settings.paths.data_dir / "runtime_hygiene_state.json",
+    )
+    hygiene_result = hygiene.maintain()
     lane_runtime = LaneRuntime(settings=settings, db=db)
     lane_turns = lane_runtime.process_pending_turns(lane="prime", limit=5)
     lane_turns.extend(lane_runtime.process_pending_turns(lane="local", limit=5))
@@ -1048,7 +1084,12 @@ def _run_loop0_cycle(*, settings, db: AstrataDatabase, steps: int) -> dict[str, 
     )
     runner = Loop0Runner(settings=settings, db=db)
     result = runner.run_steps(steps)
-    return {"inbox": inbox_results, "lane_turns": lane_turns, "loop0": result}
+    return {
+        "runtime_hygiene": hygiene_result,
+        "inbox": inbox_results,
+        "lane_turns": lane_turns,
+        "loop0": result,
+    }
 
 
 def _record_loop0_daemon_heartbeat(
@@ -1075,6 +1116,7 @@ def _record_loop0_daemon_heartbeat(
                 "status": status,
                 "error": error,
                 "summary": {
+                    "runtime_hygiene_status": dict(payload.get("runtime_hygiene") or {}).get("status"),
                     "inbox_count": len(list(payload.get("inbox") or [])),
                     "lane_turns": len(list(payload.get("lane_turns") or [])),
                     "loop0_status": dict(payload.get("loop0") or {}).get("status"),
@@ -1163,6 +1205,146 @@ def _cmd_loop0_daemon(steps: int, interval_seconds: int, max_cycles: int | None)
     return 0
 
 
+def _cmd_archive_runtime_state() -> int:
+    settings = load_settings()
+    live_db = settings.paths.data_dir / "astrata.db"
+    archiver = RuntimeStateArchiver(
+        live_db=live_db,
+        archive_dir=settings.paths.data_dir / "archive",
+    )
+    summary = archiver.archive_and_rebuild()
+    print(
+        json.dumps(
+            {
+                "archive_path": summary.archive_path,
+                "live_path": summary.hot_live_path,
+                "previous_size_bytes": summary.previous_size_bytes,
+                "current_size_bytes": summary.current_size_bytes,
+                "archived_counts": summary.archived_counts,
+                "hot_counts": summary.hot_counts,
+                "summary_count": summary.summary_count,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_compact_runtime_payloads() -> int:
+    settings = load_settings()
+    live_db = settings.paths.data_dir / "astrata.db"
+    snapshot_hint = str(settings.paths.data_dir / "archive" / "astrata_runtime_latest.db")
+    summary = compact_oversized_runtime_records(
+        live_db=live_db,
+        snapshot_hint=snapshot_hint,
+    )
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_browser_status() -> int:
+    settings = load_settings()
+    service = BrowserService.from_settings(settings)
+    print(json.dumps(service.status(), indent=2))
+    return 0
+
+
+def _cmd_browser_snapshot(
+    url: str,
+    session_id: str | None,
+    label: str,
+    full_page: bool,
+    wait_ms: int,
+    width: int,
+    height: int,
+    selector: str | None,
+    include_html: bool,
+) -> int:
+    settings = load_settings()
+    service = BrowserService.from_settings(settings)
+    snapshot = service.inspect_page(
+        url=url,
+        session_id=session_id,
+        label=label,
+        full_page=full_page,
+        wait_ms=wait_ms,
+        width=width,
+        height=height,
+        selector=selector,
+        include_html=include_html,
+    )
+    print(json.dumps(snapshot.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_browser_click(
+    session_id: str,
+    selector: str,
+    wait_ms: int,
+    width: int,
+    height: int,
+    include_html: bool,
+) -> int:
+    settings = load_settings()
+    service = BrowserService.from_settings(settings)
+    result = service.click(
+        session_id=session_id,
+        selector=selector,
+        wait_ms=wait_ms,
+        width=width,
+        height=height,
+        include_html=include_html,
+    )
+    print(json.dumps(result.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_browser_type(
+    session_id: str,
+    selector: str,
+    text: str,
+    wait_ms: int,
+    width: int,
+    height: int,
+    include_html: bool,
+) -> int:
+    settings = load_settings()
+    service = BrowserService.from_settings(settings)
+    result = service.type_text(
+        session_id=session_id,
+        selector=selector,
+        text=text,
+        wait_ms=wait_ms,
+        width=width,
+        height=height,
+        include_html=include_html,
+    )
+    print(json.dumps(result.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_browser_scroll(
+    session_id: str,
+    delta_y: int,
+    wait_ms: int,
+    width: int,
+    height: int,
+    include_html: bool,
+) -> int:
+    settings = load_settings()
+    service = BrowserService.from_settings(settings)
+    result = service.scroll(
+        session_id=session_id,
+        delta_y=delta_y,
+        wait_ms=wait_ms,
+        width=width,
+        height=height,
+        include_html=include_html,
+    )
+    print(json.dumps(result.model_dump(mode="json"), indent=2))
+    return 0
+
+
 def _cmd_comms_send(recipient: str, intent: str, message: str, kind: str, conversation_id: str) -> int:
     settings = load_settings()
     db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
@@ -1215,6 +1397,359 @@ def _cmd_comms_process(recipient: str, limit: int) -> int:
     return 0
 
 
+def _cmd_mcp_bridge_status(direction: str | None = None) -> int:
+    settings = load_settings()
+    service = MCPBridgeService.from_settings(settings)
+    payload = {
+        "bindings": [binding.model_dump(mode="json") for binding in service.list_bindings(direction=direction)],
+        "events": [event.model_dump(mode="json") for event in service.list_events()],
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _cmd_mcp_register_bridge(
+    *,
+    direction: str,
+    agent_id: str,
+    transport: str,
+    role: str,
+    endpoint: str,
+    can_be_prime: bool,
+    accepts_sensitive_payloads: bool,
+) -> int:
+    settings = load_settings()
+    service = MCPBridgeService.from_settings(settings)
+    binding = service.register_binding(
+        MCPBridgeBinding(
+            direction=direction,
+            transport=transport,
+            agent_id=agent_id,
+            role=role,
+            endpoint=endpoint,
+            can_be_prime=can_be_prime,
+            accepts_sensitive_payloads=accepts_sensitive_payloads,
+        )
+    )
+    print(json.dumps(binding.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_mcp_server(host: str, port: int) -> int:
+    uvicorn.run(create_mcp_app(), host=host, port=port, log_level="info")
+    return 0
+
+
+def _cmd_mcp_relay_status(profile_id: str | None = None) -> int:
+    settings = load_settings()
+    relay = HostedMCPRelayService.from_settings(settings)
+    print(json.dumps(relay.telemetry_summary(profile_id=profile_id), indent=2))
+    return 0
+
+
+def _cmd_acknowledge_remote_host_bash(profile_id: str, enabled: bool) -> int:
+    settings = load_settings()
+    registry = AccountControlPlaneRegistry.from_settings(settings)
+    result = registry.set_remote_host_bash(profile_id=profile_id, enabled=enabled)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_mcp_register_relay_profile(
+    *,
+    label: str,
+    exposure: str,
+    control_posture: str,
+    local_prime_behavior: str,
+    remote_agent_id: str,
+    relay_endpoint: str,
+    auth_mode: str,
+    auth_token: str,
+    max_disclosure_tier: str,
+) -> int:
+    settings = load_settings()
+    relay = HostedMCPRelayService.from_settings(settings)
+    profile = relay.register_profile(
+        HostedMCPRelayProfile(
+            label=label,
+            exposure=exposure,
+            control_posture=control_posture,
+            local_prime_behavior=local_prime_behavior,
+            remote_agent_id=remote_agent_id,
+            relay_endpoint=relay_endpoint,
+            auth_mode=auth_mode,
+            auth_token=auth_token,
+            max_disclosure_tier=max_disclosure_tier,
+        )
+    )
+    print(json.dumps(profile.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_mcp_register_relay_link(
+    *,
+    profile_id: str,
+    bridge_id: str,
+    status: str,
+    backend_url: str,
+) -> int:
+    settings = load_settings()
+    relay = HostedMCPRelayService.from_settings(settings)
+    link = relay.register_local_link(
+        HostedMCPRelayLink(
+            profile_id=profile_id,
+            bridge_id=bridge_id,
+            status=status,
+            backend_url=backend_url,
+        )
+    )
+    print(json.dumps(link.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_mcp_relay_heartbeat(profile_id: str, link_id: str | None, push_remote: bool, drain_queue: bool) -> int:
+    settings = load_settings()
+    runtime = HostedMCPRelayRuntime.from_settings(settings)
+    result = runtime.heartbeat(
+        profile_id=profile_id,
+        link_id=link_id,
+        push_remote=push_remote,
+        drain_queue=drain_queue,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_mcp_relay_watch(
+    profile_id: str,
+    link_id: str | None,
+    interval_seconds: float,
+    push_remote: bool,
+    drain_queue: bool,
+    max_cycles: int | None,
+) -> int:
+    settings = load_settings()
+    runtime = HostedMCPRelayRuntime.from_settings(settings)
+    cycles = 0
+    while True:
+        cycles += 1
+        try:
+            result = runtime.heartbeat(
+                profile_id=profile_id,
+                link_id=link_id,
+                push_remote=push_remote,
+                drain_queue=drain_queue,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": result.get("status"),
+                        "profile_id": profile_id,
+                        "heartbeat_at": result.get("link", {}).get("last_heartbeat_at"),
+                        "remote_pending_seen": len((result.get("remote_push", {}).get("response") or {}).get("pending_requests") or []),
+                        "remote_consumed": len(result.get("remote_consumed") or []),
+                        "remote_ack": (result.get("remote_ack") or {}).get("status"),
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+        except KeyboardInterrupt:
+            print(json.dumps({"status": "stopped", "reason": "keyboard_interrupt"}), flush=True)
+            return 0
+        except Exception as exc:
+            print(json.dumps({"status": "error", "profile_id": profile_id, "reason": str(exc)}), file=sys.stderr, flush=True)
+        if max_cycles is not None and cycles >= max_cycles:
+            return 0
+        time.sleep(max(1.0, float(interval_seconds or 1.0)))
+
+
+def _cmd_agents_list() -> int:
+    settings = load_settings()
+    registry = DurableAgentRegistry.from_settings(settings)
+    registry.ensure_bootstrap_agents()
+    print(json.dumps([agent.model_dump(mode="json") for agent in registry.list_agents()], indent=2))
+    return 0
+
+
+def _cmd_agent_create(spec_path: str) -> int:
+    settings = load_settings()
+    registry = DurableAgentRegistry.from_settings(settings)
+    payload = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    agent = registry.create_agent(
+        agent_id=payload.get("agent_id"),
+        name=str(payload.get("name") or ""),
+        title=str(payload.get("title") or ""),
+        role=str(payload.get("role") or "assistant"),
+        created_by=str(payload.get("created_by") or "prime"),
+        persona_prompt=str(payload.get("persona_prompt") or ""),
+        responsibilities=list(payload.get("responsibilities") or []),
+        permissions_profile=dict(payload.get("permissions_profile") or {}),
+        inference_binding=dict(payload.get("inference_binding") or {}),
+        message_policy=dict(payload.get("message_policy") or {}),
+        fallback_policy=dict(payload.get("fallback_policy") or {}),
+        allowed_recipients=list(payload.get("allowed_recipients") or []),
+    )
+    print(json.dumps(agent.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_agent_update(agent_id: str, spec_path: str, allow_system_update: bool) -> int:
+    settings = load_settings()
+    registry = DurableAgentRegistry.from_settings(settings)
+    payload = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    agent = registry.update_agent(
+        agent_id,
+        patch=dict(payload.get("patch") or payload),
+        updated_by=str(payload.get("updated_by") or "prime"),
+        allow_system_update=allow_system_update,
+    )
+    print(json.dumps(agent.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_onboarding_status() -> int:
+    settings = load_settings()
+    service = OnboardingService.from_settings(settings)
+    print(json.dumps(service.status(), indent=2))
+    return 0
+
+
+def _cmd_onboarding_step(step_id: str, status: str, note: str | None) -> int:
+    settings = load_settings()
+    service = OnboardingService.from_settings(settings)
+    plan = service.update_step(step_id, status=status, note=note)
+    print(json.dumps(plan.model_dump(mode="json"), indent=2))
+    return 0
+
+
+def _cmd_onboarding_recommended_settings() -> int:
+    settings = load_settings()
+    service = OnboardingService.from_settings(settings)
+    print(json.dumps(service.recommended_settings_bundle(), indent=2))
+    return 0
+
+
+def _cmd_voice_status() -> int:
+    settings = load_settings()
+    print(json.dumps(VoiceService(settings=settings).status(), indent=2))
+    return 0
+
+
+def _cmd_voice_speak(text: str, voice: str | None, output_path: str | None) -> int:
+    settings = load_settings()
+    print(json.dumps(VoiceService(settings=settings).speak(text, voice=voice, output_path=output_path), indent=2))
+    return 0
+
+
+def _cmd_voice_transcribe(audio_path: str, model: str | None) -> int:
+    settings = load_settings()
+    print(json.dumps(VoiceService(settings=settings).transcribe(audio_path, model=model), indent=2))
+    return 0
+
+
+def _cmd_voice_preload_defaults() -> int:
+    settings = load_settings()
+    print(json.dumps(VoiceService(settings=settings).preload_defaults(), indent=2))
+    return 0
+
+
+def _cmd_voice_install_asset(asset_id: str) -> int:
+    settings = load_settings()
+    print(json.dumps(VoiceService(settings=settings).install_asset(asset_id), indent=2))
+    return 0
+
+
+def _cmd_web_presence_server(host: str, port: int) -> int:
+    uvicorn.run(create_webpresence_app(), host=host, port=port, log_level="info")
+    return 0
+
+
+def _cmd_supervisor_status(
+    *,
+    ui_host: str,
+    ui_port: int,
+    loop0_steps: int,
+    loop0_interval: int,
+    relay_profile_id: str | None,
+    relay_link_id: str | None,
+        relay_interval_seconds: float,
+) -> int:
+    settings = load_settings()
+    supervisor = AstrataSupervisor(
+        settings=settings,
+        ui_host=ui_host,
+        ui_port=ui_port,
+        loop0_steps=loop0_steps,
+        loop0_interval_seconds=loop0_interval,
+        relay_profile_id=relay_profile_id,
+        relay_link_id=relay_link_id,
+        relay_interval_seconds=relay_interval_seconds,
+    )
+    print(json.dumps(supervisor.status(), indent=2))
+    return 0
+
+
+def _cmd_supervisor_reconcile(
+    *,
+    ui_host: str,
+    ui_port: int,
+    loop0_steps: int,
+    loop0_interval: int,
+    relay_profile_id: str | None,
+    relay_link_id: str | None,
+    relay_interval_seconds: float,
+) -> int:
+    settings = load_settings()
+    supervisor = AstrataSupervisor(
+        settings=settings,
+        ui_host=ui_host,
+        ui_port=ui_port,
+        loop0_steps=loop0_steps,
+        loop0_interval_seconds=loop0_interval,
+        relay_profile_id=relay_profile_id,
+        relay_link_id=relay_link_id,
+        relay_interval_seconds=relay_interval_seconds,
+    )
+    print(json.dumps(supervisor.reconcile(), indent=2))
+    return 0
+
+
+def _cmd_supervisor_stop(
+    *,
+    ui_host: str,
+    ui_port: int,
+    loop0_steps: int,
+    loop0_interval: int,
+    relay_profile_id: str | None,
+    relay_link_id: str | None,
+    relay_interval_seconds: float,
+    include_adopted: bool,
+    stop_local_runtime: bool,
+) -> int:
+    settings = load_settings()
+    supervisor = AstrataSupervisor(
+        settings=settings,
+        ui_host=ui_host,
+        ui_port=ui_port,
+        loop0_steps=loop0_steps,
+        loop0_interval_seconds=loop0_interval,
+        relay_profile_id=relay_profile_id,
+        relay_link_id=relay_link_id,
+        relay_interval_seconds=relay_interval_seconds,
+    )
+    print(
+        json.dumps(
+            supervisor.stop(
+                include_adopted=include_adopted,
+                stop_local_runtime=stop_local_runtime,
+            ),
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="astrata")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1227,6 +1762,41 @@ def _build_parser() -> argparse.ArgumentParser:
     loop0_daemon.add_argument("--steps", type=int, default=1, help="Number of Loop 0 steps per cycle.")
     loop0_daemon.add_argument("--interval", type=int, default=60, help="Seconds to sleep between cycles.")
     loop0_daemon.add_argument("--max-cycles", type=int, default=None, help="Optional limit for bounded runs or tests.")
+    sub.add_parser("archive-runtime-state", help="Archive the full live runtime DB and rebuild a compact hot-state DB.")
+    sub.add_parser("compact-runtime-payloads", help="Compact oversized hot-row payload fields in the live runtime DB.")
+    sub.add_parser("browser-status", help="Inspect Astrata's internal browser state.")
+    browser_snapshot = sub.add_parser("browser-snapshot", help="Capture a page through Astrata's internal browser substrate.")
+    browser_snapshot.add_argument("url", help="http(s) URL to inspect.")
+    browser_snapshot.add_argument("--session-id", default=None, help="Optional browser session id to continue.")
+    browser_snapshot.add_argument("--label", default="", help="Optional label for a new browser session.")
+    browser_snapshot.add_argument("--full-page", action="store_true", help="Capture full page height.")
+    browser_snapshot.add_argument("--wait-ms", type=int, default=350, help="Extra wait before capture.")
+    browser_snapshot.add_argument("--width", type=int, default=1440, help="Viewport width.")
+    browser_snapshot.add_argument("--height", type=int, default=900, help="Viewport height.")
+    browser_snapshot.add_argument("--selector", default=None, help="Optional selector to wait for.")
+    browser_snapshot.add_argument("--include-html", action="store_true", help="Persist rendered HTML alongside the screenshot.")
+    browser_click = sub.add_parser("browser-click", help="Click a selector in an existing browser session.")
+    browser_click.add_argument("--session-id", required=True, help="Browser session to continue.")
+    browser_click.add_argument("--selector", required=True, help="Selector to click.")
+    browser_click.add_argument("--wait-ms", type=int, default=350, help="Extra wait after interaction.")
+    browser_click.add_argument("--width", type=int, default=1440, help="Viewport width.")
+    browser_click.add_argument("--height", type=int, default=900, help="Viewport height.")
+    browser_click.add_argument("--include-html", action="store_true", help="Persist rendered HTML alongside the screenshot.")
+    browser_type = sub.add_parser("browser-type", help="Type text into a selector in an existing browser session.")
+    browser_type.add_argument("--session-id", required=True, help="Browser session to continue.")
+    browser_type.add_argument("--selector", required=True, help="Selector to fill.")
+    browser_type.add_argument("--text", required=True, help="Text to type.")
+    browser_type.add_argument("--wait-ms", type=int, default=350, help="Extra wait after interaction.")
+    browser_type.add_argument("--width", type=int, default=1440, help="Viewport width.")
+    browser_type.add_argument("--height", type=int, default=900, help="Viewport height.")
+    browser_type.add_argument("--include-html", action="store_true", help="Persist rendered HTML alongside the screenshot.")
+    browser_scroll = sub.add_parser("browser-scroll", help="Scroll within an existing browser session.")
+    browser_scroll.add_argument("--session-id", required=True, help="Browser session to continue.")
+    browser_scroll.add_argument("--delta-y", type=int, default=800, help="Vertical scroll delta.")
+    browser_scroll.add_argument("--wait-ms", type=int, default=350, help="Extra wait after interaction.")
+    browser_scroll.add_argument("--width", type=int, default=1440, help="Viewport width.")
+    browser_scroll.add_argument("--height", type=int, default=900, help="Viewport height.")
+    browser_scroll.add_argument("--include-html", action="store_true", help="Persist rendered HTML alongside the screenshot.")
     comms_send = sub.add_parser("comms-send", help="Send a durable principal message into Astrata.")
     comms_send.add_argument("message", help="Message payload to send.")
     comms_send.add_argument("--recipient", default="prime", help="Recipient identity.")
@@ -1241,9 +1811,118 @@ def _build_parser() -> argparse.ArgumentParser:
     comms_process = sub.add_parser("comms-process", help="Turn inbound messages into request specs and tasks.")
     comms_process.add_argument("--recipient", default="astrata", help="Recipient inbox to process.")
     comms_process.add_argument("--limit", type=int, default=5, help="Maximum number of messages to process.")
+    mcp_status = sub.add_parser("mcp-bridge-status", help="Inspect configured MCP bridge bindings and recent events.")
+    mcp_status.add_argument("--direction", choices=("inbound", "outbound"), default=None, help="Optional bridge direction filter.")
+    mcp_register = sub.add_parser("mcp-register-bridge", help="Register a minimal MCP bridge binding.")
+    mcp_register.add_argument("--direction", choices=("inbound", "outbound"), required=True)
+    mcp_register.add_argument("--agent-id", required=True)
+    mcp_register.add_argument("--transport", choices=("stdio", "streamable_http"), default="streamable_http")
+    mcp_register.add_argument("--role", choices=("prime", "assistant", "worker", "peer"), default="peer")
+    mcp_register.add_argument("--endpoint", default="", help="HTTP endpoint for streamable HTTP bridges.")
+    mcp_register.add_argument("--can-be-prime", action="store_true")
+    mcp_register.add_argument("--accepts-sensitive-payloads", action="store_true")
+    mcp_server = sub.add_parser("mcp-server", help="Run Astrata's inbound MCP HTTP bridge.")
+    mcp_server.add_argument("--host", default="127.0.0.1")
+    mcp_server.add_argument("--port", type=int, default=8892)
+    mcp_relay_status = sub.add_parser("mcp-relay-status", help="Inspect hosted MCP relay profiles, links, queue, and telemetry.")
+    mcp_relay_status.add_argument("--profile-id", default=None, help="Optional hosted relay profile filter.")
+    remote_host_bash = sub.add_parser(
+        "acknowledge-remote-host-bash",
+        help="Explicitly enable or disable generic host bash access for a relay profile.",
+    )
+    remote_host_bash.add_argument("--profile-id", required=True, help="Relay profile receiving the acknowledgement.")
+    remote_host_bash.add_argument("--disable", action="store_true", help="Turn the acknowledgement off instead of on.")
+    mcp_relay_profile = sub.add_parser("mcp-register-relay-profile", help="Register a hosted MCP relay profile.")
+    mcp_relay_profile.add_argument("--label", required=True)
+    mcp_relay_profile.add_argument("--exposure", choices=("chatgpt", "gemini", "claude", "generic"), default="generic")
+    mcp_relay_profile.add_argument(
+        "--control-posture",
+        choices=("true_remote_prime", "peer", "local_prime_delegate", "local_prime_customer"),
+        default="local_prime_customer",
+    )
+    mcp_relay_profile.add_argument(
+        "--local-prime-behavior",
+        choices=("absent", "subordinate", "authoritative", "collaborative"),
+        default="authoritative",
+    )
+    mcp_relay_profile.add_argument("--remote-agent-id", default="")
+    mcp_relay_profile.add_argument("--relay-endpoint", default="")
+    mcp_relay_profile.add_argument("--auth-mode", default="token")
+    mcp_relay_profile.add_argument("--auth-token", default="")
+    mcp_relay_profile.add_argument(
+        "--max-disclosure-tier",
+        choices=("public", "connector_safe", "trusted_remote", "local_only", "enclave_only"),
+        default="connector_safe",
+    )
+    mcp_relay_link = sub.add_parser("mcp-register-relay-link", help="Register Astrata's local outbound link to a hosted MCP relay.")
+    mcp_relay_link.add_argument("--profile-id", required=True)
+    mcp_relay_link.add_argument("--bridge-id", required=True)
+    mcp_relay_link.add_argument("--status", choices=("online", "offline", "degraded"), default="offline")
+    mcp_relay_link.add_argument("--backend-url", default="")
+    mcp_relay_heartbeat = sub.add_parser("mcp-relay-heartbeat", help="Advertise local Astrata state and drain queued hosted relay work.")
+    mcp_relay_heartbeat.add_argument("--profile-id", required=True)
+    mcp_relay_heartbeat.add_argument("--link-id", default=None)
+    mcp_relay_heartbeat.add_argument("--push-remote", action="store_true")
+    mcp_relay_heartbeat.add_argument("--no-drain-queue", action="store_true")
+    mcp_relay_watch = sub.add_parser("mcp-relay-watch", help="Continuously heartbeat and drain a hosted MCP relay link.")
+    mcp_relay_watch.add_argument("--profile-id", required=True)
+    mcp_relay_watch.add_argument("--link-id", default=None)
+    mcp_relay_watch.add_argument("--interval-seconds", type=float, default=5.0)
+    mcp_relay_watch.add_argument("--no-push-remote", action="store_true")
+    mcp_relay_watch.add_argument("--no-drain-queue", action="store_true")
+    mcp_relay_watch.add_argument("--max-cycles", type=int, default=None, help=argparse.SUPPRESS)
+    web_presence = sub.add_parser("web-presence-server", help="Run Astrata's public web presence / registry API server.")
+    web_presence.add_argument("--host", default="127.0.0.1")
+    web_presence.add_argument("--port", type=int, default=8893)
+    for command_name, command_help in (
+        ("supervisor-status", "Inspect Astrata's always-on process supervisor state."),
+        ("supervisor-reconcile", "Start or adopt the always-on Astrata service set."),
+        ("supervisor-stop", "Stop supervisor-owned always-on services."),
+    ):
+        supervisor = sub.add_parser(command_name, help=command_help)
+        supervisor.add_argument("--ui-host", default="127.0.0.1")
+        supervisor.add_argument("--ui-port", type=int, default=8891)
+        supervisor.add_argument("--loop0-steps", type=int, default=1)
+        supervisor.add_argument("--loop0-interval", type=int, default=120)
+        supervisor.add_argument("--relay-profile-id", default=None)
+        supervisor.add_argument("--relay-link-id", default=None)
+        supervisor.add_argument("--relay-interval-seconds", type=float, default=30.0)
+        if command_name == "supervisor-stop":
+            supervisor.add_argument("--include-adopted", action="store_true", help="Also stop adopted matching processes.")
+            supervisor.add_argument("--stop-local-runtime", action="store_true", help="Also stop Astrata's managed local inference runtime.")
+    sub.add_parser("agents-list", help="List durable agents known to Astrata.")
+    agent_create = sub.add_parser("agent-create", help="Create a durable agent from a JSON spec.")
+    agent_create.add_argument("spec_path", help="Path to a JSON file describing the new durable agent.")
+    agent_update = sub.add_parser("agent-update", help="Update a durable agent from a JSON patch spec.")
+    agent_update.add_argument("agent_id", help="Durable agent id to update.")
+    agent_update.add_argument("spec_path", help="Path to a JSON file containing a patch or update payload.")
+    agent_update.add_argument("--allow-system-update", action="store_true", help="Permit direct updates to system-managed agents.")
+    sub.add_parser("onboarding-status", help="Inspect Astrata's durable onboarding plan.")
+    sub.add_parser(
+        "onboarding-recommended-settings",
+        help="Show the one-click recommended setup bundle and why each recommendation exists.",
+    )
+    onboarding_step = sub.add_parser("onboarding-step", help="Update one onboarding step status.")
+    onboarding_step.add_argument("step_id", help="Onboarding step id to update.")
+    onboarding_step.add_argument("--status", choices=("pending", "active", "complete", "blocked", "skipped"), required=True)
+    onboarding_step.add_argument("--note", default=None, help="Optional note to append to the step.")
+    sub.add_parser("voice-status", help="Inspect Astrata's current voice input/output capability surface.")
+    voice_speak = sub.add_parser("voice-speak", help="Speak text through a local voice backend when available.")
+    voice_speak.add_argument("text", help="Text to speak aloud.")
+    voice_speak.add_argument("--voice", default=None, help="Optional backend-specific voice name.")
+    voice_speak.add_argument("--output-path", default=None, help="Optional audio file destination when supported.")
+    voice_transcribe = sub.add_parser("voice-transcribe", help="Transcribe an audio file through a local voice input backend.")
+    voice_transcribe.add_argument("audio_path", help="Audio file to transcribe.")
+    voice_transcribe.add_argument("--model", default=None, help="Optional transcription model override.")
+    sub.add_parser("voice-preload-defaults", help="Download and stage Astrata's lightweight default local voice assets.")
+    voice_install = sub.add_parser("voice-install-asset", help="Download and stage one curated local voice asset.")
+    voice_install.add_argument("asset_id", help="Curated voice asset id, such as kokoro-82m, moonshine, or omnivoice.")
     local_start = sub.add_parser("local-runtime-start", help="Start a managed local inference runtime.")
     local_start.add_argument("--model-id", default=None, help="Specific local model ID to run.")
     local_start.add_argument("--profile", default=None, help="Runtime profile override.")
+    local_ensure = sub.add_parser("local-runtime-ensure", help="Ensure Astrata's managed local lane is up and healthy.")
+    local_ensure.add_argument("--model-id", default=None, help="Specific local model ID to run.")
+    local_ensure.add_argument("--profile", default=None, help="Runtime profile override.")
     sub.add_parser("local-runtime-stop", help="Stop the managed local inference runtime.")
     sub.add_parser("local-runtime-status", help="Inspect managed local runtime status.")
     sub.add_parser("local-model-catalog", help="Show the curated local model starter catalog.")
@@ -1323,6 +2002,52 @@ def main() -> int:
         return _cmd_loop0_run(max(1, args.steps))
     if args.command == "loop0-daemon":
         return _cmd_loop0_daemon(max(1, args.steps), max(1, args.interval), args.max_cycles)
+    if args.command == "archive-runtime-state":
+        return _cmd_archive_runtime_state()
+    if args.command == "compact-runtime-payloads":
+        return _cmd_compact_runtime_payloads()
+    if args.command == "browser-status":
+        return _cmd_browser_status()
+    if args.command == "browser-snapshot":
+        return _cmd_browser_snapshot(
+            args.url,
+            args.session_id,
+            args.label,
+            args.full_page,
+            args.wait_ms,
+            args.width,
+            args.height,
+            args.selector,
+            args.include_html,
+        )
+    if args.command == "browser-click":
+        return _cmd_browser_click(
+            args.session_id,
+            args.selector,
+            args.wait_ms,
+            args.width,
+            args.height,
+            args.include_html,
+        )
+    if args.command == "browser-type":
+        return _cmd_browser_type(
+            args.session_id,
+            args.selector,
+            args.text,
+            args.wait_ms,
+            args.width,
+            args.height,
+            args.include_html,
+        )
+    if args.command == "browser-scroll":
+        return _cmd_browser_scroll(
+            args.session_id,
+            args.delta_y,
+            args.wait_ms,
+            args.width,
+            args.height,
+            args.include_html,
+        )
     if args.command == "comms-send":
         return _cmd_comms_send(args.recipient, args.intent, args.message, args.kind, args.conversation_id)
     if args.command == "comms-inbox":
@@ -1331,8 +2056,119 @@ def main() -> int:
         return _cmd_comms_ack(args.communication_id)
     if args.command == "comms-process":
         return _cmd_comms_process(args.recipient, args.limit)
+    if args.command == "mcp-bridge-status":
+        return _cmd_mcp_bridge_status(args.direction)
+    if args.command == "mcp-register-bridge":
+        return _cmd_mcp_register_bridge(
+            direction=args.direction,
+            agent_id=args.agent_id,
+            transport=args.transport,
+            role=args.role,
+            endpoint=args.endpoint,
+            can_be_prime=args.can_be_prime,
+            accepts_sensitive_payloads=args.accepts_sensitive_payloads,
+        )
+    if args.command == "mcp-server":
+        return _cmd_mcp_server(args.host, args.port)
+    if args.command == "mcp-relay-status":
+        return _cmd_mcp_relay_status(args.profile_id)
+    if args.command == "acknowledge-remote-host-bash":
+        return _cmd_acknowledge_remote_host_bash(args.profile_id, not args.disable)
+    if args.command == "mcp-register-relay-profile":
+        return _cmd_mcp_register_relay_profile(
+            label=args.label,
+            exposure=args.exposure,
+            control_posture=args.control_posture,
+            local_prime_behavior=args.local_prime_behavior,
+            remote_agent_id=args.remote_agent_id,
+            relay_endpoint=args.relay_endpoint,
+            auth_mode=args.auth_mode,
+            auth_token=args.auth_token,
+            max_disclosure_tier=args.max_disclosure_tier,
+        )
+    if args.command == "mcp-register-relay-link":
+        return _cmd_mcp_register_relay_link(
+            profile_id=args.profile_id,
+            bridge_id=args.bridge_id,
+            status=args.status,
+            backend_url=args.backend_url,
+        )
+    if args.command == "mcp-relay-heartbeat":
+        return _cmd_mcp_relay_heartbeat(
+            args.profile_id,
+            args.link_id,
+            args.push_remote,
+            not args.no_drain_queue,
+        )
+    if args.command == "mcp-relay-watch":
+        return _cmd_mcp_relay_watch(
+            args.profile_id,
+            args.link_id,
+            args.interval_seconds,
+            not args.no_push_remote,
+            not args.no_drain_queue,
+            args.max_cycles,
+        )
+    if args.command == "web-presence-server":
+        return _cmd_web_presence_server(args.host, args.port)
+    if args.command == "supervisor-status":
+        return _cmd_supervisor_status(
+            ui_host=args.ui_host,
+            ui_port=args.ui_port,
+            loop0_steps=max(1, args.loop0_steps),
+            loop0_interval=max(1, args.loop0_interval),
+            relay_profile_id=args.relay_profile_id,
+            relay_link_id=args.relay_link_id,
+            relay_interval_seconds=args.relay_interval_seconds,
+        )
+    if args.command == "supervisor-reconcile":
+        return _cmd_supervisor_reconcile(
+            ui_host=args.ui_host,
+            ui_port=args.ui_port,
+            loop0_steps=max(1, args.loop0_steps),
+            loop0_interval=max(1, args.loop0_interval),
+            relay_profile_id=args.relay_profile_id,
+            relay_link_id=args.relay_link_id,
+            relay_interval_seconds=args.relay_interval_seconds,
+        )
+    if args.command == "supervisor-stop":
+        return _cmd_supervisor_stop(
+            ui_host=args.ui_host,
+            ui_port=args.ui_port,
+            loop0_steps=max(1, args.loop0_steps),
+            loop0_interval=max(1, args.loop0_interval),
+            relay_profile_id=args.relay_profile_id,
+            relay_link_id=args.relay_link_id,
+            relay_interval_seconds=args.relay_interval_seconds,
+            include_adopted=args.include_adopted,
+            stop_local_runtime=args.stop_local_runtime,
+        )
+    if args.command == "agents-list":
+        return _cmd_agents_list()
+    if args.command == "agent-create":
+        return _cmd_agent_create(args.spec_path)
+    if args.command == "agent-update":
+        return _cmd_agent_update(args.agent_id, args.spec_path, args.allow_system_update)
+    if args.command == "onboarding-status":
+        return _cmd_onboarding_status()
+    if args.command == "onboarding-recommended-settings":
+        return _cmd_onboarding_recommended_settings()
+    if args.command == "onboarding-step":
+        return _cmd_onboarding_step(args.step_id, args.status, args.note)
+    if args.command == "voice-status":
+        return _cmd_voice_status()
+    if args.command == "voice-speak":
+        return _cmd_voice_speak(args.text, args.voice, args.output_path)
+    if args.command == "voice-transcribe":
+        return _cmd_voice_transcribe(args.audio_path, args.model)
+    if args.command == "voice-preload-defaults":
+        return _cmd_voice_preload_defaults()
+    if args.command == "voice-install-asset":
+        return _cmd_voice_install_asset(args.asset_id)
     if args.command == "local-runtime-start":
         return _cmd_local_runtime_start(args.model_id, args.profile)
+    if args.command == "local-runtime-ensure":
+        return _cmd_local_runtime_ensure(args.model_id, args.profile)
     if args.command == "local-runtime-stop":
         return _cmd_local_runtime_stop()
     if args.command == "local-runtime-status":
