@@ -4,144 +4,137 @@
 
 Astrata Web is the identity and routing control plane.
 
-Cloudflare can remain the edge relay for development and early v0, but the current Worker + KV shape is not the production account system. The next production-shaped step is:
+Cloudflare Workers can remain the edge relay for development and early v0, but the user-owned account system must live above the current single-user development bridge.
 
-- real user accounts
-- real OAuth for Custom GPT Actions
-- per-user relay profile routing
-- per-device local Astrata pairing
-- queue storage that is not high-frequency Workers KV writes
+## Current Rule
 
-## Why This Matters
+The safe remote route is:
 
-The current GPT Actions bridge can talk to Astrata, but it is still single-user development infrastructure. Its default relay profile points at Jonathan's local Astrata instance. That is useful for proving the loop, but unsafe for distribution.
+`token -> account -> relay profile -> owned device link -> permitted tools`
 
-The production rule is:
+Anything weaker than that is development infrastructure, not distribution infrastructure.
 
-`remote token -> user account -> relay profile -> local device/link -> permitted tools`
+## Roles
 
-No remote action should route by a global default profile once the GPT is shared with anyone else.
+### Astrata Desktop
 
-## Product Surfaces
+Owns:
 
-- `Astrata Desktop`
-  The local node. It owns local-only memory, local model access, local tools, and secure-enclave boundaries.
+- local memory
+- local models
+- local tools
+- local-only disclosure boundaries
+- the paired device identity
 
-- `Astrata Web`
-  The hosted control plane. It owns accounts, OAuth, profile routing, device pairing, relay queues, subscription/metering status, and public docs/downloads.
+### Astrata Web
 
-- `Custom GPT`
-  The near-term distribution surface. It should call Astrata Web through the stable GPT Actions schema: `help`, `about`, `submit_feedback`, `list_tools`, `tool_search`, and `use_tool`. One-time/rare guidance such as `onboarding` should be discovered through `tool_search` and called through `use_tool`.
+Owns:
 
-- `ChatGPT App/MCP`
-  A development and agent-interop bridge. Keep it, but do not depend on it for immediate tester distribution.
+- accounts
+- hosted OAuth metadata and token surfaces
+- login
+- OAuth authorize/token flow
+- relay profile ownership
+- device ownership
+- connection revocation
+- queue routing
+- per-profile relay queue/session/result authority
 
-- `Astrata Mobile`
-  Future companion/remote client. It should authenticate as the same user and route through Astrata Web, not directly to another user's local profile.
+### Hosted Relay
 
-## Cloudflare Fit
-
-Cloudflare Workers remain good for:
+Owns:
 
 - public HTTPS edge
-- low-latency action endpoints
-- privacy policy and schema hosting
-- OAuth endpoint stubs
-- routing remote calls to per-user relay queues
+- connector entrypoints
+- queue submission and delivery coordination
+- profile/device authorization checks
 
-Workers KV is not good as the primary queue:
+## Current HTTP Surface
 
-- it has low free-tier write limits
-- it is eventually consistent
-- it is not an atomic queue/lock
-- high-frequency heartbeat writes can exhaust quota quickly
+The repo now exposes the narrow hosted OAuth control-plane scaffold through Astrata Web:
 
-Better Cloudflare-native options:
+- `GET /.well-known/oauth-authorization-server`
+- `GET /.well-known/oauth-protected-resource`
+- `POST /oauth/register`
+- `POST /oauth/authorize`
+- `POST /oauth/token`
+- `POST /oauth/introspect`
+- `POST /oauth/revoke`
 
-- Durable Objects for per-user or per-profile serialized relay queues and live coordination.
-- D1 for relational account/profile/device metadata.
-- Workers as the front door that routes to Durable Objects and D1.
+These routes sit in front of the current local account registry. They are intentionally narrow:
 
-This keeps the current hosting investment useful while replacing the weak storage layer.
+- authorization-code flow only
+- effective scope is `relay:use`
+- issued tokens bind to one `user_id -> profile_id -> device_id`
 
-## Real Auth Shape
+That is enough to make Astrata, not the edge worker, the source of truth for connector access decisions.
 
-The production OAuth shape should be:
+## Why The Distinction Matters
 
-1. User creates or signs into an Astrata Web account.
-2. Astrata Web creates a user id and default relay profile.
-3. Astrata Desktop pairs to that account using a browser login or short pairing code.
-4. Custom GPT Actions uses OAuth, not the shared relay token.
-5. The OAuth access token resolves to a user id.
-6. `tool_search` resolves allowed tools for that user/profile.
-7. `use_tool` queues work only for that user's relay profile.
-8. User can revoke the GPT, rotate tokens, or disconnect a local device.
+The current repo can already prove the routing chain locally.
+What it does not yet provide is the hosted web experience around it.
+The metadata and token endpoints now exist, and the repo now includes a simple browser authorize flow for v0 testers.
+The fuller end-user sign-in and consent UX is still to come.
 
-## Tester Access Policy
+Without Astrata Web owning identity:
 
-For v0-friendly tester distribution, Astrata should separate public product access from metered cloud access.
+- a shared GPT could route through the wrong profile
+- pairing codes could be mistaken for authentication
+- device selection and revocation would be too brittle
 
-- Public:
-  - download pages
-  - desktop installers
-  - local-first onboarding and setup guidance
-  - local runtime bootstrap
-  - local model and voice asset setup that does not require Astrata-hosted control-plane capacity
-- Invite-gated:
-  - hosted Astrata account activation for testers
-  - GPT bridge sign-in
-  - relay profile creation
-  - remote queue usage
-  - any hosted control-plane feature that consumes metered Astrata infrastructure
+## v0-Friendly Access Policy
 
-The default rule is:
+Public:
+
+- download pages
+- installer distribution
+- local-first onboarding docs
+- local model/runtime setup
+
+Invite-gated:
+
+- hosted account activation
+- GPT OAuth sign-in
+- remote queue usage
+- hosted control-plane features that consume cloud resources
+
+The guiding rule is:
 
 `download/install is public; remote bridge activation is eligibility-gated`
 
-This keeps the top of funnel open while reserving the actual cloud-cost surface for invited testers until subscriptions or another billing model exist.
+## Recommended Hosted Shape
 
-## Minimal Migration Plan
+Short version:
 
-1. Disable default-profile routing for shared GPT builds.
-   Keep the current `RELAY_DEFAULT_PROFILE_ID` only for private dev deployments.
+- Workers for HTTPS edge and small adapter surfaces
+- durable per-profile queueing
+- relational account/profile/device metadata
 
-2. Add user/account schema.
-   Required records:
-   - `users`
-   - `oauth_clients`
-   - `oauth_authorization_codes`
-   - `oauth_access_tokens`
-   - `relay_profiles`
-   - `local_devices`
-   - `device_links`
-   - `relay_sessions`
-   - `relay_requests`
-   - `relay_results`
+Cloudflare-native candidates remain sensible:
 
-3. Add device pairing.
-   Desktop requests a pairing code, user signs in on Astrata Web, Web binds that local device to the user's relay profile, Desktop stores a local link token.
+- Workers for edge/API
+- Durable Objects for serialized queue coordination
+- D1 for account and routing metadata
 
-4. Move queueing off KV.
-   Route each `user_id/profile_id` to a Durable Object queue or an equivalent backend-backed queue.
+## Immediate Build Sequence
 
-5. Upgrade GPT Actions auth.
-   Replace API-key bearer auth with OAuth in the GPT Builder, using Astrata Web's production authorization and token URLs.
-
-6. Add account controls.
-   User can see connected GPTs/devices, revoke sessions, rotate local-link tokens, and disable remote control.
+1. Put hosted authorize/token endpoints in front of the current OAuth-shaped registry.
+2. Add login and consent flow for GPT users.
+3. Add default profile/device selection and revocation controls.
+4. Move queueing to durable per-profile storage.
+5. Remove shared default-profile assumptions from any shared-user path.
 
 ## Security Rails
 
-- Shared bearer tokens are development-only.
-- GPT Actions must route by authenticated user, never by global profile, before broader distribution.
-- Local-only and enclave-only data must not transit Astrata Web.
-- Connector-safe projections must stay tiered by relay profile and user permissions.
-- Tool availability must come from `tool_search`, not from a hardcoded GPT prompt.
-- User onboarding state should become an account-level field once Astrata Web owns identity, starting with a simple flag or timestamp such as `gpt_onboarded_at` before growing into richer curricula.
+- shared bearer tokens are dev-only
+- pairing is device selection, not identity proof
+- connector-safe projections remain mandatory
+- local-only and enclave-only data must not leave the machine through the hosted bridge
+- tool availability should come from profile policy and relay advertisement, not hardcoded GPT prompts
 
-## Open Questions
+## Relationship To v0
 
-- Whether to use Cloudflare D1 for accounts immediately, or use an external managed Postgres/auth provider and keep Cloudflare as edge only.
-- Whether Durable Objects are enough for all relay queues, or whether long-term constellation messaging wants a dedicated event bus.
-- Whether Astrata accounts should initially use email magic link, passkeys, or an external OAuth provider.
-- Whether tester billing/subscription state should live in Astrata Web v0 or wait until distribution expands.
+This is not separate from the v0 plan. It is one of the gating pieces for v0.
+
+We do not need a perfect long-term SaaS platform first.
+We do need a user-owned account and routing path that prevents a tester GPT from accidentally operating on the wrong person's machine.

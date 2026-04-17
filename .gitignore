@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 node_modules/
+.wrangler/
+**/.wrangler/
 
 # Local Astrata runtime state and downloaded models
 .astrata/

@@ -1,0 +1,23 @@
+name = "astrata-mcp-relay"
+main = "worker.js"
+compatibility_date = "2026-04-10"
+
+[vars]
+ENVIRONMENT = "development"
+RELAY_DEFAULT_PROFILE_ID = ""
+ASTRATA_CONTROL_PLANE_URL = "http://127.0.0.1:8893"
+
+# Set this with `wrangler secret put RELAY_SHARED_TOKEN`
+# RELAY_SHARED_TOKEN = ""
+
+# Optional bearer token if the Astrata Web control plane is fronted by an authenticated internal gateway.
+# Set with `wrangler secret put ASTRATA_CONTROL_PLANE_BEARER_TOKEN`
+# ASTRATA_CONTROL_PLANE_BEARER_TOKEN = ""
+
+# When ASTRATA_CONTROL_PLANE_URL is set, the worker proxies OAuth and relay queue/session/result state
+# to Astrata Web and keeps in-worker KV/memory only as a development fallback.
+
+# Optional but recommended for durable hosted queue state:
+# [[kv_namespaces]]
+# binding = "RELAY_STATE"
+# id = "your_kv_namespace_id"

@@ -61,6 +61,8 @@ class CoordinatorController:
                 preferred_providers = advice.preferred_providers
             preferred_cli_tools = advice.preferred_cli_tools
         require_prime_route = bool(envelope.metadata.get("require_prime_route"))
+        if require_prime_route and not preferred_providers:
+            preferred_providers = ("codex",)
         if (
             not require_prime_route
             and envelope.risk not in {"high", "critical"}

@@ -4,212 +4,289 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Astrata</title>
+    <meta name="description" content="Astrata — local-first personal coordination and execution system." />
     <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/marked@13/marked.min.js"></script>
   </head>
   <body>
-    <div class="grain"></div>
-    <main class="app-shell">
-      <section class="hero">
-        <div class="hero-copy">
-          <p class="eyebrow">Astrata Operator Surface</p>
-          <h1>One runtime. Real state. No terminal required.</h1>
-          <p class="lede">
-            Watch the loop, steer the machine, and keep the local stack healthy without
-            dropping into CLI glue.
-          </p>
-          <div class="hero-actions">
-            <button id="refreshButton" class="button button-primary">Refresh Surface</button>
-            <button id="runLoopButton" class="button button-secondary">Run One Loop Step</button>
+    <div class="app-shell" id="appShell">
+
+      <!-- ══ COL 1: ICON RAIL (48px) ══════════════════════════════ -->
+      <nav class="icon-rail" id="iconRail">
+        <div class="icon-rail-brand"></div>
+
+        <!-- Conversations -->
+        <button class="rail-btn active" data-view="chat" id="railChat" title="Chat">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <span class="rail-btn-badge" id="railChatBadge" hidden></span>
+        </button>
+
+        <div class="rail-section-sep"></div>
+
+        <!-- Workspace -->
+        <button class="rail-btn" data-view="tasks" id="railTasks" title="Tasks">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          <span class="rail-btn-badge" id="railTasksBadge" hidden></span>
+        </button>
+        <button class="rail-btn" data-view="attempts" id="railAttempts" title="Attempts">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+        </button>
+        <button class="rail-btn" data-view="artifacts" id="railArtifacts" title="Artifacts">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        </button>
+        <button class="rail-btn" data-view="history" id="railHistory" title="History">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 3"/></svg>
+        </button>
+
+        <div class="rail-section-sep"></div>
+
+        <!-- System -->
+        <button class="rail-btn" data-view="models" id="railModels" title="Models &amp; Runtime">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+        </button>
+        <button class="rail-btn" data-view="settings" id="railSettings" title="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+
+        <div class="rail-spacer"></div>
+
+        <button class="rail-btn" data-view="startup" id="railStartup" title="Health">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        </button>
+      </nav>
+
+      <!-- ══ COL 2: CONTEXT PANEL (260px) ═════════════════════════ -->
+      <aside class="context-panel" id="contextPanel">
+        <div class="context-panel-header" id="contextPanelHeader">
+          <div>
+            <div class="context-panel-title" id="contextPanelTitle">Prime</div>
+            <div class="context-panel-sub" id="contextPanelSub">Conversations</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="ctxActionBtn" title="New Chat" style="padding:5px 8px;font-size:12px;">+</button>
+        </div>
+
+        <div class="context-panel-body" id="contextPanelBody">
+          <!-- Populated dynamically per section -->
+        </div>
+
+        <!-- Telemetry footer -->
+        <div class="context-panel-footer" id="contextPanelFooter">
+          <div class="telemetry-header">Operational</div>
+          <div class="telemetry-row">
+            <span class="telemetry-row-label">running</span>
+            <span class="telemetry-row-value" id="tel-running">—</span>
+          </div>
+          <div class="telemetry-row">
+            <span class="telemetry-row-label">queued</span>
+            <span class="telemetry-row-value" id="tel-queued">—</span>
+          </div>
+          <div class="telemetry-row">
+            <span class="telemetry-row-label">blocked</span>
+            <span class="telemetry-row-value" id="tel-blocked">—</span>
+          </div>
+          <div class="telemetry-row">
+            <span class="telemetry-row-label">route</span>
+            <span class="telemetry-row-value" id="tel-route">—</span>
+          </div>
+          <div class="telemetry-row">
+            <span class="telemetry-row-label">runtime</span>
+            <span class="telemetry-row-value" id="tel-runtime">—</span>
           </div>
         </div>
-        <div class="hero-status">
-          <div class="metric-column">
-            <span class="metric-label">Default Route</span>
-            <span id="defaultRouteValue" class="metric-value">...</span>
+      </aside>
+
+      <!-- ══ COL 3: MAIN CONTENT (1fr) ════════════════════════════ -->
+      <main class="main-content" id="mainContent">
+
+        <!-- Chat View -->
+        <div class="chat-container" id="viewChat">
+          <div class="chat-header" style="align-items:flex-end;padding-bottom:0;">
+            <div class="agent-tabs" id="chatAgentTabs" style="display:flex;gap:16px;flex:1;overflow-x:auto;">
+              <!-- Dynamically populated Agent Tabs -->
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;padding-bottom:12px;">
+              <span id="runtimeIndicator" class="pill pill-neutral" hidden></span>
+              <button class="btn btn-ghost btn-sm" id="runLoopBtn">⟳ Loop</button>
+              <button class="btn btn-ghost btn-sm" id="refreshBtn">↻</button>
+            </div>
           </div>
-          <div class="metric-column">
-            <span class="metric-label">Thermal State</span>
-            <span id="thermalStateValue" class="metric-value">...</span>
-          </div>
-          <div class="metric-column">
-            <span class="metric-label">Queue Pressure</span>
-            <span id="queuePressureValue" class="metric-value">...</span>
+          <div class="chat-messages" id="chatMessages"></div>
+          <div class="chat-composer">
+            <div class="composer-mode-row">
+              <div class="mode-toggle" id="chatModeToggle">
+                <button class="mode-btn active" data-mode="agent">Agent</button>
+                <button class="mode-btn" data-mode="ephemeral">Ephemeral</button>
+              </div>
+              <span class="mode-label" id="chatModeLabel">Sends to Agent · creates tasks</span>
+            </div>
+            <div class="composer-inner">
+              <div class="composer-input-wrap">
+                <textarea class="composer-textarea" id="chatInput" placeholder="Talk… (Enter to send)" rows="1"></textarea>
+              </div>
+              <button class="btn-send" id="chatSendBtn">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </div>
           </div>
         </div>
-      </section>
 
-      <section class="workspace-grid">
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Startup</p>
-              <h2>Preflight and self-reflection</h2>
-            </div>
+        <!-- Tasks View -->
+        <div class="view-container" id="viewTasks" hidden>
+          <div class="view-header">
+            <div><h1>Tasks</h1><p>Governed work and execution queue</p></div>
+            <button class="btn btn-ghost btn-sm" id="refreshTasksBtn">↻ Refresh</button>
           </div>
-          <div id="startupCounts" class="badge-row"></div>
-          <div id="startupList" class="list-stack"></div>
-        </section>
+          <div class="metric-grid" id="taskMetrics"></div>
+          <div id="taskList" style="display:flex;flex-direction:column;gap:12px;margin-top:4px;"></div>
+        </div>
 
-        <section class="panel panel-runtime">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Local Runtime</p>
-              <h2>Quiet-first local control</h2>
-            </div>
-            <div class="panel-actions">
-              <button id="startRuntimeButton" class="button button-secondary">Start</button>
-              <button id="stopRuntimeButton" class="button button-ghost">Stop</button>
-            </div>
-          </div>
-          <div id="runtimeSummary" class="runtime-summary"></div>
-          <div class="subsection">
-            <h3>Discovered Models</h3>
-            <div id="modelList" class="list-stack"></div>
-          </div>
-        </section>
+        <!-- Attempts View -->
+        <div class="view-container" id="viewAttempts" hidden>
+          <div class="view-header"><div><h1>Attempts</h1><p>Execution history and outcomes</p></div></div>
+          <div class="metric-grid" id="attemptMetrics"></div>
+          <div id="attemptList" style="display:flex;flex-direction:column;gap:12px;margin-top:4px;"></div>
+        </div>
 
-        <section class="panel panel-compose">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Operator Lanes</p>
-              <h2>Talk to the machine directly</h2>
+        <!-- Artifacts View -->
+        <div class="view-container" id="viewArtifacts" hidden>
+          <div class="view-header"><div><h1>Artifacts</h1><p>Durable work products</p></div></div>
+          <div class="metric-grid" id="artifactMetrics"></div>
+          <div id="artifactList" style="display:flex;flex-direction:column;gap:12px;margin-top:4px;"></div>
+        </div>
+
+        <!-- History View -->
+        <div class="view-container" id="viewHistory" hidden>
+          <div class="view-header"><div><h1>History</h1><p>Snapshot reports, bottlenecks, git state, and recent system events</p></div></div>
+          <div class="metric-grid" id="historyMetrics"></div>
+          <div id="historyContent" style="display:flex;flex-direction:column;gap:12px;margin-top:4px;"></div>
+        </div>
+
+        <!-- Models & Runtime -->
+        <div class="view-container" id="viewModels" hidden>
+          <div class="view-header">
+            <div><h1>Models &amp; Runtime</h1><p>Local model catalogue and runtime control</p></div>
+            <div style="display:flex;gap:8px;">
+              <span id="desktopBackendIndicator" class="pill pill-neutral">backend: unknown</span>
+              <button class="btn btn-secondary btn-sm" id="resumeAppBackendBtn">↻ Resume Backend</button>
+              <button class="btn btn-danger btn-sm" id="stopAppBackendBtn">■ Stop Backend</button>
+              <button class="btn btn-secondary btn-sm" id="startRuntimeBtn">▶ Start</button>
+              <button class="btn btn-danger btn-sm" id="stopRuntimeBtn">■ Stop</button>
             </div>
           </div>
-          <form id="messageForm" class="compose-form">
-            <textarea
-              id="messageInput"
-              placeholder="Talk to Prime or Local. Ask for implementation, review, diagnosis, or coordination help."
-              rows="6"
-            ></textarea>
-            <div class="compose-row">
-              <select id="recipientSelect">
-                <option value="prime">Prime</option>
-                <option value="local">Local</option>
-              </select>
-              <button class="button button-primary" type="submit">Send Message</button>
-            </div>
-          </form>
-          <div id="laneCounts" class="badge-row"></div>
-          <div class="subsection">
-            <h3>Recent Principal Messages</h3>
-            <div id="principalInbox" class="list-stack"></div>
-          </div>
-          <div class="subsection">
-            <div class="panel-header compact">
-              <div>
-                <h3>Lane Transcript</h3>
-              </div>
-              <div class="panel-actions">
-                <button id="showPrimeTranscriptButton" class="button button-ghost" type="button">Prime</button>
-                <button id="showLocalTranscriptButton" class="button button-ghost" type="button">Local</button>
+          <div id="runtimeStatus"></div>
+          <div class="panel" style="margin-top:8px;">
+            <div class="panel-header">
+              <div class="panel-title">Connect ChatGPT</div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <button class="btn btn-ghost btn-sm" id="linkDesktopBtn">Link This Desktop</button>
+                <button class="btn btn-secondary btn-sm" id="generatePairingBtn">Create OAuth Link</button>
               </div>
             </div>
-            <div id="laneTranscript" class="list-stack"></div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px;">
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Astrata account email
+                <input id="accountEmailInput" type="email" placeholder="you@example.com" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Display name
+                <input id="accountDisplayNameInput" type="text" placeholder="Optional" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Device label
+                <input id="accountDeviceLabelInput" type="text" placeholder="This Desktop" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Relay host
+                <input id="relayEndpointInput" type="url" placeholder="https://relay.example.com" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+            </div>
+            <div style="display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;margin-bottom:12px;align-items:end;">
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                Invite code
+                <input id="accountInviteCodeInput" type="text" placeholder="ASTRATA-INVITE-..." style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+              <button class="btn btn-ghost btn-sm" id="redeemInviteBtn">Redeem Invite</button>
+            </div>
+            <div style="display:grid;grid-template-columns:minmax(220px,1fr);gap:10px;margin-bottom:12px;align-items:end;">
+              <label style="display:grid;gap:6px;font-size:12px;color:var(--text-dim);">
+                ChatGPT OAuth callback URL
+                <input id="connectorCallbackInput" type="url" placeholder="https://chat.openai.com/aip/g-.../oauth/callback" style="font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);">
+              </label>
+            </div>
+            <div id="connectorStatus"></div>
           </div>
-          <div class="subsection">
-            <h3>Prime Lane</h3>
-            <div id="primeInbox" class="list-stack"></div>
+          <div class="panel" style="margin-top:8px;">
+            <div class="panel-title">Discovered Models</div>
+            <div class="model-grid" id="modelGrid"></div>
           </div>
-          <div class="subsection">
-            <h3>Local Lane</h3>
-            <div id="localInbox" class="list-stack"></div>
-          </div>
-        </section>
+        </div>
 
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Queue</p>
-              <h2>Governed work</h2>
-            </div>
+        <!-- Settings View -->
+        <div class="view-container" id="viewSettings" hidden>
+          <div class="view-header">
+            <div><h1>Settings</h1><p>Inference routing, provider registry, and orchestrator controls</p></div>
+            <span class="saving-indicator" id="savingIndicator" hidden>SAVING…</span>
           </div>
-          <div id="queueCounts" class="badge-row"></div>
-          <div id="taskList" class="list-stack"></div>
-        </section>
+          <div id="settingsContent"></div>
+        </div>
 
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Attempts</p>
-              <h2>Execution history</h2>
-            </div>
-          </div>
-          <div id="attemptCounts" class="badge-row"></div>
-          <div id="attemptList" class="list-stack"></div>
-        </section>
-      </section>
+        <!-- Health View -->
+        <div class="view-container" id="viewStartup" hidden>
+          <div class="view-header"><div><h1>Health</h1><p>Pre-flight checks and system self-reflection</p></div></div>
+          <div id="startupContent"></div>
+        </div>
 
-      <section class="bottom-grid">
-        <section class="panel">
-          <div class="panel-header">
+        <!-- Task Detail Overlay -->
+        <div class="view-container" id="viewTaskDetail" hidden>
+          <div class="view-header">
             <div>
-              <p class="panel-kicker">System Work</p>
-              <h2>Internal inbox and governed tasks</h2>
+              <h1 id="taskDetailTitle">Task Detail</h1>
+              <p id="taskDetailDesc"></p>
             </div>
+            <button class="btn btn-ghost btn-sm" id="backFromDetail">← Back</button>
           </div>
-          <div id="astrataInbox" class="list-stack"></div>
-        </section>
+          <div id="taskDetailContent"></div>
+        </div>
 
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Artifacts</p>
-              <h2>What the system is leaving behind</h2>
-            </div>
-          </div>
-          <div id="artifactList" class="list-stack"></div>
-        </section>
-      </section>
+      </main>
 
-      <section class="bottom-grid">
-        <section class="panel panel-detail">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Task Detail</p>
-              <h2>Trace one unit of work</h2>
-            </div>
+      <div class="desktop-overlay" id="desktopBackendOverlay" hidden>
+        <div class="desktop-overlay-panel">
+          <div class="desktop-overlay-kicker">Desktop Backend</div>
+          <h2 id="desktopBackendOverlayTitle">Backend stopped</h2>
+          <p id="desktopBackendOverlayBody">Astrata's desktop backend is offline.</p>
+          <div class="desktop-overlay-actions">
+            <button class="btn btn-secondary btn-sm" id="desktopOverlayResumeBtn">↻ Resume Backend</button>
+            <button class="btn btn-ghost btn-sm" id="desktopOverlayDismissBtn">Dismiss</button>
           </div>
-          <div id="taskDetailEmpty" class="list-item">Select a task to inspect its attempts, artifacts, and related messages.</div>
-          <div id="taskDetail" class="detail-shell" hidden>
-            <div id="taskDetailSummary" class="detail-summary"></div>
-            <section class="subsection">
-              <h3>Blockers</h3>
-              <div id="taskDetailBlockers" class="list-stack"></div>
-            </section>
-            <div class="detail-grid">
-              <section class="subsection">
-                <h3>Attempts</h3>
-                <div id="taskDetailAttempts" class="list-stack"></div>
-              </section>
-              <section class="subsection">
-                <h3>Artifacts</h3>
-                <div id="taskDetailArtifacts" class="list-stack"></div>
-              </section>
-            </div>
-            <div class="detail-grid">
-              <section class="subsection">
-                <h3>Messages</h3>
-                <div id="taskDetailMessages" class="list-stack"></div>
-              </section>
-              <section class="subsection">
-                <h3>Verifications</h3>
-                <div id="taskDetailVerifications" class="list-stack"></div>
-              </section>
-            </div>
-            <div class="detail-grid">
-              <section class="subsection">
-                <h3>Child Tasks</h3>
-                <div id="taskDetailChildren" class="list-stack"></div>
-              </section>
-              <section class="subsection">
-                <h3>Related Work</h3>
-                <div id="taskDetailRelated" class="list-stack"></div>
-              </section>
-            </div>
+        </div>
+      </div>
+
+      <!-- ══ COL 4: TASK RAIL (320px, chat-only) ══════════════════ -->
+      <aside class="task-rail" id="taskRail" hidden>
+        <div class="task-rail-header">
+          <span class="task-rail-title">Active Tasks</span>
+          <button class="btn btn-ghost btn-sm" id="taskRailRefreshBtn" style="padding:3px 8px;font-size:11px;">↻</button>
+        </div>
+        <div class="task-rail-body" id="taskRailBody"></div>
+        <div class="task-rail-footer" id="taskRailFooter">
+          <div style="font-size:9px;font-weight:800;letter-spacing:0.12em;color:var(--text-dim);text-transform:uppercase;margin-bottom:2px;">Telemetry</div>
+          <div class="task-rail-tel-row">
+            <span>running</span><span class="task-rail-tel-val" id="trt-running">—</span>
           </div>
-        </section>
-      </section>
-    </main>
+          <div class="task-rail-tel-row">
+            <span>queued</span><span class="task-rail-tel-val" id="trt-queued">—</span>
+          </div>
+          <div class="task-rail-tel-row">
+            <span>blocked</span><span class="task-rail-tel-val" id="trt-blocked">—</span>
+          </div>
+          <div class="task-rail-tel-row">
+            <span>completed</span><span class="task-rail-tel-val" id="trt-complete">—</span>
+          </div>
+        </div>
+      </aside>
+
+    </div><!-- /.app-shell -->
     <script src="/static/app.js" defer></script>
   </body>
-  </html>
+</html>

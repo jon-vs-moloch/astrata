@@ -13,7 +13,8 @@ from astrata.config.settings import Settings
 from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.local.strata_endpoint import StrataEndpointService
-from astrata.providers.base import CompletionRequest, Message
+from astrata.memory import build_memory_augmented_request, default_memory_store_path
+from astrata.providers.base import Message
 from astrata.providers.registry import ProviderRegistry, build_default_registry
 from astrata.records.communications import CommunicationRecord
 from astrata.routing.advisor import RoutePerformanceAdvisor
@@ -168,7 +169,7 @@ class LaneRuntime:
                 unavailable_reason="missing_provider",
                 security_level=self._message_security_level(message),
             )
-        request = CompletionRequest(
+        request = build_memory_augmented_request(
             messages=[
                 Message(
                     role="system",
@@ -187,8 +188,16 @@ class LaneRuntime:
                 "conversation_id": conversation_id,
                 "task_class": "general",
             },
+            memory_store_path=default_memory_store_path(data_dir=self.settings.paths.data_dir),
+            memory_query=str(message.payload.get("message") or ""),
+            accessor="local",
+            destination="remote",
         )
         try:
+            try:
+                setattr(provider, "last_request", request)
+            except Exception:
+                pass
             response = provider.complete(request)
         except Exception as exc:
             return self._handle_prime_unavailable(

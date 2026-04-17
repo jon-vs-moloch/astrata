@@ -8,7 +8,7 @@ architecture.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Literal, Optional, Protocol, Union
+from typing import Any, Dict, List, Literal, Optional, Protocol
 from uuid import uuid4
 
 import pydantic

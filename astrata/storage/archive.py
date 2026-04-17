@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -157,7 +156,6 @@ class RuntimeStateArchiver:
                     "metadata": {"archived_count": archived_artifact_count},
                 }
         hot_task_ids = {str(item.get("task_id") or "") for item in hot_tasks}
-        hot_attempt_ids = {str(item.get("attempt_id") or "") for item in hot_attempts}
 
         for task in hot_tasks:
             hot._upsert("tasks", "task_id", str(task.get("task_id")), task)

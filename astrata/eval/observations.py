@@ -27,6 +27,48 @@ class EvalObservation(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ObservationSignal(BaseModel):
+    signal_id: str
+    signal_kind: str = "observation"
+    subject_kind: str
+    subject_id: str
+    summary: str
+    status: str = "open"
+    severity: str = "medium"
+    confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    evidence: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+def select_signal_followup_policy(*, signal: ObservationSignal) -> dict[str, Any]:
+    if signal.status != "open":
+        return {
+            "mode": "none",
+            "reason": "Closed observation signals do not need follow-up work.",
+            "followup_specs": [],
+        }
+    severity = str(signal.severity or "medium").strip().lower()
+    priority = 7 if severity in {"high", "critical"} else 5
+    urgency = 4 if severity in {"high", "critical"} else 2
+    return {
+        "mode": "targeted",
+        "reason": "Open observation signals should cash out into bounded alignment maintenance.",
+        "followup_specs": [
+            {
+                "title": f"Resolve {signal.signal_kind}: {signal.subject_id}",
+                "description": signal.summary,
+                "priority": priority,
+                "urgency": urgency,
+                "risk": "moderate" if severity in {"high", "critical"} else "low",
+                "completion_type": "review_or_audit",
+                "success_criteria": {"observation_signal_resolved": True},
+                "task_id_hint": f"signal-followup-{signal.subject_kind}-{signal.subject_id}",
+                "route_preferences": {"preferred_cli_tools": ["kilocode", "gemini-cli"]},
+            }
+        ],
+    }
+
+
 class EvalObservationStore:
     def __init__(self, *, state_path: Path) -> None:
         self.state_path = state_path

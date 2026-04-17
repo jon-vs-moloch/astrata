@@ -329,15 +329,15 @@ class StrataEndpointService:
         if current is not None and current.endpoint and health is not None and health.ok:
             return current.endpoint.removesuffix("/health")
 
-        existing_endpoint = f"http://127.0.0.1:{self._runtime_port()}/health"
+        existing_endpoint = f"http://127.0.0.1:{self._runtime_port(runtime_key)}/health"
         existing_backend = self._runtime.backend("llama_cpp")
         if existing_backend is not None:
             direct_health = existing_backend.healthcheck(
-                config={"host": "127.0.0.1", "port": self._runtime_port()}
+                config={"host": "127.0.0.1", "port": self._runtime_port(runtime_key)}
             )
             if direct_health.ok:
                 self._runtime.select_runtime(
-                    runtime_key="default",
+                    runtime_key=runtime_key,
                     backend_id="llama_cpp",
                     model_id=model_id,
                     mode="external",

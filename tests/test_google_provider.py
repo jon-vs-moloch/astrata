@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from astrata.config.secrets import SecretStore
-from astrata.providers.google_ai_studio import GoogleAiStudioProvider
+from astrata.providers.google_ai_studio import GoogleAiStudioProvider, recommended_google_model
 
 
 def test_secret_store_round_trips_provider_secret():
@@ -67,3 +67,38 @@ def test_google_provider_returns_observed_cooldown_window_for_active_model():
         assert len(windows) == 1
         assert windows[0]["requests_remaining"] == 0
         assert windows[0]["source"] == "google_http_429"
+
+
+def test_google_provider_prefers_cached_gemini_3_and_gemma_order():
+    models = [
+        {"model_id": "gemini-2.5-pro"},
+        {"model_id": "gemini-3-flash-preview"},
+        {"model_id": "gemma-4-31b-it"},
+        {"model_id": "gemini-3-pro-preview"},
+    ]
+
+    assert recommended_google_model(models) == "gemini-3-pro-preview"
+
+
+def test_google_provider_default_model_uses_cached_preference_without_explicit_override():
+    with TemporaryDirectory() as tmp:
+        catalog_path = Path(tmp) / "google_models.json"
+        quota_path = Path(tmp) / "google_quota_state.json"
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {"model_id": "gemini-2.5-pro"},
+                        {"model_id": "gemma-4-26b-a4b-it"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provider = GoogleAiStudioProvider(
+            api_key="demo-key",
+            catalog_path=catalog_path,
+            quota_state_path=quota_path,
+        )
+
+        assert provider.default_model() == "gemma-4-26b-a4b-it"

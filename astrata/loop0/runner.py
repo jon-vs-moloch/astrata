@@ -19,7 +19,12 @@ from astrata.controllers.base import ControllerEnvelope
 from astrata.controllers.coordinator import CoordinatorController
 from astrata.controllers.local_executor import LocalExecutorController
 from astrata.governance.documents import GovernanceBundle, load_governance_bundle
-from astrata.eval.observations import EvalObservation, EvalObservationStore
+from astrata.eval.observations import (
+    EvalObservation,
+    EvalObservationStore,
+    ObservationSignal,
+    select_signal_followup_policy,
+)
 from astrata.governance.policy import (
     GovernanceDriftMonitor,
     governance_change_is_authorized,
@@ -46,6 +51,7 @@ from astrata.scheduling.prioritizer import WorkPrioritizer
 from astrata.scheduling.quota import QuotaPolicy, default_source_limits
 from astrata.scheduling.work_pool import ScheduledWorkItem
 from astrata.storage.db import AstrataDatabase
+from astrata.storage.hygiene import reconcile_running_attempts
 from astrata.verification.basic import (
     VerificationResult,
     inspect_expected_paths,
@@ -641,6 +647,7 @@ class Loop0Runner:
 
     def _reconcile_pending_tasks(self) -> list[TaskRecord]:
         reconciled: list[TaskRecord] = []
+        reconcile_running_attempts(self.db)
         reconciled.extend(self._reconcile_worker_results())
         reconciled.extend(self._supervise_worker_tasks())
         for task_payload in self.db.iter_records("tasks"):
@@ -1651,7 +1658,6 @@ class Loop0Runner:
             if not policy.get("batchable"):
                 passthrough.append(candidate)
                 continue
-            provenance = dict(metadata.get("provenance") or {})
             lane_sender, _conversation_id = self._message_task_lane_context(metadata)
             batch_key = (
                 lane_sender,

@@ -2,180 +2,144 @@
 
 ## Purpose
 
-This manual exists to make Astrata legible to:
+This manual is the plain-language operator map for the current repo.
 
-- the operator
-- Prime
-- durable assistants working within their disclosure tier
+It is meant to answer:
 
-The goal is not exhaustive prose. The goal is to make the system easy to understand, operate, and improve.
+- what Astrata is right now
+- which surfaces are real
+- how to inspect its state
+- what we should trust versus treat as scaffold
 
-For the current release path, see `docs/ROAD_TO_V0.md`.
-For the hosted account/auth direction, see `docs/WEB_AUTH_CONTROL_PLANE.md`.
-For the concrete implementation sequence, see `docs/ACCOUNT_AUTH_IMPLEMENTATION_PLAN.md`.
+For the v0 sequence, see [ROAD_TO_V0.md](/Users/jon/Projects/Astrata/docs/ROAD_TO_V0.md).
 
 ## System Shape
 
-Astrata is not a chatbot.
-Astrata is a local-first operating environment for AI-mediated computing.
+Astrata is a local-first operating environment for AI-mediated work.
 
-Core layers:
+The current repo has six important layers:
 
-- `Procedures`: reusable named ways of doing work
-- `Tools`: bounded actions that procedures and agents can invoke
-- `Durable agents`: Prime, reception, local, and future staff
-- `Memory`: the durable encyclopedia / knowledge substrate
-- `Inference`: cloud, CLI, and local lanes
-- `Runtime`: local model execution, thermal control, process management
-- `Bridges`: MCP and future constellation-facing boundaries
-- `UI / Web presence`: operator surfaces and public metadata surfaces
+- procedures and bounded execution paths
+- cloud and CLI provider routing
+- local runtime management
+- account and hosted-relay scaffolding
+- memory and connector-safe projection logic
+- UI and Loop 0 observability surfaces
 
-## Loops
+## What Is Real Today
 
-Astrata is being built toward three loops:
+Working or restored enough to build on:
 
-- `L0`: bounded self-improvement inside the repo and runtime
-- `L1`: durable autonomous operation with reliable local/cloud execution lanes
-- `L2`: constellation-grade multi-node coordination
+- local UI snapshot and message flow
+- managed local runtime start/stop/status
+- Loop 0 runner and observability path
+- Google AI Studio model sync/list/default support
+- KiloCode model registry sync/list support
+- account, invite, pairing, and OAuth-shaped local control plane
+- hosted relay profile/device-link authorization scaffolding
+- richer memory model with disclosure-aware projection
 
-Current priority is closing `L0` cleanly, then making `L1` reliable enough that the system can keep improving without constant rescue.
+## What Is Still Scaffold
 
-## Prime Operating Heuristic
+Not yet a final product surface:
 
-When choosing the next change:
+- hosted production login UX
+- durable hosted queueing
+- full remote connection management UI
+- signed/notarized release distribution
+- mature always-on desktop supervision UX
 
-1. Prefer fixes that unblock durable operation over cosmetic improvements.
-2. Prefer work that can be expressed as a Procedure or Tool over one-off behavior.
-3. Prefer changes that make the system more legible to itself.
-4. Prefer fixes that remove repeated operator intervention.
+## Core CLI Surfaces
 
-## Core Procedures
+High-signal commands that exist today:
 
-Important current procedures include:
+```bash
+astrata doctor
+astrata loop0-next
+astrata loop0-run --steps 1
+astrata local-runtime-start --model-id <model> --profile quiet
+astrata local-runtime-stop
+astrata local-runtime-status
+astrata google-models-sync
+astrata google-models-list
+astrata google-set-default-model <model>
+astrata kilocode-models-sync
+astrata kilocode-models-list
+astrata account-status
+astrata account-issue-invite --label "friendly tester"
+astrata account-redeem-invite --email you@example.com --invite-code <code>
+astrata account-pair-device --email you@example.com --relay-endpoint https://<relay-host>/mcp
+astrata account-register-oauth-client --label ChatGPT --redirect-uri <callback-url>
+astrata account-issue-oauth-code --client-id <client-id> --email you@example.com --redirect-uri <callback-url>
+astrata account-exchange-oauth-code --client-id <client-id> --code <code> --redirect-uri <callback-url>
+astrata routines-list
+astrata routine-run refresh-inference-registries
+```
+
+## Procedure Shape
+
+Important procedures currently defined in code:
 
 - `system-onboarding`
+- `loop0-bounded-file-generation`
 - `message-task-bounded-file-generation`
 - `task-decomposition`
 - `publish-to-internet`
 - `ensure-local-lane`
 
-Rule of thumb:
-If a behavior recurs, it should become a Procedure.
-
-## Core Tools
-
-Important current operator/runtime tools include:
-
-- `onboarding-status`
-- `onboarding-recommended-settings`
-- `local-runtime-ensure`
-- `local-runtime-start`
-- `local-runtime-status`
-- `voice-status`
-- `voice-preload-defaults`
-- `voice-install-asset`
-- `mcp-server`
-- `web-presence-server`
-- `supervisor-status`
-- `supervisor-reconcile`
-- `supervisor-stop`
+These live in [registry.py](/Users/jon/Projects/Astrata/astrata/procedures/registry.py).
 
 Rule of thumb:
-If an action is bounded and directly invocable, it should become a Tool surface.
-
-## Local Lane
-
-The local lane matters because it is the minimum autonomy floor.
-
-Current expectations:
-
-- stale managed-process state should self-clear
-- thermal cooldown should not latch forever after nominal conditions return
-- the operator and Prime should have an idempotent way to bring the lane up
-
-Primary tool:
-
-- `astrata local-runtime-ensure`
-
-If the local lane is unhealthy, restoring it is usually higher leverage than adding another feature.
-
-## Memory And Disclosure
-
-Astrata should remain legible without violating tiered disclosure.
-
-Guidelines:
-
-- public/operator docs may describe system structure freely
-- sensitive task content should not be exposed across tiers
-- manuals should explain the existence of boundaries even when a given reader cannot cross them
-- artifacts and status views should say what kind of thing happened even when full details are redacted
-
-## Registries
-
-Astrata should prefer observed registries over static assumptions.
-
-Current examples:
-
-- provider registry
-- local model catalog
-- voice asset registry with observed install size
-
-Rule of thumb:
-When Astrata learns a real operational fact, it should record it so the mistake is not repeated.
+if a behavior repeats, it should become a procedure or a routine.
 
 ## Operator Routine
 
-Recommended routine when advancing the system:
+When moving the system forward:
 
-1. Check `astrata doctor`
+1. Run `astrata doctor`
 2. Check `astrata loop0-next`
-3. Reconcile the always-on lane with `astrata supervisor-reconcile`
-4. Pick the highest-leverage bounded change
-5. Express the result as a Procedure/Tool when plausible
-6. Update the manual if the system shape changed
+3. Verify the local runtime is healthy
+4. Sync inference registries if provider/model surfaces changed
+5. Make one bounded improvement
+6. Re-run tests before trusting the result
 
-## Always-On Supervisor
+## Memory And Disclosure
 
-Astrata's v0 supervisor is the owner-of-last-resort for the pieces that make the system feel alive:
+Astrata's memory layer is no longer just a transcript cache.
+It is moving toward a permissioned encyclopedia with:
 
-- desktop UI backend
-- Loop0 daemon
-- hosted MCP relay watcher
-- local inference lane health/adoption
+- revisions
+- links
+- embeddings
+- disclosure tiers
+- projected views for remote consumers
 
-Primary tools:
+Remote-facing code should consume projected snippets, not raw records.
 
-- `astrata supervisor-status`
-- `astrata supervisor-reconcile`
-- `astrata supervisor-stop`
+## Relay And Remote Operation
 
-`supervisor-reconcile` should adopt matching live processes and healthy endpoints before it starts anything new. That is the guard against the failure mode where the desktop shell closes, the backend or local model process survives, and a later restart tries to bind the same port again.
+Current remote-operation rule:
 
-## Near-Term Bottlenecks
+`token -> account -> profile -> owned device link -> permitted tools`
 
-Current likely bottlenecks:
+That rule is already reflected in the local account and hosted-relay scaffolding. The missing piece is the hosted production web auth and queue layer around it.
 
-- reliable supervisor ownership across desktop, Loop0, relay, and local runtime surfaces
-- getting Loop0 to use the local lane automatically when healthy
-- making registries first-class inputs to planning and routing
-- strengthening the manual so Astrata can navigate its own architecture more efficiently
+## Practical Priorities
 
-## Remaining Work
+When in doubt, prefer work that:
 
-Current operator-visible remaining work:
+- removes operator rescue
+- strengthens local runtime reliability
+- preserves disclosure boundaries
+- turns repeated maintenance into procedure or routine form
+- keeps tests green while salvaging older work
 
-- make desktop/backend lifecycle fully deliberate:
-  close prompt, graceful backend stop, keep-alive on ordinary close, and explicit resume/recovery paths
-- make backend recovery work not only while the desktop shell is alive, but under the supervisor shape
-- make Loop0 use the durable comms/task path without stalling on avoidable runtime duplication
-- promote local runtime endpoint adoption from live reconciliation into fully persistent owned process state
-- define and build the hosted MCP relay for off-machine connector access
-- project memory, task status, and summaries into connector-safe `search` / `fetch` surfaces
-- enforce hosted disclosure tiers so remote connectors never bypass local-only or enclave-only boundaries
-- define metering, quotas, and operator telemetry for hosted bridge traffic
+## Current Bottlenecks
 
-If a remaining item is likely to recur or become a staff responsibility, it should be turned into:
+Most likely near-term bottlenecks:
 
-- a Procedure
-- a Tool
-- a durable task or bridge event
+- durable hosted relay queueing
+- hosted authorize/token endpoints
+- connection revocation/default-device controls
+- supervised desktop/runtime lifecycle
+- release/distribution hardening

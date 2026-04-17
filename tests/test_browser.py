@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import pytest
 
 from astrata.bootstrap import DependencyBootstrapService
 from astrata.browser.service import BrowserService, PlaywrightBrowserBackend

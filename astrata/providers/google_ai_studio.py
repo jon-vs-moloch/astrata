@@ -11,11 +11,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
+from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+GOOGLE_AI_STUDIO_MODEL_PREFERENCE = (
+    "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview",
+    "gemini-pro-latest",
+    "gemma-4-31b-it",
+    "gemma-4-26b-a4b-it",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+)
 
 
 class GoogleAiStudioProvider(Provider):
@@ -30,7 +41,7 @@ class GoogleAiStudioProvider(Provider):
     ) -> None:
         self._name = name
         self._api_key = str(api_key or os.environ.get("ASTRATA_GOOGLE_API_KEY") or "").strip() or None
-        self._default_model = str(default_model or os.environ.get("ASTRATA_GOOGLE_MODEL") or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+        self._explicit_default_model = str(default_model or os.environ.get("ASTRATA_GOOGLE_MODEL") or "").strip() or None
         self._chat_endpoint = str(
             os.environ.get("ASTRATA_GOOGLE_ENDPOINT")
             or "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -52,7 +63,9 @@ class GoogleAiStudioProvider(Provider):
         return self._api_key
 
     def default_model(self) -> str | None:
-        return self._default_model
+        if self._explicit_default_model:
+            return self._explicit_default_model
+        return recommended_google_model(self.cached_models())
 
     def describe(self) -> dict[str, Any]:
         cached = self.cached_models()
@@ -68,6 +81,7 @@ class GoogleAiStudioProvider(Provider):
         api_key = self.api_key()
         if not api_key:
             raise RuntimeError("Google AI Studio API key is not configured")
+        assert_projected_memory_request(request, provider_name=self.name)
         model = request.model or self.default_model()
         payload: dict[str, Any] = {
             "model": model,
@@ -127,6 +141,8 @@ class GoogleAiStudioProvider(Provider):
         catalog = {
             "last_synced_at": _now().isoformat(),
             "models": models,
+            "recommended_default_model": recommended_google_model(models),
+            "preference_order": list(GOOGLE_AI_STUDIO_MODEL_PREFERENCE),
         }
         self._catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
         return models
@@ -237,3 +253,15 @@ def _extract_openai_compatible_content(raw: dict[str, Any]) -> str:
                 chunks.append(str(item.get("text") or ""))
         return "".join(chunks)
     return str(content or "")
+
+
+def recommended_google_model(models: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> str:
+    available = {
+        str(model.get("model_id") or model.get("name") or "").split("/")[-1]
+        for model in models
+        if isinstance(model, dict)
+    }
+    for candidate in GOOGLE_AI_STUDIO_MODEL_PREFERENCE:
+        if candidate in available:
+            return candidate
+    return "gemini-2.5-flash"

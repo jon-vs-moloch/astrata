@@ -6,8 +6,10 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 import urllib.request
 
+from astrata.accounts import AccountControlPlaneRegistry
 from astrata.comms.intake import process_inbound_messages
 from astrata.comms.lanes import PrincipalMessageLane
 from astrata.comms.runtime import LaneRuntime
@@ -34,10 +36,16 @@ from astrata.local.runtime.client import LocalRuntimeClient
 from astrata.local.runtime.processes import ManagedProcessController
 from astrata.local.strata_endpoint import StrataEndpointService
 from astrata.loop0.runner import Loop0Runner
+from astrata.mcp.relay import HostedMCPRelayService
 from astrata.providers.registry import build_default_registry
+from astrata.providers.kilocode_registry import KiloCodeModelRegistry
+from astrata.records.models import ArtifactRecord
 from astrata.routing.policy import RouteChooser
+from astrata.routines import RoutineService
 from astrata.scheduling.quota import QuotaPolicy, default_source_limits
+from astrata.supervisor import AstrataSupervisor
 from astrata.storage.db import AstrataDatabase
+from astrata.storage.hygiene import reconcile_running_attempts
 from astrata.startup.diagnostics import (
     generate_python_preflight_report,
     load_runtime_report,
@@ -118,8 +126,10 @@ def _cmd_doctor() -> int:
             )
         )
     thermal_state = probe_thermal_state(preference=settings.local_runtime.thermal_preference)
-    thermal_controller = ThermalController(state_path=settings.paths.data_dir / "thermal_state.json")
-    thermal_decision = thermal_controller.evaluate(thermal_state)
+    thermal_controller = ThermalController(
+        state_path=settings.paths.data_dir / "thermal_state.json"
+    )
+    thermal_decision = thermal_controller.evaluate(thermal_state, bypass_hysteresis=True)
     local_recommendation = local_runtime.recommend(
         thermal_preference=settings.local_runtime.thermal_preference
     )
@@ -154,8 +164,12 @@ def _cmd_doctor() -> int:
                 for capabilities in local_runtime.list_backend_capabilities()
             ],
             "endpoint_profiles": {
-                "chat_completions": inference_planner.endpoint_profile("chat_completions").model_dump(mode="json"),
-                "agent_session": inference_planner.endpoint_profile("agent_session").model_dump(mode="json"),
+                "chat_completions": inference_planner.endpoint_profile(
+                    "chat_completions"
+                ).model_dump(mode="json"),
+                "agent_session": inference_planner.endpoint_profile("agent_session").model_dump(
+                    mode="json"
+                ),
             },
             "thermal_preference": settings.local_runtime.thermal_preference,
             "thermal_state": {
@@ -179,7 +193,10 @@ def _cmd_doctor() -> int:
             "search_paths": effective_search_paths(settings.local_runtime.model_search_paths),
             "install_dir": str(settings.local_runtime.model_install_dir),
             "discovered_paths": discovered_paths,
-            "models": [model.model_dump(mode="json") for model in local_runtime.model_registry().list_models()],
+            "models": [
+                model.model_dump(mode="json")
+                for model in local_runtime.model_registry().list_models()
+            ],
             "thermal_decision": {
                 "sample": thermal_decision.sample,
                 "latched": thermal_decision.latched,
@@ -189,18 +206,26 @@ def _cmd_doctor() -> int:
                 "reason": thermal_decision.reason,
             },
             "recommendation": {
-                "model": None if local_recommendation.model is None else local_recommendation.model.model_dump(mode="json"),
+                "model": None
+                if local_recommendation.model is None
+                else local_recommendation.model.model_dump(mode="json"),
                 "profile_id": local_recommendation.profile_id,
                 "reason": local_recommendation.reason,
             },
-            "selection": None if local_runtime.current_selection() is None else local_runtime.current_selection().model_dump(mode="json"),
-            "selections": [selection.model_dump(mode="json") for selection in local_runtime.list_selections()],
+            "selection": None
+            if local_runtime.current_selection() is None
+            else local_runtime.current_selection().model_dump(mode="json"),
+            "selections": [
+                selection.model_dump(mode="json") for selection in local_runtime.list_selections()
+            ],
             "strata_endpoint": {
                 "base_url": settings.local_runtime.strata_endpoint_base_url,
                 "health": strata_endpoint_health,
                 "native": native_strata.status(),
             },
-            "managed_process": None if local_runtime.managed_status() is None else {
+            "managed_process": None
+            if local_runtime.managed_status() is None
+            else {
                 "running": local_runtime.managed_status().running,
                 "pid": local_runtime.managed_status().pid,
                 "endpoint": local_runtime.managed_status().endpoint,
@@ -254,7 +279,9 @@ def _build_local_operation_tracker() -> tuple[OperationTracker, object]:
 
 def _build_local_telemetry_store() -> tuple[LocalModelTelemetryStore, object]:
     settings = load_settings()
-    store = LocalModelTelemetryStore(state_path=settings.paths.data_dir / "local_model_telemetry.json")
+    store = LocalModelTelemetryStore(
+        state_path=settings.paths.data_dir / "local_model_telemetry.json"
+    )
     return store, settings
 
 
@@ -302,7 +329,9 @@ def _cmd_local_runtime_start(model_id: str | None, profile_id: str | None) -> in
     manager.discover_models(search_paths=settings.local_runtime.model_search_paths)
     recommendation = manager.recommend(thermal_preference=settings.local_runtime.thermal_preference)
     thermal_state = probe_thermal_state(preference=settings.local_runtime.thermal_preference)
-    thermal_controller = ThermalController(state_path=settings.paths.data_dir / "thermal_state.json")
+    thermal_controller = ThermalController(
+        state_path=settings.paths.data_dir / "thermal_state.json"
+    )
     thermal_decision = thermal_controller.evaluate(thermal_state)
     model = manager.model_registry().get(model_id) if model_id else recommendation.model
     if model is None:
@@ -312,7 +341,9 @@ def _cmd_local_runtime_start(model_id: str | None, profile_id: str | None) -> in
                     "status": "no_model",
                     "message": "No local model is available to start.",
                     "recommendation": {
-                        "model": None if recommendation.model is None else recommendation.model.model_dump(mode="json"),
+                        "model": None
+                        if recommendation.model is None
+                        else recommendation.model.model_dump(mode="json"),
                         "profile_id": recommendation.profile_id,
                         "reason": recommendation.reason,
                     },
@@ -410,7 +441,9 @@ def _cmd_local_runtime_status() -> int:
     recommendation = manager.recommend(thermal_preference=settings.local_runtime.thermal_preference)
     status = manager.managed_status()
     thermal_state = probe_thermal_state(preference=settings.local_runtime.thermal_preference)
-    thermal_controller = ThermalController(state_path=settings.paths.data_dir / "thermal_state.json")
+    thermal_controller = ThermalController(
+        state_path=settings.paths.data_dir / "thermal_state.json"
+    )
     thermal_decision = thermal_controller.evaluate(thermal_state)
     print(
         json.dumps(
@@ -433,14 +466,22 @@ def _cmd_local_runtime_status() -> int:
                     "reason": thermal_decision.reason,
                 },
                 "recommendation": {
-                    "model": None if recommendation.model is None else recommendation.model.model_dump(mode="json"),
+                    "model": None
+                    if recommendation.model is None
+                    else recommendation.model.model_dump(mode="json"),
                     "profile_id": recommendation.profile_id,
                     "reason": recommendation.reason,
                 },
                 "models": [model.model_dump(mode="json") for model in models],
-                "selections": [selection.model_dump(mode="json") for selection in manager.list_selections()],
-                "operations": [record.model_dump(mode="json") for record in tracker.list_operations()[:10]],
-                "managed_process": None if status is None else {
+                "selections": [
+                    selection.model_dump(mode="json") for selection in manager.list_selections()
+                ],
+                "operations": [
+                    record.model_dump(mode="json") for record in tracker.list_operations()[:10]
+                ],
+                "managed_process": None
+                if status is None
+                else {
                     "running": status.running,
                     "pid": status.pid,
                     "endpoint": status.endpoint,
@@ -500,7 +541,9 @@ def _cmd_local_model_install(catalog_id: str | None, url: str | None) -> int:
     destination = destination_dir / filename
     op = tracker.start_operation(
         "local_model_install",
-        progress=OperationProgress(message=f"Downloading {filename} into Astrata-managed local model storage."),
+        progress=OperationProgress(
+            message=f"Downloading {filename} into Astrata-managed local model storage."
+        ),
     )
     try:
         _download_file(source_url, destination, tracker=tracker, operation_id=op.operation_id)
@@ -600,7 +643,10 @@ def _download_file(
 ) -> None:
     tmp_destination = destination.with_suffix(destination.suffix + ".part")
     request = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(request, timeout=300) as response, tmp_destination.open("wb") as handle:
+    with (
+        urllib.request.urlopen(request, timeout=300) as response,
+        tmp_destination.open("wb") as handle,
+    ):
         total_bytes = response.headers.get("Content-Length")
         total = None
         if total_bytes:
@@ -628,7 +674,9 @@ def _download_file(
     tmp_destination.replace(destination)
 
 
-def _cmd_local_model_observe(path: str, task_class: str, score: float, success: bool, source: str, note: str | None) -> int:
+def _cmd_local_model_observe(
+    path: str, task_class: str, score: float, success: bool, source: str, note: str | None
+) -> int:
     telemetry, _settings = _build_local_telemetry_store()
     observation = telemetry.record_observation(
         model_path=path,
@@ -659,15 +707,24 @@ def _cmd_local_model_rank(task_class: str) -> int:
     manager.discover_models(search_paths=settings.local_runtime.model_search_paths)
     models = _enrich_local_models_with_telemetry(manager, telemetry)
     recommendation = manager.recommend(thermal_preference=settings.local_runtime.thermal_preference)
-    evaluation = summarize_local_model_evals(telemetry=telemetry, task_class=task_class, ratings=ratings)
-    empiric_winner_path = evaluation.decision.winner_variant_id or evaluation.rating_leader_variant_id
+    evaluation = summarize_local_model_evals(
+        telemetry=telemetry, task_class=task_class, ratings=ratings
+    )
+    empiric_winner_path = (
+        evaluation.decision.winner_variant_id or evaluation.rating_leader_variant_id
+    )
     eval_domain = build_eval_domain(
         subject_kind="local_model",
         task_class=task_class,
         mutation_surface="model_profile",
         environment="local_runtime",
     )
-    domain_bucket = ((evaluation.rating_snapshot or {}).get("ratings", {}).get("by_domain", {}).get(eval_domain.rating_domain, {}))
+    domain_bucket = (
+        (evaluation.rating_snapshot or {})
+        .get("ratings", {})
+        .get("by_domain", {})
+        .get(eval_domain.rating_domain, {})
+    )
     effective = recommendation.model
     if empiric_winner_path:
         for model in models:
@@ -691,8 +748,10 @@ def _cmd_local_model_rank(task_class: str) -> int:
                 "domain_rating": (domain_bucket.get(model.path) or {}).get("rating"),
                 "domain_matches": (domain_bucket.get(model.path) or {}).get("matches"),
                 "empirical_winner": empiric_winner_path == model.path,
-                "recommended": recommendation.model is not None and model.model_id == recommendation.model.model_id,
-                "effective_recommended": effective is not None and model.model_id == effective.model_id,
+                "recommended": recommendation.model is not None
+                and model.model_id == recommendation.model.model_id,
+                "effective_recommended": effective is not None
+                and model.model_id == effective.model_id,
             }
         )
     print(
@@ -700,8 +759,12 @@ def _cmd_local_model_rank(task_class: str) -> int:
             {
                 "thermal_preference": settings.local_runtime.thermal_preference,
                 "task_class": task_class,
-                "recommended_model_id": None if recommendation.model is None else recommendation.model.model_id,
-                "recommended_display_name": None if recommendation.model is None else recommendation.model.display_name,
+                "recommended_model_id": None
+                if recommendation.model is None
+                else recommendation.model.model_id,
+                "recommended_display_name": None
+                if recommendation.model is None
+                else recommendation.model.display_name,
                 "effective_model_id": None if effective is None else effective.model_id,
                 "effective_display_name": None if effective is None else effective.display_name,
                 "evaluation": {
@@ -709,7 +772,9 @@ def _cmd_local_model_rank(task_class: str) -> int:
                     "rating_leader_variant_id": evaluation.rating_leader_variant_id,
                     "margin": evaluation.decision.margin,
                     "rationale": evaluation.decision.rationale,
-                    "summaries": [summary.model_dump(mode="json") for summary in evaluation.summaries],
+                    "summaries": [
+                        summary.model_dump(mode="json") for summary in evaluation.summaries
+                    ],
                 },
                 "ranked_models": ranked,
             },
@@ -719,7 +784,9 @@ def _cmd_local_model_rank(task_class: str) -> int:
     return 0
 
 
-def _cmd_local_model_matchup(left_path: str, right_path: str, task_class: str, left_score: float, note: str | None) -> int:
+def _cmd_local_model_matchup(
+    left_path: str, right_path: str, task_class: str, left_score: float, note: str | None
+) -> int:
     ratings, _settings = _build_local_rating_store()
     eval_domain = build_eval_domain(
         subject_kind="local_model",
@@ -749,7 +816,9 @@ def _cmd_local_model_eval_pair(
 ) -> int:
     settings = load_settings()
     thermal_state = probe_thermal_state(preference=settings.local_runtime.thermal_preference)
-    thermal_controller = ThermalController(state_path=settings.paths.data_dir / "thermal_state.json")
+    thermal_controller = ThermalController(
+        state_path=settings.paths.data_dir / "thermal_state.json"
+    )
     thermal_decision = thermal_controller.evaluate(thermal_state)
     if not allow_thermal_override and not thermal_decision.should_start_new_local_work:
         print(
@@ -789,7 +858,9 @@ def _cmd_local_model_eval_pair(
         raise RuntimeError("LM Studio CLI is not available.")
     op = tracker.start_operation(
         "local_model_eval_pair",
-        progress=OperationProgress(message=f"Evaluating {left_model} vs {right_model} for {task_class}."),
+        progress=OperationProgress(
+            message=f"Evaluating {left_model} vs {right_model} for {task_class}."
+        ),
     )
     arena = LocalModelArena(lmstudio=lmstudio, telemetry=telemetry, ratings=ratings)
     try:
@@ -854,7 +925,12 @@ def _cmd_loop0_next() -> int:
     runner = Loop0Runner(settings=settings, db=db)
     candidate = runner.next_candidate()
     if candidate is None:
-        print(json.dumps({"status": "complete", "message": "No missing Loop 0 candidate paths found."}, indent=2))
+        print(
+            json.dumps(
+                {"status": "complete", "message": "No missing Loop 0 candidate paths found."},
+                indent=2,
+            )
+        )
         return 0
     print(json.dumps(candidate.__dict__, indent=2))
     return 0
@@ -885,6 +961,131 @@ def _cmd_google_set_default_model(model: str) -> int:
     secrets.set_provider_secret("google", "default_model", model)
     print(json.dumps({"status": "stored", "provider": "google", "default_model": model}, indent=2))
     return 0
+
+
+def _cmd_kilocode_sync_models() -> int:
+    settings = load_settings()
+    registry = KiloCodeModelRegistry(state_path=settings.paths.data_dir / "kilocode_models.json")
+    payload = registry.sync()
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _cmd_kilocode_list_models() -> int:
+    settings = load_settings()
+    registry = KiloCodeModelRegistry(state_path=settings.paths.data_dir / "kilocode_models.json")
+    payload = registry.cached()
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _account_registry() -> AccountControlPlaneRegistry:
+    settings = load_settings()
+    return AccountControlPlaneRegistry.from_settings(settings)
+
+
+def _cmd_account_status() -> int:
+    registry = _account_registry()
+    print(
+        json.dumps(
+            {
+                "summary": registry.summary(),
+                "access_policy": registry.access_policy(),
+                "schema_manifest": registry.schema_manifest(),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_account_issue_invite(label: str) -> int:
+    result = _account_registry().issue_invite_code(label=label)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_account_redeem_invite(email: str, display_name: str, invite_code: str) -> int:
+    result = _account_registry().redeem_invite_code(
+        email=email,
+        display_name=display_name,
+        invite_code=invite_code,
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "ok" else 1
+
+
+def _cmd_account_pair_device(email: str, label: str, relay_endpoint: str) -> int:
+    result = _account_registry().pair_device_for_user(
+        email=email,
+        label=label,
+        relay_endpoint=relay_endpoint,
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "ok" else 1
+
+
+def _cmd_account_register_oauth_client(label: str, redirect_uri: list[str]) -> int:
+    result = _account_registry().register_oauth_client(
+        label=label,
+        redirect_uris=tuple(redirect_uri or ()),
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "ok" else 1
+
+
+def _cmd_account_issue_oauth_code(
+    *,
+    client_id: str,
+    email: str,
+    redirect_uri: str,
+    profile_id: str | None,
+    device_id: str | None,
+) -> int:
+    result = _account_registry().issue_oauth_authorization_code(
+        client_id=client_id,
+        email=email,
+        redirect_uri=redirect_uri,
+        profile_id=profile_id,
+        device_id=device_id,
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "ok" else 1
+
+
+def _cmd_account_exchange_oauth_code(*, client_id: str, code: str, redirect_uri: str) -> int:
+    result = _account_registry().exchange_oauth_authorization_code(
+        client_id=client_id,
+        code=code,
+        redirect_uri=redirect_uri,
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "ok" else 1
+
+
+def _cmd_routines_list() -> int:
+    settings = load_settings()
+    service = RoutineService.from_settings(settings)
+    routines = service.ensure_default_routines()
+    print(
+        json.dumps(
+            {
+                "count": len(routines),
+                "routines": [item.model_dump(mode="json") for item in routines],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_routine_run(routine_id: str) -> int:
+    settings = load_settings()
+    service = RoutineService.from_settings(settings)
+    service.ensure_default_routines()
+    result = service.run(routine_id)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") in {"succeeded", "skipped"} else 1
 
 
 def _cmd_provider_route_eval_pair(
@@ -975,7 +1176,14 @@ def _cmd_strata_endpoint_status() -> int:
     return 0
 
 
-def _cmd_strata_endpoint_chat(message: str, thread_id: str | None, model_id: str | None, allow_degraded_fallback: bool, mode: str | None, response_budget: str) -> int:
+def _cmd_strata_endpoint_chat(
+    message: str,
+    thread_id: str | None,
+    model_id: str | None,
+    allow_degraded_fallback: bool,
+    mode: str | None,
+    response_budget: str,
+) -> int:
     settings = load_settings()
     service = StrataEndpointService.from_settings(settings)
     reply = service.chat(
@@ -1030,6 +1238,7 @@ def _cmd_loop0_run(steps: int) -> int:
     settings = load_settings()
     db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
     db.initialize()
+    hygiene = reconcile_running_attempts(db)
     lane_runtime = LaneRuntime(settings=settings, db=db)
     lane_turns = lane_runtime.process_pending_turns(lane="prime", limit=5)
     lane_turns.extend(lane_runtime.process_pending_turns(lane="local", limit=5))
@@ -1041,11 +1250,158 @@ def _cmd_loop0_run(steps: int) -> int:
     )
     runner = Loop0Runner(settings=settings, db=db)
     result = runner.run_steps(steps)
-    print(json.dumps({"inbox": inbox_results, "lane_turns": lane_turns, "loop0": result}, indent=2))
+    print(
+        json.dumps(
+            {
+                "runtime_hygiene": hygiene,
+                "inbox": inbox_results,
+                "lane_turns": lane_turns,
+                "loop0": result,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
-def _cmd_comms_send(recipient: str, intent: str, message: str, kind: str, conversation_id: str) -> int:
+def _cmd_loop0_daemon(*, steps: int, interval_seconds: int) -> int:
+    settings = load_settings()
+    db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+    db.initialize()
+    interval = max(5, int(interval_seconds))
+    while True:
+        started_at = time.time()
+        status = "ok"
+        payload: dict[str, object]
+        try:
+            hygiene = reconcile_running_attempts(db)
+            lane_runtime = LaneRuntime(settings=settings, db=db)
+            lane_turns = lane_runtime.process_pending_turns(lane="prime", limit=5)
+            lane_turns.extend(lane_runtime.process_pending_turns(lane="local", limit=5))
+            inbox_results = process_inbound_messages(
+                db=db,
+                project_root=settings.paths.project_root,
+                recipient="astrata",
+                limit=5,
+            )
+            runner = Loop0Runner(settings=settings, db=db)
+            loop0_result = runner.run_steps(max(1, steps))
+            payload = {
+                "runtime_hygiene": hygiene,
+                "lane_turns": len(lane_turns),
+                "inbox_results": len(inbox_results),
+                "loop0_status": loop0_result.get("status"),
+                "interval_seconds": interval,
+            }
+        except Exception as exc:  # pragma: no cover - exercised by live daemon behavior.
+            status = "failed"
+            payload = {"error": str(exc), "interval_seconds": interval}
+        heartbeat = ArtifactRecord(
+            artifact_type="loop0_daemon_heartbeat",
+            title="Loop 0 daemon heartbeat",
+            description="Latest heartbeat from the always-on Loop 0 daemon.",
+            content_summary=json.dumps(payload, indent=2),
+            status="good" if status == "ok" else "broken",
+            provenance={"status": status, "source": "loop0_daemon"},
+        )
+        db.upsert_artifact(heartbeat)
+        elapsed = time.time() - started_at
+        time.sleep(max(1.0, interval - elapsed))
+
+
+def _selected_relay_profile_id(settings, profile_id: str | None) -> str | None:
+    if profile_id:
+        return profile_id
+    relay = HostedMCPRelayService.from_settings(settings)
+    profile = next(iter(relay.list_profiles()), None)
+    return None if profile is None else profile.profile_id
+
+
+def _cmd_supervisor_status(ui_host: str, ui_port: int, relay_profile_id: str | None) -> int:
+    settings = load_settings()
+    selected_profile_id = _selected_relay_profile_id(settings, relay_profile_id)
+    result = AstrataSupervisor(
+        settings=settings,
+        ui_host=ui_host,
+        ui_port=ui_port,
+        relay_profile_id=selected_profile_id,
+    ).status()
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_supervisor_reconcile(ui_host: str, ui_port: int, relay_profile_id: str | None) -> int:
+    settings = load_settings()
+    selected_profile_id = _selected_relay_profile_id(settings, relay_profile_id)
+    result = AstrataSupervisor(
+        settings=settings,
+        ui_host=ui_host,
+        ui_port=ui_port,
+        relay_profile_id=selected_profile_id,
+    ).reconcile()
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_supervisor_stop(ui_host: str, ui_port: int, include_adopted: bool) -> int:
+    settings = load_settings()
+    result = AstrataSupervisor(settings=settings, ui_host=ui_host, ui_port=ui_port).stop(
+        include_adopted=include_adopted
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_mcp_relay_watch(
+    *,
+    profile_id: str,
+    link_id: str | None,
+    interval_seconds: float,
+) -> int:
+    settings = load_settings()
+    relay = HostedMCPRelayService.from_settings(settings)
+    interval = max(1.0, float(interval_seconds))
+    while True:
+        link = relay.local_link(profile_id)
+        device_id = None if link is None else link.device_id
+        link_token = None if link is None else link.link_token
+        heartbeat = relay.local_heartbeat(
+            profile_id=profile_id,
+            device_id=device_id,
+            link_token=link_token,
+            advertised_capabilities={"source": "astrata.mcp_relay_watch", "link_id": link_id},
+        )
+        pending = list(heartbeat.get("pending_requests") or [])
+        for request in pending:
+            request_id = str(request.get("request_id") or "")
+            if not request_id:
+                continue
+            relay.acknowledge_requests(
+                profile_id=profile_id,
+                request_ids=[request_id],
+                device_id=device_id,
+                link_token=link_token,
+            )
+            delivery = relay.queue_tool_call(
+                profile_id=profile_id,
+                tool_name=str(request.get("tool_name") or ""),
+                arguments=dict(request.get("arguments") or {}),
+                meta={"source_request_id": request_id, **dict(request.get("meta") or {})},
+            )
+            relay.record_result(
+                profile_id=profile_id,
+                request_id=request_id,
+                result={"delivery": delivery},
+                session_id=str(request.get("session_id") or ""),
+                device_id=device_id,
+                link_token=link_token,
+            )
+        time.sleep(interval)
+
+
+def _cmd_comms_send(
+    recipient: str, intent: str, message: str, kind: str, conversation_id: str
+) -> int:
     settings = load_settings()
     db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
     db.initialize()
@@ -1078,7 +1434,11 @@ def _cmd_comms_ack(communication_id: str) -> int:
     db.initialize()
     lane = PrincipalMessageLane(db=db)
     message = lane.acknowledge(communication_id)
-    payload = {"status": "not_found", "communication_id": communication_id} if message is None else message.model_dump(mode="json")
+    payload = (
+        {"status": "not_found", "communication_id": communication_id}
+        if message is None
+        else message.model_dump(mode="json")
+    )
     print(json.dumps(payload, indent=2))
     return 0
 
@@ -1103,87 +1463,316 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init-db", help="Initialize Astrata's durable record store.")
     sub.add_parser("doctor", help="Print project and governance status.")
     sub.add_parser("loop0-next", help="Show the next bounded Loop 0 implementation candidate.")
-    loop0_run = sub.add_parser("loop0-run", help="Run one or more Loop 0 planning/recording cycles.")
-    loop0_run.add_argument("--steps", type=int, default=1, help="Number of Loop 0 steps to attempt.")
+    loop0_run = sub.add_parser(
+        "loop0-run", help="Run one or more Loop 0 planning/recording cycles."
+    )
+    loop0_run.add_argument(
+        "--steps", type=int, default=1, help="Number of Loop 0 steps to attempt."
+    )
+    loop0_daemon = sub.add_parser(
+        "loop0-daemon", help="Run Loop 0 continuously as an always-on worker."
+    )
+    loop0_daemon.add_argument(
+        "--steps", type=int, default=1, help="Number of Loop 0 steps per daemon tick."
+    )
+    loop0_daemon.add_argument(
+        "--interval", type=int, default=120, help="Seconds between daemon ticks."
+    )
+    supervisor_status = sub.add_parser(
+        "supervisor-status", help="Inspect Astrata's supervised local services."
+    )
+    supervisor_status.add_argument("--ui-host", default="127.0.0.1", help="UI bind host.")
+    supervisor_status.add_argument("--ui-port", type=int, default=8891, help="UI bind port.")
+    supervisor_status.add_argument(
+        "--relay-profile-id", default=None, help="Optional hosted relay profile to watch."
+    )
+    supervisor_reconcile = sub.add_parser(
+        "supervisor-reconcile", help="Start/adopt supervised local Astrata services."
+    )
+    supervisor_reconcile.add_argument("--ui-host", default="127.0.0.1", help="UI bind host.")
+    supervisor_reconcile.add_argument("--ui-port", type=int, default=8891, help="UI bind port.")
+    supervisor_reconcile.add_argument(
+        "--relay-profile-id", default=None, help="Optional hosted relay profile to watch."
+    )
+    supervisor_stop = sub.add_parser("supervisor-stop", help="Stop supervised Astrata services.")
+    supervisor_stop.add_argument("--ui-host", default="127.0.0.1", help="UI bind host.")
+    supervisor_stop.add_argument("--ui-port", type=int, default=8891, help="UI bind port.")
+    supervisor_stop.add_argument(
+        "--include-adopted", action="store_true", help="Also stop adopted matching services."
+    )
+    relay_watch = sub.add_parser(
+        "mcp-relay-watch", help="Bridge hosted relay requests into the local control plane."
+    )
+    relay_watch.add_argument("--profile-id", required=True, help="Relay profile to watch.")
+    relay_watch.add_argument(
+        "--link-id", default=None, help="Optional local link id for telemetry."
+    )
+    relay_watch.add_argument(
+        "--interval-seconds", type=float, default=30.0, help="Seconds between relay polls."
+    )
     comms_send = sub.add_parser("comms-send", help="Send a durable principal message into Astrata.")
     comms_send.add_argument("message", help="Message payload to send.")
     comms_send.add_argument("--recipient", default="prime", help="Recipient identity.")
-    comms_send.add_argument("--conversation-id", default="", help="Optional durable conversation/thread id.")
-    comms_send.add_argument("--intent", default="principal_message", help="Intent label for the message.")
+    comms_send.add_argument(
+        "--conversation-id", default="", help="Optional durable conversation/thread id."
+    )
+    comms_send.add_argument(
+        "--intent", default="principal_message", help="Intent label for the message."
+    )
     comms_send.add_argument("--kind", default="request", help="Message kind.")
     comms_inbox = sub.add_parser("comms-inbox", help="Read durable messages for a recipient.")
     comms_inbox.add_argument("--recipient", default="principal", help="Recipient inbox to inspect.")
-    comms_inbox.add_argument("--unread-only", action="store_true", help="Hide acknowledged/resolved messages.")
+    comms_inbox.add_argument(
+        "--unread-only", action="store_true", help="Hide acknowledged/resolved messages."
+    )
     comms_ack = sub.add_parser("comms-ack", help="Acknowledge a durable message.")
     comms_ack.add_argument("communication_id", help="Message ID to acknowledge.")
-    comms_process = sub.add_parser("comms-process", help="Turn inbound messages into request specs and tasks.")
+    comms_process = sub.add_parser(
+        "comms-process", help="Turn inbound messages into request specs and tasks."
+    )
     comms_process.add_argument("--recipient", default="astrata", help="Recipient inbox to process.")
-    comms_process.add_argument("--limit", type=int, default=5, help="Maximum number of messages to process.")
-    local_start = sub.add_parser("local-runtime-start", help="Start a managed local inference runtime.")
+    comms_process.add_argument(
+        "--limit", type=int, default=5, help="Maximum number of messages to process."
+    )
+    local_start = sub.add_parser(
+        "local-runtime-start", help="Start a managed local inference runtime."
+    )
     local_start.add_argument("--model-id", default=None, help="Specific local model ID to run.")
     local_start.add_argument("--profile", default=None, help="Runtime profile override.")
     sub.add_parser("local-runtime-stop", help="Stop the managed local inference runtime.")
     sub.add_parser("local-runtime-status", help="Inspect managed local runtime status.")
     sub.add_parser("local-model-catalog", help="Show the curated local model starter catalog.")
-    local_install = sub.add_parser("local-model-install", help="Download a catalog or explicit GGUF model into Astrata-managed storage.")
-    local_install.add_argument("--catalog-id", default=None, help="Installable catalog entry to download, such as qwen3.5-0.8b-q4_k_m.")
-    local_install.add_argument("--url", default=None, help="Explicit GGUF download URL. Used when no installable catalog entry is provided.")
-    local_adopt = sub.add_parser("local-model-adopt", help="Adopt a local model path into Astrata inventory.")
+    local_install = sub.add_parser(
+        "local-model-install",
+        help="Download a catalog or explicit GGUF model into Astrata-managed storage.",
+    )
+    local_install.add_argument(
+        "--catalog-id",
+        default=None,
+        help="Installable catalog entry to download, such as qwen3.5-0.8b-q4_k_m.",
+    )
+    local_install.add_argument(
+        "--url",
+        default=None,
+        help="Explicit GGUF download URL. Used when no installable catalog entry is provided.",
+    )
+    local_adopt = sub.add_parser(
+        "local-model-adopt", help="Adopt a local model path into Astrata inventory."
+    )
     local_adopt.add_argument("path", help="Path to a local model file.")
-    local_observe = sub.add_parser("local-model-observe", help="Record observed performance for a local model.")
+    local_observe = sub.add_parser(
+        "local-model-observe", help="Record observed performance for a local model."
+    )
     local_observe.add_argument("path", help="Path to the local model file.")
-    local_observe.add_argument("--task-class", default="general", help="Task class for the observation.")
-    local_observe.add_argument("--score", type=float, required=True, help="Normalized quality score for the run.")
-    local_observe.add_argument("--success", action="store_true", help="Mark the observation as successful.")
+    local_observe.add_argument(
+        "--task-class", default="general", help="Task class for the observation."
+    )
+    local_observe.add_argument(
+        "--score", type=float, required=True, help="Normalized quality score for the run."
+    )
+    local_observe.add_argument(
+        "--success", action="store_true", help="Mark the observation as successful."
+    )
     local_observe.add_argument("--source", default="observed", help="Observation source label.")
     local_observe.add_argument("--note", default=None, help="Optional note.")
-    local_matchup = sub.add_parser("local-model-matchup", help="Record a pairwise local model matchup result.")
+    local_matchup = sub.add_parser(
+        "local-model-matchup", help="Record a pairwise local model matchup result."
+    )
     local_matchup.add_argument("left_path", help="Left model path.")
     local_matchup.add_argument("right_path", help="Right model path.")
-    local_matchup.add_argument("--task-class", default="general", help="Task class for the matchup.")
-    local_matchup.add_argument("--left-score", type=float, required=True, help="Left-side result: 1 win, 0 loss, 0.5 tie.")
+    local_matchup.add_argument(
+        "--task-class", default="general", help="Task class for the matchup."
+    )
+    local_matchup.add_argument(
+        "--left-score", type=float, required=True, help="Left-side result: 1 win, 0 loss, 0.5 tie."
+    )
     local_matchup.add_argument("--note", default=None, help="Optional matchup note.")
-    local_eval_pair = sub.add_parser("local-model-eval-pair", help="Run a bounded pair eval between two local models.")
-    local_eval_pair.add_argument("left_model", help="Left local model identifier/path for LM Studio.")
-    local_eval_pair.add_argument("right_model", help="Right local model identifier/path for LM Studio.")
+    local_eval_pair = sub.add_parser(
+        "local-model-eval-pair", help="Run a bounded pair eval between two local models."
+    )
+    local_eval_pair.add_argument(
+        "left_model", help="Left local model identifier/path for LM Studio."
+    )
+    local_eval_pair.add_argument(
+        "right_model", help="Right local model identifier/path for LM Studio."
+    )
     local_eval_pair.add_argument("--task-class", default="general", help="Task class for the eval.")
-    local_eval_pair.add_argument("--prompt", required=True, help="Prompt to evaluate both models on.")
-    local_eval_pair.add_argument("--judge-provider", default="codex", help="Astrata provider to use as the judge.")
-    local_eval_pair.add_argument("--judge-cli-tool", default=None, help="Optional CLI tool hint for judge requests.")
-    local_eval_pair.add_argument("--allow-thermal-override", action="store_true", help="Run even if quiet-mode thermal policy would defer.")
-    local_rank = sub.add_parser("local-model-rank", help="Show local model ranking inputs and current recommendation.")
-    local_rank.add_argument("--task-class", default="general", help="Task class to evaluate, such as coding.")
-    sub.add_parser("google-models-sync", help="Sync the Google AI Studio model catalog into Astrata.")
+    local_eval_pair.add_argument(
+        "--prompt", required=True, help="Prompt to evaluate both models on."
+    )
+    local_eval_pair.add_argument(
+        "--judge-provider", default="codex", help="Astrata provider to use as the judge."
+    )
+    local_eval_pair.add_argument(
+        "--judge-cli-tool", default=None, help="Optional CLI tool hint for judge requests."
+    )
+    local_eval_pair.add_argument(
+        "--allow-thermal-override",
+        action="store_true",
+        help="Run even if quiet-mode thermal policy would defer.",
+    )
+    local_rank = sub.add_parser(
+        "local-model-rank", help="Show local model ranking inputs and current recommendation."
+    )
+    local_rank.add_argument(
+        "--task-class", default="general", help="Task class to evaluate, such as coding."
+    )
+    sub.add_parser(
+        "google-models-sync", help="Sync the Google AI Studio model catalog into Astrata."
+    )
     sub.add_parser("google-models-list", help="List cached Google AI Studio models.")
-    google_default = sub.add_parser("google-set-default-model", help="Set Astrata's default Google AI Studio model.")
+    google_default = sub.add_parser(
+        "google-set-default-model", help="Set Astrata's default Google AI Studio model."
+    )
     google_default.add_argument("model", help="Model identifier to use by default.")
-    provider_eval_pair = sub.add_parser("provider-route-eval-pair", help="Run a bounded eval between two provider routes.")
-    provider_eval_pair.add_argument("left_provider", help="Left provider name, such as google, cli, codex, or local-model.")
-    provider_eval_pair.add_argument("right_provider", help="Right provider name, such as google, cli, codex, or local-model.")
-    provider_eval_pair.add_argument("--task-class", default="general", help="Task class for the eval.")
-    provider_eval_pair.add_argument("--prompt", required=True, help="Prompt to evaluate both routes on.")
-    provider_eval_pair.add_argument("--left-model", default=None, help="Optional left model override.")
-    provider_eval_pair.add_argument("--right-model", default=None, help="Optional right model override.")
-    provider_eval_pair.add_argument("--left-cli-tool", default=None, help="Optional left CLI tool, when provider is cli.")
-    provider_eval_pair.add_argument("--right-cli-tool", default=None, help="Optional right CLI tool, when provider is cli.")
-    provider_eval_pair.add_argument("--left-base-url", default=None, help="Optional left base URL, useful for strata-endpoint routes.")
-    provider_eval_pair.add_argument("--right-base-url", default=None, help="Optional right base URL, useful for strata-endpoint routes.")
-    provider_eval_pair.add_argument("--left-thread-id", default=None, help="Optional persistent thread id for the left route.")
-    provider_eval_pair.add_argument("--right-thread-id", default=None, help="Optional persistent thread id for the right route.")
-    provider_eval_pair.add_argument("--allow-degraded-fallback", action="store_true", help="Allow explicit degraded fallback on persistent endpoint routes.")
-    provider_eval_pair.add_argument("--allow-scarce-judge", action="store_true", help="Allow using a scarce judge route like Codex for side-quest benchmarking.")
-    provider_eval_pair.add_argument("--judge-provider", default="codex", help="Astrata provider to use as judge.")
-    provider_eval_pair.add_argument("--judge-cli-tool", default=None, help="Optional CLI tool hint for judge requests.")
-    sub.add_parser("strata-endpoint-status", help="Inspect Astrata's native persistent Strata-style endpoint.")
-    strata_chat = sub.add_parser("strata-endpoint-chat", help="Send a message through Astrata's native persistent Strata-style endpoint.")
+    sub.add_parser("kilocode-models-sync", help="Sync the KiloCode model catalog into Astrata.")
+    sub.add_parser(
+        "kilocode-models-list", help="List cached KiloCode models and recommended default."
+    )
+    sub.add_parser(
+        "account-status",
+        help="Show account, invite, profile, and device-link control-plane status.",
+    )
+    account_invite = sub.add_parser(
+        "account-issue-invite", help="Issue a hosted-bridge invite code."
+    )
+    account_invite.add_argument("--label", default="", help="Optional invite label.")
+    account_redeem = sub.add_parser(
+        "account-redeem-invite", help="Redeem a hosted-bridge invite code for a user."
+    )
+    account_redeem.add_argument("--email", required=True, help="User email.")
+    account_redeem.add_argument("--display-name", default="", help="Optional display name.")
+    account_redeem.add_argument("--invite-code", required=True, help="Invite code to redeem.")
+    account_pair = sub.add_parser(
+        "account-pair-device", help="Pair this desktop as an owned relay device for a user."
+    )
+    account_pair.add_argument("--email", required=True, help="Eligible user email.")
+    account_pair.add_argument("--label", default="Astrata Desktop", help="Local device label.")
+    account_pair.add_argument(
+        "--relay-endpoint", default="", help="Hosted relay endpoint for this device link."
+    )
+    oauth_client = sub.add_parser(
+        "account-register-oauth-client", help="Register an OAuth client for relay access."
+    )
+    oauth_client.add_argument("--label", required=True, help="Client label, such as ChatGPT.")
+    oauth_client.add_argument(
+        "--redirect-uri", action="append", default=[], help="Allowed redirect URI. Repeatable."
+    )
+    oauth_code = sub.add_parser(
+        "account-issue-oauth-code",
+        help="Issue an OAuth authorization code bound to a user profile/device.",
+    )
+    oauth_code.add_argument("--client-id", required=True, help="OAuth client id.")
+    oauth_code.add_argument("--email", required=True, help="Eligible user email.")
+    oauth_code.add_argument("--redirect-uri", default="", help="OAuth redirect URI.")
+    oauth_code.add_argument("--profile-id", default=None, help="Optional profile override.")
+    oauth_code.add_argument("--device-id", default=None, help="Optional device override.")
+    oauth_exchange = sub.add_parser(
+        "account-exchange-oauth-code",
+        help="Exchange an OAuth authorization code for a relay access token.",
+    )
+    oauth_exchange.add_argument("--client-id", required=True, help="OAuth client id.")
+    oauth_exchange.add_argument("--code", required=True, help="Authorization code.")
+    oauth_exchange.add_argument("--redirect-uri", default="", help="OAuth redirect URI.")
+    sub.add_parser("routines-list", help="List registered Astrata routines.")
+    routine_run = sub.add_parser("routine-run", help="Run one registered Astrata routine now.")
+    routine_run.add_argument("routine_id", help="Routine id to run.")
+    provider_eval_pair = sub.add_parser(
+        "provider-route-eval-pair", help="Run a bounded eval between two provider routes."
+    )
+    provider_eval_pair.add_argument(
+        "left_provider", help="Left provider name, such as google, cli, codex, or local-model."
+    )
+    provider_eval_pair.add_argument(
+        "right_provider", help="Right provider name, such as google, cli, codex, or local-model."
+    )
+    provider_eval_pair.add_argument(
+        "--task-class", default="general", help="Task class for the eval."
+    )
+    provider_eval_pair.add_argument(
+        "--prompt", required=True, help="Prompt to evaluate both routes on."
+    )
+    provider_eval_pair.add_argument(
+        "--left-model", default=None, help="Optional left model override."
+    )
+    provider_eval_pair.add_argument(
+        "--right-model", default=None, help="Optional right model override."
+    )
+    provider_eval_pair.add_argument(
+        "--left-cli-tool", default=None, help="Optional left CLI tool, when provider is cli."
+    )
+    provider_eval_pair.add_argument(
+        "--right-cli-tool", default=None, help="Optional right CLI tool, when provider is cli."
+    )
+    provider_eval_pair.add_argument(
+        "--left-base-url",
+        default=None,
+        help="Optional left base URL, useful for strata-endpoint routes.",
+    )
+    provider_eval_pair.add_argument(
+        "--right-base-url",
+        default=None,
+        help="Optional right base URL, useful for strata-endpoint routes.",
+    )
+    provider_eval_pair.add_argument(
+        "--left-thread-id", default=None, help="Optional persistent thread id for the left route."
+    )
+    provider_eval_pair.add_argument(
+        "--right-thread-id", default=None, help="Optional persistent thread id for the right route."
+    )
+    provider_eval_pair.add_argument(
+        "--allow-degraded-fallback",
+        action="store_true",
+        help="Allow explicit degraded fallback on persistent endpoint routes.",
+    )
+    provider_eval_pair.add_argument(
+        "--allow-scarce-judge",
+        action="store_true",
+        help="Allow using a scarce judge route like Codex for side-quest benchmarking.",
+    )
+    provider_eval_pair.add_argument(
+        "--judge-provider", default="codex", help="Astrata provider to use as judge."
+    )
+    provider_eval_pair.add_argument(
+        "--judge-cli-tool", default=None, help="Optional CLI tool hint for judge requests."
+    )
+    sub.add_parser(
+        "strata-endpoint-status", help="Inspect Astrata's native persistent Strata-style endpoint."
+    )
+    strata_chat = sub.add_parser(
+        "strata-endpoint-chat",
+        help="Send a message through Astrata's native persistent Strata-style endpoint.",
+    )
     strata_chat.add_argument("message", help="Message content to append.")
     strata_chat.add_argument("--thread-id", default=None, help="Persistent thread id to continue.")
     strata_chat.add_argument("--model-id", default=None, help="Optional local model id override.")
-    strata_chat.add_argument("--allow-degraded-fallback", action="store_true", help="Allow explicit degraded fallback semantics.")
-    strata_chat.add_argument("--mode", choices=("fast", "persistent"), default=None, help="Optional explicit execution mode override.")
-    strata_chat.add_argument("--response-budget", choices=("instant", "normal", "deep"), default="normal", help="Requested response budget / latency preference.")
-    strata_prompt = sub.add_parser("strata-endpoint-set-prompt", help="Update one native Strata-endpoint routing or execution prompt.")
-    strata_prompt.add_argument("--prompt-kind", choices=("route_selector", "fast_system", "persistent_system"), required=True, help="Prompt slot to update.")
+    strata_chat.add_argument(
+        "--allow-degraded-fallback",
+        action="store_true",
+        help="Allow explicit degraded fallback semantics.",
+    )
+    strata_chat.add_argument(
+        "--mode",
+        choices=("fast", "persistent"),
+        default=None,
+        help="Optional explicit execution mode override.",
+    )
+    strata_chat.add_argument(
+        "--response-budget",
+        choices=("instant", "normal", "deep"),
+        default="normal",
+        help="Requested response budget / latency preference.",
+    )
+    strata_prompt = sub.add_parser(
+        "strata-endpoint-set-prompt",
+        help="Update one native Strata-endpoint routing or execution prompt.",
+    )
+    strata_prompt.add_argument(
+        "--prompt-kind",
+        choices=("route_selector", "fast_system", "persistent_system"),
+        required=True,
+        help="Prompt slot to update.",
+    )
     strata_prompt.add_argument("--value", required=True, help="New prompt text.")
     return parser
 
@@ -1199,8 +1788,24 @@ def main() -> int:
         return _cmd_loop0_next()
     if args.command == "loop0-run":
         return _cmd_loop0_run(max(1, args.steps))
+    if args.command == "loop0-daemon":
+        return _cmd_loop0_daemon(steps=max(1, args.steps), interval_seconds=max(1, args.interval))
+    if args.command == "supervisor-status":
+        return _cmd_supervisor_status(args.ui_host, args.ui_port, args.relay_profile_id)
+    if args.command == "supervisor-reconcile":
+        return _cmd_supervisor_reconcile(args.ui_host, args.ui_port, args.relay_profile_id)
+    if args.command == "supervisor-stop":
+        return _cmd_supervisor_stop(args.ui_host, args.ui_port, args.include_adopted)
+    if args.command == "mcp-relay-watch":
+        return _cmd_mcp_relay_watch(
+            profile_id=args.profile_id,
+            link_id=args.link_id,
+            interval_seconds=args.interval_seconds,
+        )
     if args.command == "comms-send":
-        return _cmd_comms_send(args.recipient, args.intent, args.message, args.kind, args.conversation_id)
+        return _cmd_comms_send(
+            args.recipient, args.intent, args.message, args.kind, args.conversation_id
+        )
     if args.command == "comms-inbox":
         return _cmd_comms_inbox(args.recipient, args.unread_only)
     if args.command == "comms-ack":
@@ -1220,9 +1825,13 @@ def main() -> int:
     if args.command == "local-model-adopt":
         return _cmd_local_model_adopt(args.path)
     if args.command == "local-model-observe":
-        return _cmd_local_model_observe(args.path, args.task_class, args.score, args.success, args.source, args.note)
+        return _cmd_local_model_observe(
+            args.path, args.task_class, args.score, args.success, args.source, args.note
+        )
     if args.command == "local-model-matchup":
-        return _cmd_local_model_matchup(args.left_path, args.right_path, args.task_class, args.left_score, args.note)
+        return _cmd_local_model_matchup(
+            args.left_path, args.right_path, args.task_class, args.left_score, args.note
+        )
     if args.command == "local-model-eval-pair":
         return _cmd_local_model_eval_pair(
             args.left_model,
@@ -1241,6 +1850,38 @@ def main() -> int:
         return _cmd_google_list_models()
     if args.command == "google-set-default-model":
         return _cmd_google_set_default_model(args.model)
+    if args.command == "kilocode-models-sync":
+        return _cmd_kilocode_sync_models()
+    if args.command == "kilocode-models-list":
+        return _cmd_kilocode_list_models()
+    if args.command == "account-status":
+        return _cmd_account_status()
+    if args.command == "account-issue-invite":
+        return _cmd_account_issue_invite(args.label)
+    if args.command == "account-redeem-invite":
+        return _cmd_account_redeem_invite(args.email, args.display_name, args.invite_code)
+    if args.command == "account-pair-device":
+        return _cmd_account_pair_device(args.email, args.label, args.relay_endpoint)
+    if args.command == "account-register-oauth-client":
+        return _cmd_account_register_oauth_client(args.label, args.redirect_uri)
+    if args.command == "account-issue-oauth-code":
+        return _cmd_account_issue_oauth_code(
+            client_id=args.client_id,
+            email=args.email,
+            redirect_uri=args.redirect_uri,
+            profile_id=args.profile_id,
+            device_id=args.device_id,
+        )
+    if args.command == "account-exchange-oauth-code":
+        return _cmd_account_exchange_oauth_code(
+            client_id=args.client_id,
+            code=args.code,
+            redirect_uri=args.redirect_uri,
+        )
+    if args.command == "routines-list":
+        return _cmd_routines_list()
+    if args.command == "routine-run":
+        return _cmd_routine_run(args.routine_id)
     if args.command == "provider-route-eval-pair":
         return _cmd_provider_route_eval_pair(
             args.left_provider,

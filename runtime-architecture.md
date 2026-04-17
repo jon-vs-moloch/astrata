@@ -679,7 +679,38 @@ The HTTP surface should remain available as an optional serving wrapper for:
 - operator-visible local runtime serving
 - debugging and observability workflows
 
+Future serving design should separate endpoint configuration from backend model residency.
+
+That means Astrata should eventually be able to expose multiple ports or endpoint personalities with different:
+
+- authentication
+- rate limits
+- disclosure rules
+- reasoning policies
+- experimental settings
+
+without reloading the same underlying local models multiple times unless duplicate residency was explicitly requested.
+
+The serving layer should be able to map different endpoint policies onto one shared backend residency set.
+
 But Astrata's own lane execution, strategy orchestration, and cache-aware inference paths should not be forced to depend on a bound port when no external client is involved.
+
+For internal invocation, the preferred control surface should be a direct `reasoning_effort` parameter with support for:
+
+- `none`
+- `low`
+- `medium`
+- `high`
+- `auto`
+- `auto_none`
+- `auto_low`
+
+where automatic modes select the lightest adequate effort before the main answer is generated.
+
+Astrata should also treat local inference as part of its security architecture.
+
+A future secure enclave should allow only approved local runtimes and procedures to access especially sensitive machine-local information, with disclosure policy checks before anything can be surfaced to remote providers.
+Remote retrieval and prompt-building paths should consume projected memory views rather than raw records, so enclave and restricted material cannot leak through an incidental retrieval call.
 
 Astrata should go as close to the metal as is practical **when** doing so produces real improvement in:
 

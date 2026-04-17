@@ -6,6 +6,7 @@ import hashlib
 from typing import Any
 
 from astrata.audit.review import AuditReview
+from astrata.audit.signals import ObservationSignal
 
 
 def select_audit_followup_policy(
@@ -30,6 +31,23 @@ def select_audit_followup_policy(
         "mode": "none",
         "reason": "No follow-up audit work selected for this review.",
         "followup_specs": [],
+    }
+
+
+def select_signal_followup_policy(
+    *,
+    signal: ObservationSignal,
+) -> dict[str, Any]:
+    if signal.status != "open":
+        return {
+            "mode": "none",
+            "reason": "Resolved signals do not emit new follow-up work.",
+            "followup_specs": [],
+        }
+    return {
+        "mode": "targeted",
+        "reason": "Internal surprise/problem signals should cash out into bounded investigation or repair work.",
+        "followup_specs": _signal_followups(signal),
     }
 
 
@@ -73,6 +91,36 @@ def _sampled_followup(review: AuditReview) -> dict[str, Any]:
         "task_id_hint": f"audit-sample-{review.subject_kind}-{review.subject_id}",
         "route_preferences": {"preferred_cli_tools": ["kilocode", "gemini-cli"]},
     }
+
+
+def _signal_followups(signal: ObservationSignal) -> list[dict[str, Any]]:
+    title_prefix = {
+        "surprise": "Investigate surprising system behavior",
+        "problem": "Repair observed system problem",
+        "drift": "Correct detected system drift",
+        "opportunity": "Explore system improvement opportunity",
+    }.get(signal.signal_kind, "Investigate internal system signal")
+    default_priority = 7 if signal.severity in {"high", "critical"} else 5
+    default_urgency = 4 if signal.severity in {"high", "critical"} else 2
+    if signal.signal_kind == "opportunity":
+        default_priority = min(default_priority, 4)
+        default_urgency = min(default_urgency, 2)
+    return [
+        {
+            "title": f"{title_prefix}: {signal.subject_id}",
+            "description": (
+                f"Internal {signal.signal_kind} signal for {signal.subject_kind} `{signal.subject_id}` should be investigated and either repaired, "
+                f"explained, or deliberately ratified. Summary: {signal.summary}"
+            ),
+            "priority": default_priority,
+            "urgency": default_urgency,
+            "risk": "moderate",
+            "completion_type": "review_or_audit",
+            "success_criteria": {"signal_addressed": True, "signal_id": signal.signal_id},
+            "task_id_hint": f"signal-{signal.signal_kind}-{signal.subject_kind}-{signal.subject_id}",
+            "route_preferences": {"preferred_cli_tools": ["kilocode", "gemini-cli"]},
+        }
+    ]
 
 
 def _is_sampled(*, review: AuditReview, sample_rate: int) -> bool:

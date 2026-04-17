@@ -9,7 +9,6 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -30,6 +29,34 @@ class UISendMessageRequest(BaseModel):
 class UIActionResponse(BaseModel):
     status: str
     detail: dict
+
+
+class UISettingsRequest(BaseModel):
+    update_channel: str | None = None
+
+
+class UIInviteRedeemRequest(BaseModel):
+    email: str = Field(min_length=1)
+    display_name: str = ""
+    invite_code: str = Field(min_length=1)
+
+
+class UILinkDesktopRequest(BaseModel):
+    email: str = Field(min_length=1)
+    label: str = "Astrata Desktop"
+    relay_endpoint: str = ""
+
+
+class UIConnectorOAuthSetupRequest(BaseModel):
+    callback_url: str = Field(min_length=1)
+    label: str = "ChatGPT Connector"
+    email: str = ""
+    relay_endpoint: str = ""
+
+
+class UIRelayPairingRequest(BaseModel):
+    label: str = "Astrata Desktop"
+    ttl_minutes: int = 15
 
 
 def create_app() -> FastAPI:
@@ -85,6 +112,15 @@ def create_app() -> FastAPI:
     def startup() -> dict:
         return service.ensure_startup_reports()
 
+    @app.get("/api/settings")
+    def settings() -> dict:
+        return service.get_preferences()
+
+    @app.post("/api/settings")
+    def set_settings(payload: UISettingsRequest) -> UIActionResponse:
+        result = service.set_preferences(payload.model_dump(exclude_none=True))
+        return UIActionResponse(status="ok", detail=result)
+
     @app.post("/api/messages")
     def send_message(payload: UISendMessageRequest) -> UIActionResponse:
         record = service.send_message(
@@ -119,6 +155,44 @@ def create_app() -> FastAPI:
     def stop_local_runtime() -> UIActionResponse:
         result = service.stop_local_runtime()
         return UIActionResponse(status="stopped", detail=result)
+
+    @app.post("/api/account/invite/redeem")
+    def redeem_invite(payload: UIInviteRedeemRequest) -> UIActionResponse:
+        result = service.redeem_invite_code(
+            email=payload.email,
+            display_name=payload.display_name,
+            invite_code=payload.invite_code,
+        )
+        return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
+
+    @app.post("/api/account/device/link")
+    def link_desktop(payload: UILinkDesktopRequest) -> UIActionResponse:
+        result = service.pair_desktop_device(
+            email=payload.email,
+            label=payload.label,
+            relay_endpoint=payload.relay_endpoint,
+        )
+        return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
+
+    @app.post("/api/connector/oauth/setup")
+    def connector_oauth_setup(payload: UIConnectorOAuthSetupRequest) -> UIActionResponse:
+        result = service.connector_oauth_setup(
+            callback_url=payload.callback_url,
+            label=payload.label,
+            email=payload.email,
+            relay_endpoint=payload.relay_endpoint,
+        )
+        return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
+
+    @app.post("/api/relay/pairing")
+    def relay_pairing(payload: UIRelayPairingRequest) -> UIActionResponse:
+        result = {
+            "status": "replaced_by_oauth",
+            "label": payload.label,
+            "ttl_minutes": payload.ttl_minutes,
+            "reason": "Remote connector setup now uses account-bound OAuth and the paired desktop device link.",
+        }
+        return UIActionResponse(status="replaced_by_oauth", detail=result)
 
     return app
 

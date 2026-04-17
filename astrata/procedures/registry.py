@@ -178,8 +178,8 @@ def build_default_procedure_registry() -> ProcedureRegistry:
                     ),
                     min_capability="expert",
                     execution_mode="shortcut",
-                    preferred_providers=["codex", "openai", "google"],
-                    preferred_cli_tools=["codex-cli", "claude-code"],
+                    preferred_providers=["google", "openai", "codex"],
+                    preferred_cli_tools=["claude-code", "gemini-cli"],
                     metadata={"shortcut_allowed": True, "capture_shortcut_candidate": True},
                 ),
                 ProcedureVariantTemplate(
@@ -221,8 +221,8 @@ def build_default_procedure_registry() -> ProcedureRegistry:
                     description="Permit strong actors to resolve the bounded task directly and then cash out the shortcut used.",
                     min_capability="strong",
                     execution_mode="shortcut",
-                    preferred_providers=["codex", "openai", "google"],
-                    preferred_cli_tools=["codex-cli", "claude-code"],
+                    preferred_providers=["google", "openai", "codex"],
+                    preferred_cli_tools=["claude-code", "gemini-cli"],
                     metadata={"shortcut_allowed": True, "capture_shortcut_candidate": True},
                 ),
             ],
@@ -255,8 +255,8 @@ def build_default_procedure_registry() -> ProcedureRegistry:
                     description="Permit stronger actors to produce a compact leaf-task DAG directly and capture the shortcut used.",
                     min_capability="strong",
                     execution_mode="shortcut",
-                    preferred_providers=["codex", "openai", "google"],
-                    preferred_cli_tools=["codex-cli", "claude-code", "gemini-cli"],
+                    preferred_providers=["google", "openai", "codex"],
+                    preferred_cli_tools=["claude-code", "gemini-cli"],
                     metadata={"shortcut_allowed": True, "capture_shortcut_candidate": True, "preserve_workflow": True},
                 ),
             ],
@@ -308,6 +308,33 @@ def build_default_procedure_registry() -> ProcedureRegistry:
                 ),
             ],
             metadata={"task_class": "runtime"},
+        )
+    )
+    registry.register(
+        ProcedureTemplate(
+            procedure_id="refresh-inference-registries",
+            title="Refresh Inference Registries",
+            description=(
+                "Refresh model/provider registries for cheap and generous inference lanes so Astrata can route "
+                "worker and remote-operator work away from scarce Prime quota whenever safe."
+            ),
+            expected_outputs=["kilocode_model_registry", "google_model_registry", "route_default_review"],
+            default_variant_id="weekly_registry_refresh",
+            variants=[
+                ProcedureVariantTemplate(
+                    variant_id="weekly_registry_refresh",
+                    title="Weekly Registry Refresh",
+                    description="Sync KiloCode and Google AI Studio catalogs, then preserve the recommended cheap-lane defaults.",
+                    min_capability="basic",
+                    execution_mode="careful",
+                    preferred_cli_tools=["kilocode", "gemini-cli"],
+                    metadata={
+                        "routine_candidate": True,
+                        "commands": ["astrata kilocode-models-sync", "astrata google-models-sync"],
+                    },
+                )
+            ],
+            metadata={"task_class": "maintenance", "routine_candidate": True},
         )
     )
     return registry

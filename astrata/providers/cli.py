@@ -11,7 +11,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
+from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
+from astrata.providers.kilocode_registry import default_kilocode_model
 
 
 CLI_TOOL_SPECS: dict[str, dict[str, str]] = {
@@ -26,6 +27,14 @@ class CliProvider(Provider):
     def __init__(self, *, name: str = "cli") -> None:
         self._name = name
         self._completion_timeout_seconds = int(os.environ.get("ASTRATA_CLI_TIMEOUT_SECONDS", "90"))
+        self._codex_default_model = (
+            str(
+                os.environ.get("ASTRATA_CODEX_CLI_MODEL")
+                or os.environ.get("ASTRATA_CODEX_MODEL")
+                or "gpt-5.4"
+            ).strip()
+            or "gpt-5.4"
+        )
 
     @property
     def name(self) -> str:
@@ -47,7 +56,7 @@ class CliProvider(Provider):
 
     def available_tools(self) -> list[str]:
         ordered: list[str] = []
-        for tool in ("codex-cli", "kilocode", "gemini-cli", "claude-code"):
+        for tool in ("kilocode", "gemini-cli", "claude-code", "codex-cli"):
             if self._tool_is_usable(tool):
                 ordered.append(tool)
         return ordered
@@ -98,9 +107,15 @@ class CliProvider(Provider):
             raise RuntimeError(f"CLI tool {tool} is not configured")
 
         spec = CLI_TOOL_SPECS[tool]
+        if spec["underlying_provider"] != "custom":
+            assert_projected_memory_request(request, provider_name=f"{self.name}:{tool}")
         exec_path = shutil.which(spec["exec"]) or spec["exec"]
         prompt = _render_prompt(request)
         model = request.model or str(request.metadata.get("model") or "").strip() or None
+        if tool == "codex-cli" and not model:
+            model = self._codex_default_model
+        if tool == "kilocode" and not model:
+            model = default_kilocode_model()
         cwd = str(request.metadata.get("cwd") or "").strip() or None
         args = self._build_args(tool=tool, exec_path=exec_path, prompt=prompt, model=model)
         proc = self._run_command(args=args, cwd=cwd)
@@ -124,10 +139,14 @@ class CliProvider(Provider):
 
     def _default_tool(self) -> str | None:
         available = self.available_tools()
-        if "codex-cli" in available:
-            return "codex-cli"
         if "kilocode" in available:
             return "kilocode"
+        if "gemini-cli" in available:
+            return "gemini-cli"
+        if "claude-code" in available:
+            return "claude-code"
+        if "codex-cli" in available:
+            return "codex-cli"
         return available[0] if available else None
 
     def _tool_is_usable(self, tool: str) -> bool:

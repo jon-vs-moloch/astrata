@@ -2,25 +2,38 @@
 
 ## Goal
 
-Reach the point where:
+Make the remote operator path safe for friendly-tester distribution.
 
-- each GPT user signs into their own Astrata account
-- each account owns one or more relay profiles
-- each Astrata Desktop client signs into that same account and registers as a user-owned device
-- GPT OAuth tokens resolve to `user_id -> profile_id -> device selection`
-- no distributed GPT routes through a shared bearer token or a global default profile
+The required routing rule is:
 
-## Non-Goal
+`OAuth token -> Astrata account -> relay profile -> owned device link -> permitted tools`
 
-This plan is not trying to deliver:
+That means:
 
-- enterprise SSO
-- billing-complete SaaS infrastructure
-- a perfect long-term queue architecture on the first pass
+- a GPT user signs into their own Astrata account
+- the account owns one or more relay profiles
+- Astrata Desktop pairs as an owned device for that same account
+- remote requests resolve to one account-owned device context
+- no shared developer bearer token remains in the distribution path
 
-The v0 target is user-safe distribution:
+## Current Code State
 
-`GPT user auth -> Astrata account -> owned desktop device(s) -> per-user relay routing`
+The repo already has the local control-plane scaffold for this:
+
+- account, invite, relay-profile, device, and device-link records
+- OAuth client, authorization-code, and access-token records
+- CLI surfaces for invite issuance, redemption, device pairing, and OAuth exchange
+- hosted relay checks that profile/device links belong to the same user
+- relay token resolution bound to `user_id/profile_id/device_id`
+
+Relevant code:
+
+- [accounts models](/Users/jon/Projects/Astrata/astrata/accounts/models.py)
+- [accounts service](/Users/jon/Projects/Astrata/astrata/accounts/service.py)
+- [MCP server auth path](/Users/jon/Projects/Astrata/astrata/mcp/server.py)
+- [hosted relay service](/Users/jon/Projects/Astrata/astrata/mcp/relay.py)
+
+This is enough for local development and controlled tester work. It is not yet a production web auth system.
 
 ## Product Rule
 
@@ -29,244 +42,119 @@ Pairing is not identity.
 Pairing should answer:
 
 - which device belongs to this authenticated user
-- which profile should remote work target
+- which relay profile that device should serve
 
 Identity should be owned by Astrata Web:
 
-- user account
-- login session
+- account login
 - OAuth consent
 - device ownership
-- revocation
-
-## Current State
-
-The repo already has:
-
-- hosted relay OAuth endpoints in the Cloudflare Worker
-- OAuth tokens bound to `profile_id`
-- desktop-minted pairing codes
-- per-profile relay routing
-- desktop UI support for generating pairing codes
-
-That is a good development bridge, but it is still not distribution-safe because the GPT user is not proving account ownership to Astrata Web.
+- connection revocation
+- default-profile and default-device controls
 
 ## v0 Target User Flow
 
 1. User opens the Astrata GPT.
 2. ChatGPT starts OAuth against Astrata Web.
 3. User signs into their Astrata account.
-4. Astrata Web loads the user's registered relay profiles and paired desktop devices.
-5. User chooses a target device/profile, or Astrata Web uses the default.
-6. Astrata Web issues an OAuth token bound to `user_id`, `profile_id`, and the selected device context.
-7. GPT requests route only to that user's relay queue and permitted tools.
-8. User can later review and revoke the GPT connection or change the default device/profile.
+4. Astrata Web resolves the user's relay profiles and paired devices.
+5. User selects a target profile/device, or Astrata Web uses the default.
+6. Astrata Web issues an access token bound to that user/profile/device context.
+7. The hosted relay accepts only tools that profile is allowed to use.
+8. The user can later revoke the GPT connection or change their default device.
 
-## Architecture
+## Local CLI Surfaces We Already Have
 
-### Surfaces
+These are the current repo-backed primitives:
 
-- `Astrata Desktop`
-  The local trusted node. It signs into Astrata Web, registers devices, stores device credentials, and receives routed relay work.
+```bash
+astrata account-status
+astrata account-issue-invite --label "friendly tester"
+astrata account-redeem-invite --email you@example.com --invite-code <code>
+astrata account-pair-device --email you@example.com --relay-endpoint https://<relay-host>/mcp
+astrata account-register-oauth-client --label ChatGPT --redirect-uri <callback-url>
+astrata account-issue-oauth-code --client-id <client-id> --email you@example.com --redirect-uri <callback-url>
+astrata account-exchange-oauth-code --client-id <client-id> --code <code> --redirect-uri <callback-url>
+```
 
-- `Astrata Web`
-  The account, OAuth, and routing control plane. It owns user identity, device ownership, relay profiles, and revocation controls.
+These commands are local scaffolding around the registry. They are not the final hosted web UX.
 
-- `Hosted Relay`
-  The edge-facing bridge. It terminates GPT and MCP traffic, validates Astrata-issued OAuth tokens, and routes requests by authenticated user/profile.
+## Durable Records
 
-### Routing Rule
-
-Every remote request should resolve through this chain:
-
-`access token -> user account -> relay profile -> selected device/link -> permitted tools`
-
-No distributed GPT should route by:
-
-- `RELAY_DEFAULT_PROFILE_ID`
-- shared bearer token
-- desktop-generated secret alone
-
-## Data Model
-
-The minimum durable records are:
+Minimum records for the v0 path:
 
 - `users`
-- `account_sessions`
+- `invites`
 - `relay_profiles`
 - `devices`
 - `device_links`
 - `oauth_clients`
 - `oauth_authorization_codes`
 - `oauth_access_tokens`
+
+Desirable next records once the hosted flow exists:
+
+- `account_sessions`
 - `gpt_connections`
 - `relay_requests`
 - `relay_results`
 
-Recommended minimum fields:
+## Remaining Phases
 
-### users
+### Phase 1: Hosted Authorize/Token Endpoints
 
-- `user_id`
-- `email`
-- `display_name`
-- `status`
-- `default_profile_id`
-- `gpt_onboarded_at`
-- `created_at`
-- `updated_at`
-
-### relay_profiles
-
-- `profile_id`
-- `user_id`
-- `label`
-- `control_posture`
-- `disclosure_tier`
-- `default_device_id`
-- `created_at`
-- `updated_at`
-
-### devices
-
-- `device_id`
-- `user_id`
-- `label`
-- `platform`
-- `status`
-- `last_seen_at`
-- `created_at`
-- `updated_at`
-
-### device_links
-
-- `link_id`
-- `device_id`
-- `profile_id`
-- `relay_endpoint`
-- `link_token_hash`
-- `status`
-- `last_heartbeat_at`
-- `created_at`
-- `updated_at`
-
-### gpt_connections
-
-- `connection_id`
-- `user_id`
-- `profile_id`
-- `oauth_client_id`
-- `status`
-- `last_used_at`
-- `created_at`
-- `updated_at`
-
-## Implementation Phases
-
-### Phase 1: Account Schema And Control Plane Surface
-
-Goal:
-Create durable account/device/profile models and expose a hosted control-plane surface that describes the system state.
-
-Deliverables:
-
-- account-control-plane data models in the repo
-- durable state store abstraction for users, profiles, devices, and OAuth records
-- Astrata Web presence endpoints for auth/control-plane status and schema
-- repo docs that describe the exact migration path
+Build real HTTP authorize/token endpoints around the current registry.
 
 Acceptance:
 
-- the repo has a stable account/device/profile schema
-- Astrata Web can report auth-control-plane readiness
-- future desktop and relay work have a real module boundary to target
+- ChatGPT can complete OAuth without local-only operator steps
+- issued tokens resolve to account/profile/device context
 
-### Phase 2: Desktop Sign-In And Device Registration
+### Phase 2: Device And Connection Management
 
-Goal:
-Let Astrata Desktop authenticate to Astrata Web and register itself as a user-owned device.
+Expose:
 
-Deliverables:
-
-- desktop sign-in UI
-- browser login callback flow
-- device registration endpoint
-- persistent local device credential
-- device status and default-profile selection in the desktop UI
-
-Acceptance:
-
-- a signed-in desktop appears under the correct user account
-- one user can register multiple desktops
-
-### Phase 3: User-Centric GPT OAuth
-
-Goal:
-Replace pairing-code identity with Astrata account identity during GPT OAuth.
-
-Deliverables:
-
-- Astrata Web-hosted login requirement in OAuth authorize flow
-- device/profile selection screen after login
-- OAuth code/token records bound to `user_id` and `profile_id`
-- relay request routing by authenticated user/profile
-- removal of shared-token requirement for distributed GPT builds
-
-Acceptance:
-
-- a new GPT user can connect using only their Astrata account
-- the connection routes to their own desktop device(s), not Jonathan's
-
-### Phase 4: Revocation, Defaults, And Recovery Controls
-
-Goal:
-Make the account system operable and supportable.
-
-Deliverables:
-
-- connected GPT list
-- connected device list
+- connected devices
+- connected GPT clients
 - revoke/disconnect controls
-- default profile/device settings
-- token rotation and stale-device cleanup
+- default-profile and default-device selection
 
 Acceptance:
 
-- a user can recover from a bad device binding without operator rescue
+- a tester can recover from bad pairing without operator rescue
 
-### Phase 5: Queue And Storage Hardening
+### Phase 3: Durable Queueing
 
-Goal:
-Move the relay from development-shaped storage to production-shaped routing durability.
-
-Deliverables:
-
-- queueing off the current lightweight KV-heavy pattern
-- profile/device routing storage with stronger consistency
-- serialized queue coordination per user/profile
+Move relay queueing off development-shaped JSON/KV patterns and into a serialized per-profile queue.
 
 Acceptance:
 
-- relay routing is durable enough for friendly tester distribution
+- a user's remote work is isolated by account/profile
+- retries and reconnects do not duplicate or lose work casually
 
-## Immediate Build Order
+### Phase 4: Distribution Safety Gates
 
-The next implementation steps should happen in this order:
+Before broader sharing:
 
-1. Land durable account/device/profile models in the repo.
-2. Expose control-plane schema/status through `astrata/webpresence`.
-3. Add desktop sign-in and device registration primitives.
-4. Update the relay OAuth authorize flow to require Astrata account login.
-5. Replace manual pairing-code-first UX with user login plus device selection.
-6. Add revoke/default-device controls.
+- no shared default-profile routing
+- no developer bearer token fallback in the user path
+- no routing by pairing code alone
 
-## First Slice We Are Starting Now
+## Near-Term Build Order
 
-The first repo slice starts here:
+1. Keep the current local control-plane code green.
+2. Add hosted authorize/token endpoints around the existing registry.
+3. Add revoke/default-device/default-profile operations.
+4. Move hosted queueing to a durable per-profile queue.
+5. Hook the Custom GPT flow to the hosted OAuth path.
 
-- create a durable implementation plan in `docs/`
-- add account-control-plane models and registry scaffolding in code
-- expose those models through Astrata Web presence endpoints
+## Non-Goals For v0
 
-That does not finish user auth by itself, but it creates the durable schema and module boundary needed for the rest of the implementation.
+Not required yet:
 
+- enterprise SSO
+- full billing system
+- perfect long-term account schema
+- multi-tenant operations tooling beyond what testers need
+
+The bar is simpler: safe, user-owned remote routing for friendly testers.

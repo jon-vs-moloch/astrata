@@ -69,6 +69,7 @@ def test_ui_service_snapshot_reports_desktop_backend_session():
         assert snapshot["desktop_backend"]["session_present"] is True
         assert snapshot["desktop_backend"]["backend_url"] == "http://127.0.0.1:8891/"
         assert snapshot["desktop_backend"]["backend_deliberately_stopped"] is True
+        assert snapshot["desktop_backend"]["backend_running"] is False
 
 
 def test_ui_service_ensure_local_runtime_reports_existing_healthy_lane(monkeypatch):
@@ -230,6 +231,111 @@ def test_ui_service_redeem_invite_code_enables_hosted_bridge():
 
         assert result["status"] == "ok"
         assert result["hosted_bridge_eligibility"]["status"] == "eligible"
+
+
+def test_ui_service_pairs_desktop_device_for_invited_user():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        service = AstrataUIService(settings=settings)
+
+        invite = service._account_registry().issue_invite_code(label="test")
+        service.redeem_invite_code(
+            email="tester@example.com",
+            display_name="Tester",
+            invite_code=invite["invite"]["code"],
+        )
+        result = service.pair_desktop_device(
+            email="tester@example.com",
+            label="Tester Mac",
+            relay_endpoint="https://relay.example/mcp",
+        )
+        snapshot = service.snapshot()
+
+        assert result["status"] == "ok"
+        assert result["device"]["label"] == "Tester Mac"
+        assert result["device_link"]["relay_endpoint"] == "https://relay.example/mcp"
+        assert snapshot["account_auth"]["counts"]["devices"] == 1
+        assert snapshot["account_auth"]["counts"]["active_device_links"] == 1
+        assert snapshot["account_auth"]["status"] == "linked"
+        assert snapshot["relay"]["selected_profile"]["profile_id"] == result["profile"]["profile_id"]
+
+
+def test_ui_service_connector_oauth_setup_returns_operator_url():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        service = AstrataUIService(settings=settings)
+
+        invite = service._account_registry().issue_invite_code(label="test")
+        service.redeem_invite_code(
+            email="tester@example.com",
+            display_name="Tester",
+            invite_code=invite["invite"]["code"],
+        )
+        service.pair_desktop_device(
+            email="tester@example.com",
+            label="Tester Mac",
+            relay_endpoint="https://relay.example/mcp",
+        )
+
+        setup = service.connector_oauth_setup(
+            email="tester@example.com",
+            callback_url="https://chat.openai.com/aip/g-abc123/oauth/callback",
+        )
+        snapshot = service.snapshot()
+
+        assert setup["status"] == "ok"
+        assert setup["authorize_url"].startswith("https://relay.example/oauth/authorize?")
+        assert "client_id=" in setup["authorize_url"]
+        assert snapshot["account_auth"]["oauth"]["counts"]["clients"] == 1
+        assert snapshot["account_auth"]["connector_urls"]["relay"] == "https://relay.example/mcp"
+
+
+def test_ui_service_preferences_and_history_snapshot():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        db = AstrataDatabase(settings.paths.data_dir / "astrata.db")
+        db.initialize()
+        db.upsert_task(
+            TaskRecord(
+                task_id="blocked-task",
+                title="Blocked work",
+                description="Needs intervention.",
+                status="blocked",
+            )
+        )
+        db.upsert_attempt(
+            AttemptRecord(
+                attempt_id="failed-attempt",
+                task_id="blocked-task",
+                actor="loop0",
+                outcome="failed",
+                failure_kind="runtime_error",
+                started_at="2026-04-09T00:00:00+00:00",
+                ended_at="2026-04-09T00:01:00+00:00",
+            )
+        )
+        db.upsert_artifact(
+            ArtifactRecord(
+                artifact_id="history-1",
+                artifact_type="history_report",
+                title="History report",
+                content_summary="Overnight summary.",
+            )
+        )
+
+        service = AstrataUIService(settings=settings)
+        updated = service.set_preferences({"update_channel": "nightly"})
+        snapshot = service.snapshot()
+
+        assert updated["update_channel"] == "nightly"
+        assert snapshot["update_channel"]["selected"] == "nightly"
+        assert snapshot["history"]["overview"]["blocked_tasks"] == 1
+        assert snapshot["history"]["overview"]["failed_attempts"] == 1
+        assert snapshot["history"]["snapshot_reports"][0]["artifact_id"] == "history-1"
+        assert "git" in snapshot["history"]
 
 
 def test_ui_service_task_detail_and_lane_views():

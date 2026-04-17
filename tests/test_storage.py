@@ -12,6 +12,7 @@ from astrata.storage.archive import (
     compact_oversized_runtime_records,
 )
 from astrata.storage.db import AstrataDatabase
+from astrata.storage.hygiene import reconcile_running_attempts
 
 
 def test_database_initializes_and_accepts_records(tmp_path: Path | None = None):
@@ -91,6 +92,37 @@ def test_database_supports_streaming_iteration_and_point_lookup(tmp_path: Path):
     assert looked_up is not None
     assert looked_up["task_id"] == "task-1"
     assert [item["communication_id"] for item in pending_messages] == ["comm-pending"]
+
+
+def test_runtime_hygiene_closes_running_attempts_for_terminal_tasks(tmp_path: Path):
+    db = AstrataDatabase(tmp_path / "astrata.db")
+    db.initialize()
+    db.upsert_task(
+        TaskRecord(
+            task_id="task-done",
+            title="Done",
+            description="Already completed.",
+            status="complete",
+        )
+    )
+    db.upsert_attempt(
+        AttemptRecord(
+            attempt_id="attempt-running",
+            task_id="task-done",
+            actor="loop0:cli",
+            outcome="running",
+            ended_at=None,
+        )
+    )
+
+    result = reconcile_running_attempts(db)
+    stored = db.get_record("attempts", "attempt_id", "attempt-running")
+
+    assert result["closed_attempts"] == 1
+    assert stored is not None
+    assert stored["outcome"] == "succeeded"
+    assert stored["ended_at"]
+    assert stored["provenance"]["runtime_hygiene"]["reason"] == "task_completed_while_attempt_was_running"
 
 
 def test_runtime_archiver_rebuilds_compact_hot_state(tmp_path: Path):

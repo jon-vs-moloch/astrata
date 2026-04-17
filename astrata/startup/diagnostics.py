@@ -8,7 +8,6 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-import sys
 from typing import Any
 from urllib.parse import urlparse
 

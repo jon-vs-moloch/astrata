@@ -1,0 +1,19 @@
+name = "astrata-mcp-relay"
+main = "worker.js"
+compatibility_date = "2026-04-10"
+
+[vars]
+ENVIRONMENT = "development"
+RELAY_DEFAULT_PROFILE_ID = "4c5cb217-c30e-46c4-b1f8-31eeddb39ab3"
+
+# Set this with `wrangler secret put RELAY_SHARED_TOKEN`
+# RELAY_SHARED_TOKEN = ""
+
+[[kv_namespaces]]
+binding = "RELAY_STATE"
+id = "2cb578be03d346e88d42faca234e6432"
+
+[[d1_databases]]
+binding = "astrata_auth_db"
+database_name = "astrata-auth-db"
+database_id = "4bedbe09-987a-40b2-8a33-14ca9a742b56"

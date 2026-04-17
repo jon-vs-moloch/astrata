@@ -31,7 +31,9 @@ class ThermalController:
         self.cooldown_ttl_seconds = max(0, int(cooldown_ttl_seconds))
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def evaluate(self, thermal: ThermalState) -> ThermalDecision:
+    def evaluate(
+        self, thermal: ThermalState, *, bypass_hysteresis: bool = False
+    ) -> ThermalDecision:
         sample = _normalize_pressure(thermal.thermal_pressure)
         previous = self._load_state()
         previous_latched = _normalize_pressure(str(previous.get("latched") or "unknown"))
@@ -51,11 +53,13 @@ class ThermalController:
             action = "cooldown"
             reason = "Thermal pressure is near the nominal/fair boundary."
         elif sample == "nominal":
-            if previous_latched in {"fair", "severe", "critical"}:
+            if not bypass_hysteresis and previous_latched in {"fair", "severe", "critical"}:
                 if cooldown_expired:
                     latched = "nominal"
                     action = "allow"
-                    reason = "Thermal pressure is nominal and the previous cooldown latch has expired."
+                    reason = (
+                        "Thermal pressure is nominal and the previous cooldown latch has expired."
+                    )
                 else:
                     latched = "fair"
                     action = "cooldown"

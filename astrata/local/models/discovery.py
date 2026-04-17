@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Iterable
 
 from astrata.local.models.registry import LocalModelRegistry
 

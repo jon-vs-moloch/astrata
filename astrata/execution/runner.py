@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Any, Callable, Generic, Mapping, MutableMapping, Protocol, TypeVar
+from typing import Any, Generic, Mapping, MutableMapping, Protocol, TypeVar
 
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")

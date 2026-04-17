@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any
 import urllib.error
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider
+from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
 
 
 class OpenAICompatibleProvider(Provider):
@@ -54,6 +54,7 @@ class OpenAICompatibleProvider(Provider):
         endpoint = self.endpoint()
         if not endpoint:
             raise RuntimeError(f"{self.name} endpoint is not configured")
+        assert_projected_memory_request(request, provider_name=self.name)
 
         model = request.model or self.default_model()
         payload = {
