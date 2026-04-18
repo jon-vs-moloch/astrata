@@ -53,6 +53,7 @@ class ManagedProcessStatus:
     command: list[str]
     log_path: str | None
     started_at: float | None
+    metadata: dict[str, object] | None = None
     detail: str | None = None
 
 
@@ -83,6 +84,7 @@ class ManagedProcessController:
             "command": list(launch_spec.command),
             "log_path": str(self.log_path),
             "started_at": time.time(),
+            "metadata": dict(launch_spec.metadata or {}),
         }
         self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return self.status()
@@ -103,6 +105,7 @@ class ManagedProcessController:
             command=list(state.get("command") or []),
             log_path=state.get("log_path"),
             started_at=state.get("started_at"),
+            metadata=dict(state.get("metadata") or {}),
             detail="stopped",
         )
 
@@ -120,6 +123,7 @@ class ManagedProcessController:
             command=list(state.get("command") or []),
             log_path=state.get("log_path"),
             started_at=state.get("started_at"),
+            metadata=dict(state.get("metadata") or {}),
             detail=detail,
         )
 

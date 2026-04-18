@@ -65,6 +65,16 @@ _UPDATE_CHANNELS: dict[str, dict[str, object]] = {
     },
 }
 _DEFAULT_UPDATE_CHANNEL = "tester"
+_DEFAULT_LOCAL_RUNTIME_POLICY: dict[str, Any] = {
+    "auto_load_enabled": False,
+    "keep_user_loaded_model": True,
+    "allow_manual_override": True,
+    "eligible_model_ids": [],
+    "default_profile_id": None,
+    "max_cache_gb": None,
+    "max_ram_gb": None,
+    "max_vram_gb": None,
+}
 
 
 def _now_iso() -> str:
@@ -274,13 +284,22 @@ class AstrataUIService:
         result = runner.run_steps(max(1, steps))
         return {"inbox": inbox, "lane_turns": lane_turns, "loop0": result}
 
-    def start_local_runtime(self, *, model_id: str | None = None, profile_id: str | None = None) -> dict[str, Any]:
+    def start_local_runtime(
+        self,
+        *,
+        model_id: str | None = None,
+        profile_id: str | None = None,
+        override_thermal: bool = False,
+        override_resource_policy: bool = False,
+        operator_initiated: bool = False,
+    ) -> dict[str, Any]:
         manager = self._local_runtime_manager()
-        recommendation = manager.recommend(thermal_preference=self.settings.local_runtime.thermal_preference)
+        policy = self._local_runtime_policy()
+        recommendation = self._recommendation_for_policy(manager, policy)
         thermal_state = probe_thermal_state(preference=self.settings.local_runtime.thermal_preference)
         thermal_controller = ThermalController(state_path=self.settings.paths.data_dir / "thermal_state.json")
         thermal_decision = thermal_controller.evaluate(thermal_state)
-        if not thermal_decision.should_start_new_local_work:
+        if not override_thermal and not thermal_decision.should_start_new_local_work:
             return {
                 "status": "deferred_for_thermal",
                 "thermal_state": {
@@ -300,17 +319,41 @@ class AstrataUIService:
                     "reason": recommendation.reason,
                 },
             }
+        if not operator_initiated and not self._is_model_eligible(model.model_id, policy):
+            return {
+                "status": "blocked_by_eligibility_policy",
+                "model": model.model_dump(mode="json"),
+                "policy": policy,
+            }
+        resource_policy = self._resource_policy_for_model(model, policy)
+        if not override_resource_policy and resource_policy["status"] == "blocked":
+            return {
+                "status": "blocked_by_resource_policy",
+                "model": model.model_dump(mode="json"),
+                "policy": policy,
+                "resource_policy": resource_policy,
+            }
+        selected_profile_id = profile_id or str(policy.get("default_profile_id") or "") or recommendation.profile_id
         status = manager.start_managed(
             backend_id="llama_cpp",
             model_id=model.model_id,
             binary_path=self.settings.local_runtime.llama_cpp_binary,
             host=self.settings.local_runtime.llama_cpp_host,
             port=self.settings.local_runtime.llama_cpp_port,
-            profile_id=profile_id or recommendation.profile_id,
+            profile_id=selected_profile_id,
+            metadata={
+                "load_origin": "user" if operator_initiated else "astrata",
+                "operator_initiated": operator_initiated,
+                "override_thermal": override_thermal,
+                "override_resource_policy": override_resource_policy,
+                "keep_loaded": bool(policy.get("keep_user_loaded_model", True)),
+            },
         )
         return {
             "status": "started",
             "model": model.model_dump(mode="json"),
+            "policy": policy,
+            "resource_policy": resource_policy,
             "managed_process": None if status is None else self._managed_process_summary(status),
         }
 
@@ -459,6 +502,7 @@ class AstrataUIService:
         prefs = self._load_preferences()
         return {
             "update_channel": str(prefs.get("update_channel") or _DEFAULT_UPDATE_CHANNEL),
+            "local_runtime_policy": self._normalize_local_runtime_policy(prefs.get("local_runtime_policy")),
         }
 
     def set_preferences(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -467,8 +511,123 @@ class AstrataUIService:
             requested = str(data.get("update_channel") or "").strip().lower()
             if requested in _UPDATE_CHANNELS:
                 prefs["update_channel"] = requested
+        if "local_runtime_policy" in data:
+            prefs["local_runtime_policy"] = self._normalize_local_runtime_policy(data.get("local_runtime_policy"))
         self._save_preferences(prefs)
         return self.get_preferences()
+
+    def _local_runtime_policy(self) -> dict[str, Any]:
+        prefs = self._load_preferences()
+        return self._normalize_local_runtime_policy(prefs.get("local_runtime_policy"))
+
+    def _normalize_local_runtime_policy(self, raw: Any) -> dict[str, Any]:
+        payload = dict(_DEFAULT_LOCAL_RUNTIME_POLICY)
+        if isinstance(raw, dict):
+            payload.update(raw)
+        eligible = payload.get("eligible_model_ids")
+        if isinstance(eligible, list):
+            payload["eligible_model_ids"] = [
+                str(item).strip()
+                for item in eligible
+                if str(item).strip()
+            ]
+        else:
+            payload["eligible_model_ids"] = []
+        payload["auto_load_enabled"] = bool(payload.get("auto_load_enabled"))
+        payload["keep_user_loaded_model"] = bool(payload.get("keep_user_loaded_model", True))
+        payload["allow_manual_override"] = bool(payload.get("allow_manual_override", True))
+        default_profile_id = str(payload.get("default_profile_id") or "").strip()
+        payload["default_profile_id"] = default_profile_id or None
+        for key in ("max_cache_gb", "max_ram_gb", "max_vram_gb"):
+            payload[key] = self._coerce_optional_float(payload.get(key))
+        return payload
+
+    def _coerce_optional_float(self, value: Any) -> float | None:
+        if value in {None, "", False}:
+            return None
+        try:
+            parsed = float(value)
+        except Exception:
+            return None
+        return parsed if parsed > 0 else None
+
+    def _recommendation_for_policy(self, manager: LocalRuntimeManager, policy: dict[str, Any]):
+        recommendation = manager.recommend(thermal_preference=self.settings.local_runtime.thermal_preference)
+        if recommendation.model is None:
+            return recommendation
+        if self._is_model_eligible(recommendation.model.model_id, policy):
+            return recommendation
+        eligible_models = [
+            model
+            for model in manager.model_registry().list_models()
+            if self._is_model_eligible(model.model_id, policy)
+        ]
+        if not eligible_models:
+            return recommendation
+        ranked = sorted(
+            eligible_models,
+            key=lambda model: (
+                -float(model.observed_average_score or 0.0),
+                -float(model.benchmark_score or 0.0),
+                float(model.size_bytes or 0),
+                model.display_name.lower(),
+            ),
+        )
+        return type(recommendation)(
+            model=ranked[0],
+            profile_id=str(policy.get("default_profile_id") or recommendation.profile_id or "balanced"),
+            reason=f"{recommendation.reason} Auto-load eligibility narrowed the candidate set.",
+        )
+
+    def _is_model_eligible(self, model_id: str, policy: dict[str, Any]) -> bool:
+        eligible = list(policy.get("eligible_model_ids") or [])
+        return not eligible or model_id in eligible
+
+    def _resource_policy_for_model(self, model: Any, policy: dict[str, Any]) -> dict[str, Any]:
+        estimated_gb = round(float(getattr(model, "size_bytes", 0) or 0) / (1024**3), 2)
+        limits = {
+            "max_ram_gb": policy.get("max_ram_gb"),
+            "max_vram_gb": policy.get("max_vram_gb"),
+        }
+        blockers = []
+        for key, label in (("max_ram_gb", "RAM"), ("max_vram_gb", "VRAM/offload")):
+            limit = limits[key]
+            if limit is not None and estimated_gb > float(limit):
+                blockers.append(
+                    f"Estimated footprint {estimated_gb} GB exceeds configured {label} budget of {float(limit):g} GB."
+                )
+        return {
+            "status": "blocked" if blockers else "ok",
+            "estimated_model_gb": estimated_gb,
+            "limits": limits,
+            "reasons": blockers,
+        }
+
+    def _resolve_loaded_model(self, manager: LocalRuntimeManager):
+        selection = manager.current_selection()
+        if selection is None:
+            return None
+        model_id = str(selection.model_id or "").strip()
+        if model_id:
+            record = manager.model_registry().get(model_id)
+            if record is not None:
+                return record
+        model_path = str(dict(selection.metadata or {}).get("model_path") or "").strip()
+        if model_path:
+            return manager.model_registry().find_by_path(model_path)
+        return None
+
+    def _directory_size_bytes(self, path: Path | None) -> int:
+        if path is None or not path.exists():
+            return 0
+        total = 0
+        try:
+            for item in path.rglob("*"):
+                if item.is_file():
+                    total += item.stat().st_size
+        except Exception:
+            return 0
+        return total
 
     def _db(self) -> AstrataDatabase:
         db = AstrataDatabase(self.settings.paths.data_dir / "astrata.db")
@@ -487,14 +646,24 @@ class AstrataUIService:
     def _load_preferences(self) -> dict[str, Any]:
         path = self._preferences_path()
         if not path.exists():
-            return {"update_channel": _DEFAULT_UPDATE_CHANNEL}
+            return {
+                "update_channel": _DEFAULT_UPDATE_CHANNEL,
+                "local_runtime_policy": self._normalize_local_runtime_policy(None),
+            }
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return {"update_channel": _DEFAULT_UPDATE_CHANNEL}
+            return {
+                "update_channel": _DEFAULT_UPDATE_CHANNEL,
+                "local_runtime_policy": self._normalize_local_runtime_policy(None),
+            }
         if not isinstance(payload, dict):
-            return {"update_channel": _DEFAULT_UPDATE_CHANNEL}
+            return {
+                "update_channel": _DEFAULT_UPDATE_CHANNEL,
+                "local_runtime_policy": self._normalize_local_runtime_policy(None),
+            }
         payload.setdefault("update_channel", _DEFAULT_UPDATE_CHANNEL)
+        payload["local_runtime_policy"] = self._normalize_local_runtime_policy(payload.get("local_runtime_policy"))
         return payload
 
     def _save_preferences(self, prefs: dict[str, Any]) -> None:
@@ -666,17 +835,46 @@ class AstrataUIService:
                 mode="external",
                 endpoint=self.settings.local_runtime.llama_cpp_base_url,
             )
+        managed = manager.managed_status()
+        managed_metadata = dict(getattr(managed, "metadata", {}) or {})
+        if managed is not None and getattr(managed, "running", False):
+            model_id = str(managed_metadata.get("model_id") or "").strip() or None
+            model_path = str(managed_metadata.get("model_path") or "").strip()
+            if model_id is None and model_path:
+                record = manager.model_registry().find_by_path(model_path)
+                model_id = None if record is None else record.model_id
+            manager.select_runtime(
+                backend_id=str(managed_metadata.get("backend_id") or "llama_cpp"),
+                model_id=model_id,
+                mode="managed",
+                profile_id=str(managed_metadata.get("profile_id") or "").strip() or None,
+                endpoint=getattr(managed, "endpoint", None),
+                metadata=managed_metadata,
+            )
         return manager
 
     def _local_runtime_snapshot(self) -> dict[str, Any]:
         manager = self._local_runtime_manager()
+        policy = self._local_runtime_policy()
         thermal_state = probe_thermal_state(preference=self.settings.local_runtime.thermal_preference)
         thermal_controller = ThermalController(state_path=self.settings.paths.data_dir / "thermal_state.json")
         thermal_decision = thermal_controller.evaluate(thermal_state)
-        recommendation = manager.recommend(thermal_preference=self.settings.local_runtime.thermal_preference)
+        recommendation = self._recommendation_for_policy(manager, policy)
         managed = manager.managed_status()
+        selection = manager.current_selection()
+        loaded_model = self._resolve_loaded_model(manager)
+        install_dir = self.settings.local_runtime.model_install_dir
+        install_dir_bytes = self._directory_size_bytes(install_dir)
+        models = []
+        for model in manager.model_registry().list_models()[:24]:
+            payload = model.model_dump(mode="json")
+            payload["eligible_for_auto_load"] = self._is_model_eligible(model.model_id, policy)
+            payload["resource_policy"] = self._resource_policy_for_model(model, policy)
+            payload["is_loaded"] = loaded_model is not None and loaded_model.model_id == model.model_id
+            models.append(payload)
         return {
             "thermal_preference": self.settings.local_runtime.thermal_preference,
+            "policy": policy,
             "thermal_state": {
                 "preference": thermal_state.preference,
                 "telemetry_available": thermal_state.telemetry_available,
@@ -690,9 +888,15 @@ class AstrataUIService:
                 "profile_id": recommendation.profile_id,
                 "reason": recommendation.reason,
             },
-            "selection": None if manager.current_selection() is None else manager.current_selection().model_dump(mode="json"),
+            "selection": None if selection is None else selection.model_dump(mode="json"),
+            "loaded_model": None if loaded_model is None else loaded_model.model_dump(mode="json"),
             "managed_process": None if managed is None else self._managed_process_summary(managed),
-            "models": [model.model_dump(mode="json") for model in manager.model_registry().list_models()[:12]],
+            "inventory": {
+                "install_dir": None if install_dir is None else str(install_dir),
+                "install_dir_bytes": install_dir_bytes,
+                "install_dir_gb": round(install_dir_bytes / (1024**3), 2),
+            },
+            "models": models,
         }
 
     def _tasks(self, db: AstrataDatabase) -> list[TaskRecord]:
@@ -841,6 +1045,7 @@ class AstrataUIService:
             "command": list(getattr(status, "command", []) or []),
             "log_path": getattr(status, "log_path", None),
             "started_at": getattr(status, "started_at", None),
+            "metadata": dict(getattr(status, "metadata", {}) or {}),
             "detail": getattr(status, "detail", None),
         }
 

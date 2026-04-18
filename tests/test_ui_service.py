@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -336,6 +337,144 @@ def test_ui_service_preferences_and_history_snapshot():
         assert snapshot["history"]["overview"]["failed_attempts"] == 1
         assert snapshot["history"]["snapshot_reports"][0]["artifact_id"] == "history-1"
         assert "git" in snapshot["history"]
+
+
+def test_ui_service_preferences_include_local_runtime_policy():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        service = AstrataUIService(settings=settings)
+
+        updated = service.set_preferences(
+            {
+                "local_runtime_policy": {
+                    "auto_load_enabled": True,
+                    "keep_user_loaded_model": False,
+                    "eligible_model_ids": ["model-a"],
+                    "max_ram_gb": 8,
+                }
+            }
+        )
+
+        assert updated["local_runtime_policy"]["auto_load_enabled"] is True
+        assert updated["local_runtime_policy"]["keep_user_loaded_model"] is False
+        assert updated["local_runtime_policy"]["eligible_model_ids"] == ["model-a"]
+        assert updated["local_runtime_policy"]["max_ram_gb"] == 8.0
+
+
+def test_ui_service_snapshot_reports_loaded_local_model_from_managed_metadata():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_dir = root / ".astrata"
+        models_dir = data_dir / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        model_path = models_dir / "demo.gguf"
+        model_path.write_bytes(b"gguf")
+        settings = Settings(
+            paths=AstrataPaths(
+                project_root=root,
+                data_dir=data_dir,
+                docs_dir=root,
+                provider_secrets_path=data_dir / "provider_secrets.json",
+            ),
+            runtime_limits=RuntimeLimits(),
+            local_runtime=LocalRuntimeSettings(
+                model_search_paths=(str(models_dir),),
+                model_install_dir=models_dir,
+            ),
+        )
+        (data_dir / "local_runtime.json").write_text(
+            '{"pid": %s, "endpoint": "http://127.0.0.1:8080/health", "command": ["llama-server"], "log_path": "%s", "started_at": 1.0, "metadata": {"backend_id": "llama_cpp", "model_path": "%s", "profile_id": "quiet", "load_origin": "user"}}'
+            % (os.getpid(), data_dir / "local_runtime.log", model_path),
+            encoding="utf-8",
+        )
+
+        snapshot = AstrataUIService(settings=settings).snapshot()
+
+        assert snapshot["local_runtime"]["loaded_model"]["path"] == str(model_path)
+        assert snapshot["local_runtime"]["selection"]["profile_id"] == "quiet"
+        assert snapshot["local_runtime"]["managed_process"]["metadata"]["load_origin"] == "user"
+
+
+def test_ui_service_start_local_runtime_can_override_resource_policy(monkeypatch):
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = _settings(root)
+        service = AstrataUIService(settings=settings)
+        service.set_preferences({"local_runtime_policy": {"max_ram_gb": 1}})
+
+        class _Model:
+            model_id = "model-1"
+            display_name = "Big model"
+            size_bytes = 3 * (1024**3)
+
+            def model_dump(self, mode="json"):
+                return {
+                    "model_id": self.model_id,
+                    "display_name": self.display_name,
+                    "size_bytes": self.size_bytes,
+                }
+
+        class _Recommendation:
+            model = _Model()
+            profile_id = "balanced"
+            reason = "picked"
+
+        class _Manager:
+            started = None
+
+            class _Registry:
+                @staticmethod
+                def get(model_id):
+                    return _Model() if model_id == "model-1" else None
+
+            def recommend(self, thermal_preference="quiet"):
+                return _Recommendation()
+
+            def model_registry(self):
+                return self._Registry()
+
+            def start_managed(self, **kwargs):
+                self.started = kwargs
+                return type("Status", (), {
+                    "running": True,
+                    "pid": 111,
+                    "endpoint": "http://127.0.0.1:8080/health",
+                    "command": ["llama-server"],
+                    "log_path": str(root / "runtime.log"),
+                    "started_at": 1.0,
+                    "metadata": kwargs.get("metadata") or {},
+                    "detail": None,
+                })()
+
+        manager = _Manager()
+        monkeypatch.setattr(service, "_local_runtime_manager", lambda: manager)
+        monkeypatch.setattr("astrata.ui.service.probe_thermal_state", lambda preference="quiet": type("Thermal", (), {
+            "preference": preference,
+            "thermal_pressure": "nominal",
+            "detail": None,
+        })())
+
+        class _Decision:
+            sample = "nominal"
+            latched = "nominal"
+            action = "allow"
+            should_start_new_local_work = True
+            should_throttle_background = False
+            reason = "ok"
+
+        monkeypatch.setattr("astrata.ui.service.ThermalController.evaluate", lambda self, thermal: _Decision())
+
+        blocked = service.start_local_runtime(model_id="model-1", operator_initiated=True)
+        allowed = service.start_local_runtime(
+            model_id="model-1",
+            operator_initiated=True,
+            override_resource_policy=True,
+        )
+
+        assert blocked["status"] == "blocked_by_resource_policy"
+        assert allowed["status"] == "started"
+        assert manager.started["metadata"]["load_origin"] == "user"
 
 
 def test_ui_service_task_detail_and_lane_views():

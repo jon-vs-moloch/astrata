@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +45,7 @@ class LocalModelRegistry:
         if existing is not None:
             return existing
         model = LocalModelRecord(
+            model_id=_stable_model_id(normalized),
             display_name=display_name or expanded.stem,
             path=normalized,
             size_bytes=expanded.stat().st_size if expanded.exists() else 0,
@@ -119,3 +120,10 @@ def _infer_tags(label: str, path: str) -> list[str]:
     if "mmproj" in lowered or "projector" in lowered:
         tags.append("support-artifact")
     return tags
+
+
+def _stable_model_id(path: str) -> str:
+    normalized = str(Path(path).expanduser()).strip()
+    if not normalized:
+        return str(uuid4())
+    return str(uuid5(NAMESPACE_URL, normalized))

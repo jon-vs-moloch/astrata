@@ -924,13 +924,64 @@ function renderModels(summary) {
   const runtime  = summary?.local_runtime || {};
   const desktop  = APP.desktopBackendStatus || summary?.desktop_backend || {};
   const models   = runtime?.models || [];
+  const policy   = APP.generalSettings?.local_runtime_policy || runtime?.policy || {};
   const thermal  = runtime?.thermal_state || {};
   const decision = runtime?.thermal_decision || {};
   const rec      = runtime?.recommendation || {};
   const managed  = runtime?.managed_process || {};
+  const loaded   = runtime?.loaded_model || null;
+  const inventory = runtime?.inventory || {};
   const running  = Boolean(managed?.running);
   const backendRunning = Boolean(desktop?.backend_running) || Boolean(summary);
   const backendStopped = Boolean(desktop?.backend_deliberately_stopped) && !backendRunning;
+  const loadedBy = managed?.metadata?.load_origin || 'astrata';
+
+  function formatGb(value) {
+    return value == null || value === '' ? '—' : `${Number(value).toFixed(1)} GB`;
+  }
+
+  async function savePolicy(nextPolicy, { refreshAfter = true } = {}) {
+    APP.generalSettings = {
+      ...(APP.generalSettings || {}),
+      local_runtime_policy: nextPolicy,
+    };
+    await api('/api/settings', {
+      method: 'POST',
+      body: JSON.stringify({ local_runtime_policy: nextPolicy }),
+    });
+    if (refreshAfter) await refresh();
+  }
+
+  async function loadModel(model, { overrideThermal = false, overrideResourcePolicy = false } = {}) {
+    const query = new URLSearchParams({
+      model_id: model.model_id,
+      operator_initiated: 'true',
+      override_thermal: String(Boolean(overrideThermal)),
+      override_resource_policy: String(Boolean(overrideResourcePolicy)),
+    });
+    const result = await api(`/api/local-runtime/start?${query.toString()}`, { method: 'POST' });
+    if (
+      (result?.status === 'deferred_for_thermal' || result?.status === 'blocked_by_resource_policy')
+      && policy?.allow_manual_override
+    ) {
+      const reason = result?.status === 'deferred_for_thermal'
+        ? 'Astrata would normally defer this load because of current thermal pressure.'
+        : (result?.resource_policy?.reasons || []).join(' ');
+      const confirmed = window.confirm(`${reason} Force-load ${model.display_name || model.model_id} anyway?`);
+      if (confirmed) {
+        await api(
+          `/api/local-runtime/start?${new URLSearchParams({
+            model_id: model.model_id,
+            operator_initiated: 'true',
+            override_thermal: 'true',
+            override_resource_policy: 'true',
+          }).toString()}`,
+          { method: 'POST' },
+        );
+      }
+    }
+    await refresh();
+  }
 
   clearAndAppend(document.getElementById('runtimeStatus'), el('div', { className: 'runtime-card' },
     el('div', { className: 'runtime-status-row' },
@@ -943,8 +994,32 @@ function renderModels(summary) {
     el('div', { className: 'metric-grid' },
       metricTile(thermal?.thermal_pressure || 'unknown', 'Thermal'),
       metricTile(decision?.action || '—', 'Decision'),
-      metricTile(rec?.model?.display_name || 'None', 'Recommended'),
+      metricTile(loaded?.display_name || rec?.model?.display_name || 'None', running ? 'Loaded' : 'Recommended'),
       metricTile(models.length, 'Models Found'),
+    ),
+    running ? el('div', { style: { marginTop: '12px', fontSize: '13px', color: 'var(--text-muted)', lineHeight: '1.7' } },
+      `${loaded?.display_name || 'Unknown model'} is loaded`,
+      loadedBy === 'user' ? ' because you requested it. Astrata should preserve it unless you unload it.' : '.',
+    ) : null,
+    el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' } },
+      running ? el('button', {
+        className: 'btn btn-secondary btn-sm',
+        onClick: async (e) => {
+          const btn = e.currentTarget;
+          btn.disabled = true;
+          btn.textContent = 'Unloading…';
+          try {
+            await api('/api/local-runtime/stop', { method: 'POST' });
+            await refresh();
+          } catch (err) { console.error(err); }
+          finally {
+            btn.disabled = false;
+            btn.textContent = 'Unload';
+          }
+        },
+      }, 'Unload') : null,
+      loaded?.path ? routePill('PATH', truncate(loaded.path, 36), 'neutral') : null,
+      policy?.keep_user_loaded_model ? routePill('PIN', 'user loads stay resident', 'success') : routePill('PIN', 'Astrata may reclaim', 'warning'),
     ),
     APP.desktopAvailable ? el('div', { style: { marginTop: '12px', fontSize: '12px', color: 'var(--text-muted)' } },
       `Desktop backend: ${backendRunning ? 'running' : (backendStopped ? 'stopped deliberately' : 'recovering')}.`) : null,
@@ -979,30 +1054,154 @@ function renderModels(summary) {
     return;
   }
 
-  clearAndAppend(grid, models.map(model => {
+  const eligibleSet = new Set(policy?.eligible_model_ids || []);
+  const selectedProfile = policy?.default_profile_id || '';
+  const profileOptions = ['quiet', 'balanced', 'turbo', 'quality'];
+  const policyPanel = el('div', { className: 'runtime-card', style: { marginBottom: '12px' } },
+    el('div', { className: 'runtime-status-row' },
+      el('span', { style: { fontWeight: '700', fontSize: '14px' } }, 'Runtime Policy'),
+      pill(policy?.auto_load_enabled ? 'auto-load enabled' : 'manual loads only', policy?.auto_load_enabled ? 'success' : 'neutral'),
+    ),
+    el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '10px', marginTop: '12px' } },
+      (() => {
+        const wrap = el('label', { className: 'model-card-detail', style: { display: 'flex', gap: '8px', alignItems: 'center' } });
+        const input = el('input', { type: 'checkbox' });
+        input.checked = Boolean(policy?.auto_load_enabled);
+        wrap.append(input, el('span', {}, 'Allow Astrata to auto-load eligible models'));
+        wrap._input = input;
+        return wrap;
+      })(),
+      (() => {
+        const wrap = el('label', { className: 'model-card-detail', style: { display: 'flex', gap: '8px', alignItems: 'center' } });
+        const input = el('input', { type: 'checkbox' });
+        input.checked = Boolean(policy?.keep_user_loaded_model);
+        wrap.append(input, el('span', {}, 'Preserve models you load intentionally'));
+        wrap._input = input;
+        return wrap;
+      })(),
+      (() => {
+        const wrap = el('label', { className: 'model-card-detail', style: { display: 'flex', gap: '8px', alignItems: 'center' } });
+        const input = el('input', { type: 'checkbox' });
+        input.checked = Boolean(policy?.allow_manual_override);
+        wrap.append(input, el('span', {}, 'Offer force-load when caps would block'));
+        wrap._input = input;
+        return wrap;
+      })(),
+    ),
+    el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '10px', marginTop: '12px' } },
+      (() => {
+        const wrap = el('label', { style: { display: 'grid', gap: '6px', fontSize: '12px', color: 'var(--text-dim)' } }, 'Default profile');
+        const select = el('select', { className: 'input' },
+          el('option', { value: '' }, 'Use recommendation'),
+          ...profileOptions.map(id => el('option', { value: id }, id)),
+        );
+        select.value = selectedProfile;
+        wrap.append(select);
+        wrap._input = select;
+        return wrap;
+      })(),
+      ...['max_cache_gb', 'max_ram_gb', 'max_vram_gb'].map(key => {
+        const labels = {
+          max_cache_gb: 'Max downloaded cache (GB)',
+          max_ram_gb: 'Max RAM budget (GB)',
+          max_vram_gb: 'Max VRAM/offload budget (GB)',
+        };
+        const wrap = el('label', { style: { display: 'grid', gap: '6px', fontSize: '12px', color: 'var(--text-dim)' } }, labels[key]);
+        const input = el('input', { type: 'number', min: '0', step: '0.5', value: policy?.[key] ?? '' });
+        wrap.append(input);
+        wrap._input = input;
+        wrap._key = key;
+        return wrap;
+      }),
+    ),
+    el('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' } },
+      el('button', {
+        className: 'btn btn-secondary btn-sm',
+        onClick: async (e) => {
+          const btn = e.currentTarget;
+          const toggles = policyPanel.querySelectorAll('label');
+          const [autoLoadRow, keepLoadedRow, allowOverrideRow] = toggles;
+          const numberRows = Array.from(policyPanel.querySelectorAll('label')).slice(4);
+          const nextPolicy = {
+            ...policy,
+            auto_load_enabled: autoLoadRow?._input?.checked,
+            keep_user_loaded_model: keepLoadedRow?._input?.checked,
+            allow_manual_override: allowOverrideRow?._input?.checked,
+            default_profile_id: policyPanel.querySelector('select')?.value || null,
+            eligible_model_ids: Array.from(eligibleSet),
+          };
+          numberRows.forEach(row => {
+            nextPolicy[row._key] = row._input?.value || null;
+          });
+          btn.disabled = true;
+          btn.textContent = 'Saving…';
+          try { await savePolicy(nextPolicy); }
+          catch (err) { console.error(err); }
+          finally {
+            btn.disabled = false;
+            btn.textContent = 'Save policy';
+          }
+        },
+      }, 'Save policy'),
+      inventory?.install_dir ? routePill('CACHE', `${formatGb(inventory?.install_dir_gb)} used`, 'neutral') : null,
+    ),
+  );
+
+  const cards = models.map(model => {
     const isRecommended = rec?.model?.model_id === model.model_id;
+    const isLoaded = Boolean(model?.is_loaded);
+    const resourcePolicy = model?.resource_policy || {};
+    const eligible = eligibleSet.size === 0 ? true : eligibleSet.has(model.model_id);
     return el('div', { className: 'model-card' },
       el('div', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start' } },
         el('div', { className: 'model-card-name', style: { flex: '1' } }, model.display_name || model.model_id),
+        isLoaded ? pill('Loaded', 'success') : null,
         isRecommended ? pill('Recommended', 'success') : null,
       ),
       el('div', { className: 'model-card-meta' },
         model.family ? pill(model.family, 'neutral') : null,
         model.role ? pill(model.role, 'neutral') : null,
         model.quantization ? pill(model.quantization, 'neutral') : null,
+        !eligible ? pill('Auto-load excluded', 'warning') : null,
       ),
       model.path ? el('div', { className: 'model-card-detail' }, model.path) : null,
+      el('div', { className: 'model-card-detail', style: { marginTop: '8px' } },
+        `Estimated footprint: ${formatGb(resourcePolicy?.estimated_model_gb)}`
+        + (resourcePolicy?.status === 'blocked' ? ` • ${resourcePolicy.reasons.join(' ')}` : ''),
+      ),
       el('div', { className: 'model-card-actions' },
-        el('button', {
+        (() => {
+          const label = el('label', { style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--text-dim)' } });
+          const input = el('input', { type: 'checkbox' });
+          input.checked = eligible;
+          input.addEventListener('change', async () => {
+            if (eligibleSet.size === 0) {
+              models.forEach(item => eligibleSet.add(item.model_id));
+            }
+            if (input.checked) eligibleSet.add(model.model_id);
+            else eligibleSet.delete(model.model_id);
+            await savePolicy({
+              ...policy,
+              eligible_model_ids: eligibleSet.size === models.length ? [] : Array.from(eligibleSet),
+            });
+          });
+          label.append(input, el('span', {}, 'Eligible for auto-load'));
+          return label;
+        })(),
+        isLoaded ? el('button', {
+          className: 'btn btn-secondary btn-sm',
+          onClick: async () => {
+            await api('/api/local-runtime/stop', { method: 'POST' });
+            await refresh();
+          },
+        }, 'Unload') : el('button', {
           className: 'btn btn-secondary btn-sm',
           onClick: async (e) => {
             const btn = e.currentTarget;
             btn.disabled = true;
-            btn.textContent = 'Starting…';
-            try {
-              await api(`/api/local-runtime/start?model_id=${encodeURIComponent(model.model_id)}`, { method: 'POST' });
-              await refresh();
-            } catch (err) { console.error(err); }
+            btn.textContent = 'Loading…';
+            try { await loadModel(model); }
+            catch (err) { console.error(err); }
             finally {
               btn.disabled = false;
               btn.textContent = '▶ Load';
@@ -1011,7 +1210,9 @@ function renderModels(summary) {
         }, '▶ Load'),
       ),
     );
-  }));
+  });
+
+  clearAndAppend(grid, [policyPanel, ...cards]);
 }
 
 function setDesktopOverlay({ title, body, dismissible = true } = {}) {

@@ -121,6 +121,7 @@ class LocalRuntimeManager:
         port: int = 8080,
         profile_id: str | None = None,
         extra_args: tuple[str, ...] = (),
+        metadata: dict[str, Any] | None = None,
         activate: bool = True,
     ) -> ManagedProcessStatus:
         controller = self._controller_for_runtime(runtime_key)
@@ -146,6 +147,19 @@ class LocalRuntimeManager:
             port=port,
             profile=profile,
             extra_args=extra_args,
+        )
+        launch_spec = launch_spec.model_copy(
+            update={
+                "metadata": {
+                    **dict(launch_spec.metadata or {}),
+                    "runtime_key": runtime_key,
+                    "backend_id": backend_id,
+                    "model_id": model.model_id,
+                    "model_path": model.path,
+                    "profile_id": profile.profile_id,
+                    **dict(metadata or {}),
+                }
+            }
         )
         self.select_runtime(
             runtime_key=runtime_key,

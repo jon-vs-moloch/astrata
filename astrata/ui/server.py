@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import threading
 import webbrowser
+from typing import Any
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -33,6 +34,7 @@ class UIActionResponse(BaseModel):
 
 class UISettingsRequest(BaseModel):
     update_channel: str | None = None
+    local_runtime_policy: dict[str, Any] | None = None
 
 
 class UIInviteRedeemRequest(BaseModel):
@@ -147,8 +149,20 @@ def create_app() -> FastAPI:
         return UIActionResponse(status="ok", detail=result)
 
     @app.post("/api/local-runtime/start")
-    def start_local_runtime(model_id: str | None = None, profile_id: str | None = None) -> UIActionResponse:
-        result = service.start_local_runtime(model_id=model_id, profile_id=profile_id)
+    def start_local_runtime(
+        model_id: str | None = None,
+        profile_id: str | None = None,
+        override_thermal: bool = False,
+        override_resource_policy: bool = False,
+        operator_initiated: bool = False,
+    ) -> UIActionResponse:
+        result = service.start_local_runtime(
+            model_id=model_id,
+            profile_id=profile_id,
+            override_thermal=override_thermal,
+            override_resource_policy=override_resource_policy,
+            operator_initiated=operator_initiated,
+        )
         return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
 
     @app.post("/api/local-runtime/stop")
