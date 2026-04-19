@@ -193,7 +193,11 @@ fn candidate_python_paths(root_dir: &Path) -> Vec<PathBuf> {
         }
     }
     candidates.extend([
-        root_dir.join(".astrata").join("runtime-venv").join("bin").join("python"),
+        root_dir
+            .join(".astrata")
+            .join("runtime-venv")
+            .join("bin")
+            .join("python"),
         root_dir.join(".venv").join("bin").join("python"),
         root_dir.join("venv").join("bin").join("python"),
         PathBuf::from("/opt/homebrew/bin/python3"),
@@ -239,7 +243,11 @@ fn find_python(root_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn build_preflight_report(root_dir: &Path, selected_python: Option<&Path>, bootstrap_error: Option<&str>) -> StartupPreflightReport {
+fn build_preflight_report(
+    root_dir: &Path,
+    selected_python: Option<&Path>,
+    bootstrap_error: Option<&str>,
+) -> StartupPreflightReport {
     let runtime = runtime_dir(root_dir);
     let manifest_path = runtime.join("install_manifest.json");
     let managed_runtime_python = runtime.join("runtime-venv").join("bin").join("python");
@@ -247,19 +255,31 @@ fn build_preflight_report(root_dir: &Path, selected_python: Option<&Path>, boots
         PreflightCheck {
             name: "runtime_dir".into(),
             ok: runtime.exists(),
-            status: if runtime.exists() { "pass".into() } else { "fail".into() },
+            status: if runtime.exists() {
+                "pass".into()
+            } else {
+                "fail".into()
+            },
             detail: runtime.display().to_string(),
         },
         PreflightCheck {
             name: "install_manifest".into(),
             ok: manifest_path.exists(),
-            status: if manifest_path.exists() { "pass".into() } else { "fail".into() },
+            status: if manifest_path.exists() {
+                "pass".into()
+            } else {
+                "fail".into()
+            },
             detail: manifest_path.display().to_string(),
         },
         PreflightCheck {
             name: "managed_runtime_python".into(),
             ok: managed_runtime_python.exists(),
-            status: if managed_runtime_python.exists() { "pass".into() } else { "fail".into() },
+            status: if managed_runtime_python.exists() {
+                "pass".into()
+            } else {
+                "fail".into()
+            },
             detail: managed_runtime_python.display().to_string(),
         },
     ];
@@ -376,7 +396,10 @@ fn wait_for_ui(port: u16, timeout: Duration) -> bool {
 
 fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
     if ui_port_open(port) || ui_health_ok(port) {
-        append_launcher_log(root_dir, &format!("reusing existing ui backend on port {port}"));
+        append_launcher_log(
+            root_dir,
+            &format!("reusing existing ui backend on port {port}"),
+        );
         write_preflight_report(root_dir, &build_preflight_report(root_dir, None, None));
         write_desktop_session(
             root_dir,
@@ -400,7 +423,10 @@ fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
         write_preflight_report(root_dir, &build_preflight_report(root_dir, None, Some(&error)));
         error
     })?;
-    write_preflight_report(root_dir, &build_preflight_report(root_dir, Some(&python), None));
+    write_preflight_report(
+        root_dir,
+        &build_preflight_report(root_dir, Some(&python), None),
+    );
     let runtime_dir = runtime_dir(root_dir);
     std::fs::create_dir_all(&runtime_dir)
         .map_err(|err| format!("Failed to create runtime dir: {err}"))?;
@@ -432,7 +458,10 @@ fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
                 "Failed to launch Astrata supervisor with {:?}: {err}",
                 python
             );
-            write_preflight_report(root_dir, &build_preflight_report(root_dir, Some(&python), Some(&message)));
+            write_preflight_report(
+                root_dir,
+                &build_preflight_report(root_dir, Some(&python), Some(&message)),
+            );
             message
         })?;
     append_launcher_log(
@@ -464,11 +493,17 @@ fn start_backend(root_dir: &Path, port: u16) -> Result<Option<Child>, String> {
         );
         let _ = child.kill();
         clear_desktop_session(root_dir);
-        write_preflight_report(root_dir, &build_preflight_report(root_dir, Some(&python), Some(&message)));
+        write_preflight_report(
+            root_dir,
+            &build_preflight_report(root_dir, Some(&python), Some(&message)),
+        );
         return Err(message);
     }
 
-    write_preflight_report(root_dir, &build_preflight_report(root_dir, Some(&python), None));
+    write_preflight_report(
+        root_dir,
+        &build_preflight_report(root_dir, Some(&python), None),
+    );
 
     Ok(Some(child))
 }
@@ -511,14 +546,18 @@ fn desktop_backend_status(root_dir: &Path, ui_port: u16) -> DesktopBackendStatus
     }
 }
 
-fn stop_backend_process(root_dir: &Path, child_state: &BackendChildState, ui_port: u16) -> Result<(), String> {
+fn stop_backend_process(
+    root_dir: &Path,
+    child_state: &BackendChildState,
+    ui_port: u16,
+) -> Result<(), String> {
     if let Ok(mut maybe_child) = child_state.0.lock() {
         if let Some(mut child) = maybe_child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
-    
+
     if let Some(python) = find_python(root_dir) {
         let _ = Command::new(&python)
             .current_dir(root_dir)
@@ -532,8 +571,8 @@ fn stop_backend_process(root_dir: &Path, child_state: &BackendChildState, ui_por
             .stderr(Stdio::null())
             .status();
     }
-    
-    let mut stopped = true;
+
+    let stopped = true;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if !ui_port_open(ui_port) && !ui_health_ok(ui_port) {
@@ -560,7 +599,9 @@ fn close_main_window(app: &AppHandle, close_guard: &CloseGuardState) -> Result<(
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Astrata desktop window is not available.".to_string())?;
-    window.close().map_err(|err| format!("Failed to close Astrata window: {err}"))
+    window
+        .close()
+        .map_err(|err| format!("Failed to close Astrata window: {err}"))
 }
 
 #[tauri::command]

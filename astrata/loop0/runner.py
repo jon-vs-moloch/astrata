@@ -69,6 +69,10 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _is_empty_dispatch_value(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
 @dataclass(frozen=True)
 class Loop0TaskCandidate:
     key: str
@@ -2780,14 +2784,13 @@ class Loop0Runner:
                 }
             payload["status"] = status
             provenance = dict(payload.get("provenance") or {})
-            provenance["dispatch"] = {
-                "source": "loop0_runner",
-                "candidate_key": candidate.key,
-                "inspection": assessment.inspection,
-                "implementation": implementation,
-                "recommendation": recommendation,
-                "coordination": coordination,
-            }
+            provenance["dispatch"] = self._dispatch_summary(
+                candidate=candidate,
+                assessment=assessment,
+                implementation=implementation,
+                recommendation=recommendation,
+                coordination=coordination,
+            )
             payload["provenance"] = provenance
             payload["updated_at"] = _now_iso()
             return TaskRecord(**payload)
@@ -2798,17 +2801,68 @@ class Loop0Runner:
             urgency=candidate.urgency,
             risk=candidate.risk,
             status=status,
-            provenance={
-                "source": "loop0_runner",
-                "candidate_key": candidate.key,
-                "inspection": assessment.inspection,
-                "implementation": implementation,
-                "recommendation": recommendation,
-                "coordination": coordination,
-            },
+            provenance=self._dispatch_summary(
+                candidate=candidate,
+                assessment=assessment,
+                implementation=implementation,
+                recommendation=recommendation,
+                coordination=coordination,
+            ),
             success_criteria={"expected_paths": list(candidate.expected_paths)},
             completion_policy={"type": "apply_bounded_implementation", "strategy": candidate.strategy},
         )
+
+    def _dispatch_summary(
+        self,
+        *,
+        candidate: Loop0TaskCandidate,
+        assessment: Loop0CandidateAssessment,
+        implementation: dict[str, Any],
+        recommendation: dict[str, Any],
+        coordination: dict[str, Any],
+    ) -> dict[str, Any]:
+        inspection = dict(assessment.inspection or {})
+        task_record = dict(inspection.get("task_record") or {})
+        compact_inspection = {
+            "task_id": task_record.get("task_id") or candidate.source_task_id,
+            "status": task_record.get("status"),
+            "priority": task_record.get("priority"),
+            "urgency": task_record.get("urgency"),
+            "risk": task_record.get("risk"),
+            "provenance_keys": sorted(dict(task_record.get("provenance") or {}).keys())[:32],
+            "attempt_count": inspection.get("attempt_count"),
+            "artifact_count": inspection.get("artifact_count"),
+        }
+        compact_implementation = {
+            key: implementation.get(key)
+            for key in (
+                "status",
+                "generation_mode",
+                "failure_kind",
+                "degraded_reason",
+                "delegated_via_worker",
+                "worker_task_id",
+                "delegation_request_id",
+                "delegation_result_id",
+            )
+            if not _is_empty_dispatch_value(implementation.get(key))
+        }
+        return {
+            "source": "loop0_runner",
+            "candidate_key": candidate.key,
+            "candidate_strategy": candidate.strategy,
+            "inspection": compact_inspection,
+            "implementation": compact_implementation,
+            "recommended": {
+                "action": recommendation.get("action"),
+                "reason": recommendation.get("reason"),
+                "confidence": recommendation.get("confidence"),
+            },
+            "coordination": {
+                "status": coordination.get("status"),
+                "reason": coordination.get("reason"),
+            },
+        }
 
     def _verify_candidate(
         self,

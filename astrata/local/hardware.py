@@ -65,7 +65,14 @@ def probe_thermal_state(*, preference: str = "quiet") -> ThermalState:
             if output.strip():
                 telemetry_available = True
                 lowered = output.lower()
-                if "critical" in lowered:
+                no_warning_recorded = (
+                    "no thermal warning" in lowered
+                    and "no performance warning" in lowered
+                    and "no cpu power status" in lowered
+                )
+                if no_warning_recorded:
+                    thermal_pressure = "nominal"
+                elif "critical" in lowered:
                     thermal_pressure = "critical"
                 elif "severe" in lowered:
                     thermal_pressure = "severe"

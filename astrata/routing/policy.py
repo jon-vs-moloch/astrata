@@ -86,7 +86,7 @@ class RouteChooser:
                     reason="preferred_provider",
                 )
         if prefer_local:
-            route = _pick(("ollama", "custom", "cli"))
+            route = _pick(("ollama", "pollinations", "custom", "cli"))
             if route:
                 return ExecutionRoute(
                     provider=route.provider,
@@ -95,7 +95,7 @@ class RouteChooser:
                     reason="prefer_local",
                 )
         if risk in {"high", "critical"}:
-            route = _pick(("codex", "openai", "google", "anthropic", "cli"))
+            route = _pick(("codex", "openai", "openrouter", "kilo-gateway", "google", "anthropic", "cli"))
             if route:
                 return ExecutionRoute(
                     provider=route.provider,

@@ -392,6 +392,10 @@ def test_ui_service_snapshot_reports_loaded_local_model_from_managed_metadata():
         snapshot = AstrataUIService(settings=settings).snapshot()
 
         assert snapshot["local_runtime"]["loaded_model"]["path"] == str(model_path)
+        assert snapshot["local_runtime"]["loaded_models"][0]["model"]["path"] == str(model_path)
+        assert snapshot["local_runtime"]["loaded_models"][0]["runtime_key"] == "default"
+        assert snapshot["local_runtime"]["served_endpoints"][0]["chat_completions_url"] == "http://127.0.0.1:8080/v1/chat/completions"
+        assert snapshot["local_runtime"]["endpoint_config"]["default_health_url"] == "http://127.0.0.1:8080/health"
         assert snapshot["local_runtime"]["selection"]["profile_id"] == "quiet"
         assert snapshot["local_runtime"]["managed_process"]["metadata"]["load_origin"] == "user"
 
@@ -537,6 +541,174 @@ def test_ui_service_task_detail_and_lane_views():
         assert snapshot["communications"]["local_inbox"][0]["message"] == "Hello Local"
         assert snapshot["communications"]["prime_conversation"][0]["message"] == "Hello Prime"
         assert len(snapshot["communications"]["prime_conversation"]) >= 2
+        assert snapshot["chats"]["active_threads"]
+        assert "prime" in snapshot["agents"]
+
+
+def test_ui_service_chat_threads_can_archive_and_convert():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        service = AstrataUIService(settings=_settings(root))
+
+        thread = service.create_chat_thread(
+            {
+                "chat_kind": "agent",
+                "agent_id": "prime",
+                "agent_mode": "ephemeral",
+                "title": "Scratch with Prime",
+            }
+        )
+        converted = service.update_chat_thread_status(thread["thread_id"], "convert")
+        archived = service.update_chat_thread_status(thread["thread_id"], "archive")
+        snapshot = service.snapshot()
+
+        assert converted["thread"]["agent_mode"] == "persistent"
+        assert converted["thread"]["memory_policy"]["update_agent_memory"] is True
+        assert archived["thread"]["status"] == "archived"
+        assert any(item["thread_id"] == thread["thread_id"] for item in snapshot["chats"]["archived_threads"])
+
+
+def test_ui_service_snapshot_groups_messages_by_chat_thread():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        service = AstrataUIService(settings=_settings(root))
+        thread = service.create_chat_thread(
+            {
+                "chat_kind": "agent",
+                "agent_id": "reception",
+                "agent_mode": "persistent",
+                "title": "Reception scratch",
+            }
+        )
+
+        service.send_message(
+            MessageDraft(
+                message="Hello Reception",
+                recipient="reception",
+                thread_id=thread["thread_id"],
+            )
+        )
+        snapshot = service.snapshot()
+
+        grouped = snapshot["communications"]["chat_thread_conversations"]
+        assert grouped[thread["thread_id"]][0]["message"] == "Hello Reception"
+        assert snapshot["communications"].get("reception_conversation") is None
+
+
+def test_ui_service_new_chat_thread_materializes_with_first_message():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        service = AstrataUIService(settings=_settings(root))
+
+        service.send_message(
+            MessageDraft(
+                message="Start a dedicated Reception thread",
+                recipient="reception",
+                agent_mode="persistent",
+                start_new_thread=True,
+            )
+        )
+        snapshot = service.snapshot()
+
+        threads = [
+            thread
+            for thread in snapshot["chats"]["threads"]
+            if thread["agent_id"] == "reception" and not thread["metadata"].get("main_lane")
+        ]
+        assert len(threads) == 1
+        assert threads[0]["message_count_total"] == 1
+        assert threads[0]["conversation_id"].startswith("lane:reception:")
+        assert not threads[0]["conversation_id"].endswith(":00")
+        assert snapshot["communications"]["chat_thread_conversations"][threads[0]["thread_id"]][0][
+            "message"
+        ] == "Start a dedicated Reception thread"
+
+
+def test_ui_service_snapshot_prunes_empty_non_main_threads():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        service = AstrataUIService(settings=_settings(root))
+        empty = service.create_chat_thread(
+            {
+                "chat_kind": "agent",
+                "agent_id": "prime",
+                "agent_mode": "persistent",
+                "title": "Empty accidental thread",
+            }
+        )
+
+        snapshot = service.snapshot()
+
+        assert all(
+            thread["thread_id"] != empty["thread_id"]
+            for thread in snapshot["chats"]["active_threads"]
+        )
+        assert any(
+            thread["agent_id"] == "prime" and thread["metadata"].get("main_lane")
+            for thread in snapshot["chats"]["active_threads"]
+        )
+
+
+def test_ui_service_model_chat_without_endpoint_reports_error():
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        service = AstrataUIService(settings=_settings(root))
+
+        result = service.send_message(
+            MessageDraft(
+                message="hello model",
+                chat_kind="model",
+                model_id="local",
+            )
+        )
+        snapshot = service.snapshot()
+
+        assert "No running local inference endpoint" in result["error"]
+        assert result["message"]["recipient"] == "model:local"
+        assert snapshot["chats"]["kinds"]["model"] == 1
+
+
+def test_ui_service_model_chat_can_target_configured_provider(monkeypatch):
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        service = AstrataUIService(settings=_settings(root))
+
+        class _Provider:
+            name = "openrouter"
+
+            def is_configured(self):
+                return True
+
+            def default_model(self):
+                return "openai/gpt-5.4-mini"
+
+            def complete(self, request):
+                from astrata.providers.base import CompletionResponse
+
+                return CompletionResponse(
+                    provider=self.name,
+                    model=request.model,
+                    content=f"provider said hi via {request.model}",
+                )
+
+        class _Registry:
+            def get_provider(self, provider_id):
+                return _Provider() if provider_id == "openrouter" else None
+
+        monkeypatch.setattr("astrata.ui.service.build_default_registry", lambda: _Registry())
+
+        result = service.send_message(
+            MessageDraft(
+                message="hello provider model",
+                chat_kind="model",
+                provider_id="openrouter",
+                model_id="openai/gpt-5.4-mini",
+            )
+        )
+
+        assert result["reply"]["payload"]["message"] == "provider said hi via openai/gpt-5.4-mini"
+        assert result["message"]["recipient"] == "model:openrouter:openai/gpt-5.4-mini"
+        assert result["endpoint"]["provider_id"] == "openrouter"
 
 
 def test_ui_service_snapshot_reports_inference_spend():

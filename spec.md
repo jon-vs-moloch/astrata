@@ -641,7 +641,7 @@ Variants may differ in:
 Variants are not special lab-only objects.
 They are normal runtime objects that can be tested in bounded ways against real and synthetic work.
 
-### 8. Communication
+### 7. Communication
 
 A `Communication` is a routed message with provenance, intended recipient, and lifecycle state.
 
@@ -697,13 +697,13 @@ Useful additional fields may include:
 - `trust_level`
 - `notes`
 
-### 9. Approval
+### 8. Approval
 
 An `Approval` is a gated authorization event for risky actions.
 
 Approvals are first-class system objects, not ad hoc interruptions.
 
-### 10. Memory
+### 9. Memory
 
 `Memory` is the fast, operational retrieval substrate.
 
@@ -715,10 +715,8 @@ It stores:
 - preferences
 - recent work state
 - embeddings and retrieval indices
-- tiered summaries and disclosure views
-- provenance and revision history
 
-### 11. Knowledge
+### 10. Knowledge
 
 `Knowledge` is the synthesized, compacted, provenance-aware understanding layer.
 
@@ -819,65 +817,6 @@ These three surfaces belong to one routing system.
 ---
 
 ## Experimental Runtime
-
-The current local endpoint should converge on one explicit inference control surface centered on `reasoning_effort`.
-
-Near-term semantics should include:
-
-- `none`
-- `low`
-- `medium`
-- `high`
-- `auto`
-- `auto_none`
-- `auto_low`
-
-`auto` means the model first chooses the lightest adequate reasoning effort for the request, then answers using that effort.
-
-`auto_none` and `auto_low` mean effort selection itself should be done with no or low reasoning, which may be preferable for small local models.
-
-This should replace imprecise lane terminology such as "fast" versus "persistent" when the real distinction is simply reasoning effort selection.
-
-### Endpoint Versus Backend
-
-Serving configuration and backend residency should be separate concepts.
-
-Astrata should eventually support multiple externally visible endpoints with independent:
-
-- ports
-- auth policies
-- rate limits
-- disclosure rules
-- inference settings
-- experimental routing or reasoning policies
-
-But those endpoint-level configurations should not imply duplicate model loads by default.
-
-The system should be able to:
-
-- load models A, B, and C into one backend residency set
-- expose endpoint 1000 with models A and B
-- expose endpoint 1001 with models A and C
-- share the same loaded model instances unless deliberate duplicate loading was explicitly requested
-
-Multi-loading should remain possible, but it should be a separate operational decision rather than an accidental consequence of serving topology.
-
-### Local Security Enclave
-
-Local inference is not only a cost or privacy preference.
-It is also a security surface.
-
-Astrata should eventually have a secure local enclave accessible only to approved local runtimes and procedures.
-
-That enclave should support:
-
-- sensitive local-only context
-- disclosure policies
-- access checks
-- audit trails
-- explicit rules about when information may leave the machine or be shown to non-local models
-
-This is likely more strategically valuable than richer multi-endpoint serving in the near term and should be treated as a plausible priority candidate.
 
 Astrata should operate as an always-learning system under bounded experimental discipline.
 
@@ -1287,10 +1226,6 @@ Useful response classes include:
 
 These responses should be durable and inspectable.
 
-This likely wants to converge with the broader internal "we noticed this" substrate:
-surprises, problems, drift, and opportunities should be representable in the same
-durable response/event layer rather than living only inside audit-specific machinery.
-
 ### Refusal Semantics
 
 Refusal should be treated as a meaningful response, not an implementation failure by default.
@@ -1395,56 +1330,6 @@ At minimum, Astrata should expose:
 - final resolutions
 
 Without this, federation becomes hidden complexity instead of useful self-exposure.
-
-Observability should not stop at Codex or provider spend.
-Astrata should make it easy to answer questions like:
-
-- what the system did
-- what bottlenecks constrained it
-- where time and scarce routes were spent
-- how efficiently it used those resources
-- what should be corrected next
-
-This implies a durable operational history rather than only transient dashboards.
-
-### History View
-
-Astrata should maintain a durable History view built from snapshot reports and annotations.
-
-That history should make it easy to inspect:
-
-- operational summaries for a time window
-- noteworthy events and annotations
-- bottlenecks and recurring failure modes
-- route and resource usage
-- review, audit, and verification outcomes
-- follow-up work opened as a consequence
-
-History should support both human inspection and machine consumption.
-It should preserve enough structure that later review, scheduling, and improvement passes can reuse it without reconstructing the entire world from raw logs.
-
-### Progressive Disclosure
-
-Operational surfaces should use progressive disclosure by default to stay friendly to context windows.
-
-The default presentation should prefer:
-
-- titles
-- short descriptions
-- compact summaries
-- compressed aggregates
-
-Raw payloads, verbose traces, and large evidence blobs should be loaded only on request.
-
-This matters both for UI ergonomics and for model efficiency:
-
-- large operational records should not be injected into working context by default
-- summary-first access should be the normal path
-- deeper detail should remain available without polluting every turn
-- access level should determine which summary tier is returned
-- some security tiers should hide existence entirely rather than merely withholding details
-
-Strata-style response layering is the right direction here: concise top-level representations, with drill-down to detailed evidence only when needed.
 
 ### Self-Regulation Value
 
@@ -1801,9 +1686,6 @@ Astrata should assume:
 - visible reasons for change
 
 At minimum, the common artifact record should point to a full edit history even if the history itself is stored elsewhere.
-
-Observability and operations artifacts should follow the same rule.
-Snapshot reports, annotations, summaries, and later corrections should accumulate as inspectable lineage rather than replacing one another in place.
 
 ### Typed Payloads
 
@@ -2460,7 +2342,6 @@ Context management should own:
 - **Context shaping**: deciding what to include, exclude, summarize, or defer based on the task at hand, the model being used, and the current token budget
 - **Artifact scanning**: identifying oversized context artifacts (specs, knowledge pages, conversation histories) that impose a disproportionate token tax, so they can be compacted, split, or excluded
 - **Retrieval integration**: coordinating with the memory and knowledge layers to load the most relevant context without exceeding budget
-- **Representation discipline**: preferring shorthand, structural compression, append-oriented updates, and summary-first representations so that both generated tokens and loaded tokens stay low
 
 ### Context Pressure as Signal
 
@@ -2475,37 +2356,11 @@ The routing layer, the scheduling layer, and the improvement layer should all be
 
 This is especially important for procedure-guided pipeline execution, where decomposition depth and verification overhead both consume context budget.
 
-Astrata should aggressively look for ways to reduce tokens per task, including:
-
-- fewer generated tokens when equivalent shorter outputs are available
-- fewer loaded tokens by preferring summaries, shorthand, and structural compression
-- append-oriented histories instead of repeatedly replaying rewritten blobs
-- representations that preserve stable prefixes and minimize churn
-
-Token efficiency is not a narrow prompt-writing concern.
-It is an across-the-board throughput concern.
-
 ### Relationship to Routing
 
 Context management informs routing but is not subordinate to it.
 
 The routing layer decides which execution surface to use. Context management tells the routing layer what context constraints apply and what context-shaping work has been done. Both cooperate, but context management maintains its own state and diagnostic surfaces.
-
-### Throughput and KV-Cache Friendliness
-
-Increasing throughput is a system-wide goal, not only a backend concern.
-
-Astrata should therefore prefer designs that are friendly to append-heavy execution and KV reuse where plausible.
-
-That includes:
-
-- stable prefixes over frequently rewritten large prompts
-- append-oriented event and history models
-- compact structural representations over verbose repeated prose
-- successor or snapshot patterns that preserve lineage without forcing full replay
-- retrieval and disclosure policies that load only the depth actually needed
-
-Learnings from local inference experiments about throughput, cache behavior, and prompt stability should be propagated back into general system design rather than remaining isolated in backend-specific work.
 
 ---
 

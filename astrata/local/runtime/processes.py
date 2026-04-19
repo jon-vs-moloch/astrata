@@ -91,12 +91,22 @@ class ManagedProcessController:
 
     def stop(self) -> ManagedProcessStatus:
         state = self._load_state()
-        pid = int(state.get("pid") or 0)
+        pid, detail = self._resolve_live_pid(state)
         if pid > 0 and self._pid_alive(pid):
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if not self._pid_alive(pid):
+                    break
+                time.sleep(0.1)
+            if self._pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         self.state_path.unlink(missing_ok=True)
         return ManagedProcessStatus(
             running=False,
@@ -106,14 +116,14 @@ class ManagedProcessController:
             log_path=state.get("log_path"),
             started_at=state.get("started_at"),
             metadata=dict(state.get("metadata") or {}),
-            detail="stopped",
+            detail=detail or "stopped",
         )
 
     def status(self) -> ManagedProcessStatus:
         state = self._load_state()
-        pid = int(state.get("pid") or 0)
+        pid, adopted_detail = self._resolve_live_pid(state)
         running = pid > 0 and self._pid_alive(pid)
-        detail = None if running else ("not_running" if not state else "stale_pid")
+        detail = adopted_detail if running else ("not_running" if not state else "stale_pid")
         if state and not running:
             self.state_path.unlink(missing_ok=True)
         return ManagedProcessStatus(
@@ -135,9 +145,36 @@ class ManagedProcessController:
         except Exception:
             return {}
 
+    def _save_state(self, state: dict[str, object]) -> None:
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def _resolve_live_pid(self, state: dict[str, object]) -> tuple[int, str | None]:
+        pid = int(state.get("pid") or 0)
+        if pid > 0 and self._pid_alive(pid):
+            return pid, None
+        command = list(state.get("command") or [])
+        tokens = tuple(str(token).strip() for token in command if str(token).strip())
+        if not tokens or not _command_tokens_are_specific(tokens):
+            return 0, None
+        matched_pid, _matched_command = find_matching_process(tokens)
+        if matched_pid is None:
+            return 0, None
+        updated_state = dict(state)
+        updated_state["pid"] = matched_pid
+        self._save_state(updated_state)
+        return matched_pid, "adopted_stale_pid"
+
     def _pid_alive(self, pid: int) -> bool:
         try:
             os.kill(pid, 0)
             return True
         except OSError:
             return False
+
+
+def _command_tokens_are_specific(tokens: tuple[str, ...]) -> bool:
+    """Avoid adopting an unrelated process from a vague stale command."""
+    if len(tokens) < 3:
+        return False
+    joined = " ".join(tokens).lower()
+    return any(marker in joined for marker in (".gguf", " --port ", " -m ", " --model ", "model_path"))

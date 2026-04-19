@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from astrata.providers.model_catalog import ModelCatalogRecord
+
 
 class Message(BaseModel):
     role: str
@@ -56,6 +58,20 @@ class Provider(ABC):
 
     def get_quota_windows(self, route: dict[str, Any] | None = None) -> list[dict[str, Any]] | None:
         return None
+
+    def list_model_catalog(self) -> list[ModelCatalogRecord]:
+        default = self.default_model()
+        if not default:
+            return []
+        return [
+            ModelCatalogRecord(
+                catalog_id=f"{self.name}:{default}",
+                provider_id=self.name,
+                model_id=default,
+                display_name=default,
+                status="configured" if self.is_configured() else "unconfigured",
+            )
+        ]
 
 
 def assert_projected_memory_request(request: CompletionRequest, *, provider_name: str) -> None:

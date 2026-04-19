@@ -491,16 +491,39 @@ def compact_oversized_runtime_records(
             (encoded, record_id),
         )
 
-    for task_id, payload_json in conn.execute(
-        "SELECT task_id, payload_json FROM tasks WHERE length(payload_json) > ?",
+    for task_id, provenance_bytes in conn.execute(
+        """
+        SELECT task_id, length(json_extract(payload_json, '$.provenance'))
+        FROM tasks
+        WHERE length(json_extract(payload_json, '$.provenance')) > ?
+        """,
         (threshold_bytes,),
     ).fetchall():
-        payload = json.loads(payload_json)
-        provenance = payload.get("provenance")
-        if provenance is None or len(json.dumps(provenance, sort_keys=True)) <= threshold_bytes:
-            continue
-        payload["provenance"] = compact_json(provenance, "task.provenance")
-        rewrite_payload("tasks", "task_id", str(task_id), payload)
+        conn.execute(
+            """
+            UPDATE tasks
+            SET payload_json = json_set(
+                payload_json,
+                '$.provenance',
+                json_object(
+                    'archived', 1,
+                    'field', 'task.provenance',
+                    'reason', 'oversized_runtime_compaction',
+                    'archived_at', ?,
+                    'original_json_bytes', ?,
+                    'snapshot', ?,
+                    'source', json_extract(payload_json, '$.provenance.source'),
+                    'retry_count', json_extract(payload_json, '$.provenance.retry_count'),
+                    'retry_reason', json_extract(payload_json, '$.provenance.retry_reason'),
+                    'retry_of_attempt_id', json_extract(payload_json, '$.provenance.retry_of_attempt_id'),
+                    'worker_task_id', json_extract(payload_json, '$.provenance.worker_task_id'),
+                    'previous_sha256', json_extract(payload_json, '$.provenance.sha256')
+                )
+            )
+            WHERE task_id = ?
+            """,
+            (now, int(provenance_bytes or 0), snapshot_hint, str(task_id)),
+        )
         changes.append({"table": "tasks", "record_id": str(task_id), "field": "provenance"})
 
     for attempt_id, payload_json in conn.execute(

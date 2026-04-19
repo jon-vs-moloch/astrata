@@ -1,8 +1,10 @@
 import os
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 
+import astrata.local.hardware as hardware_module
 from astrata.local.backends.llama_cpp import LlamaCppBackend, LlamaCppLaunchConfig
 from astrata.local.catalog import StarterCatalog
 from astrata.local.hardware import probe_thermal_state
@@ -19,6 +21,8 @@ from astrata.eval.substrate import build_eval_domain
 from astrata.local.thermal import ThermalController
 from astrata.local.runtime.manager import LocalRuntimeManager
 from astrata.local.runtime.processes import ManagedProcessController
+from astrata.providers.base import CompletionRequest, Message
+from astrata.local.runtime.client import LocalRuntimeClient
 
 
 def test_local_model_registry_adopts_path_once():
@@ -171,9 +175,15 @@ def test_recommend_runtime_selection_demotes_projector_artifacts():
 def test_recommend_runtime_selection_prefers_observed_success():
     registry = LocalModelRegistry()
     gemma = registry.adopt("/tmp/gemma-4-e2b-it-q4.gguf", display_name="gemma-4-e2b-it-q4")
-    qwen = registry.adopt("/tmp/qwen-3.5-4b-instruct-q4.gguf", display_name="qwen-3.5-4b-instruct-q4")
-    weaker_gemma = gemma.model_copy(update={"observed_success_rate": 0.20, "observed_sample_count": 12})
-    stronger_qwen = qwen.model_copy(update={"observed_success_rate": 0.90, "observed_sample_count": 12})
+    qwen = registry.adopt(
+        "/tmp/qwen-3.5-4b-instruct-q4.gguf", display_name="qwen-3.5-4b-instruct-q4"
+    )
+    weaker_gemma = gemma.model_copy(
+        update={"observed_success_rate": 0.20, "observed_sample_count": 12}
+    )
+    stronger_qwen = qwen.model_copy(
+        update={"observed_success_rate": 0.90, "observed_sample_count": 12}
+    )
     recommendation = recommend_runtime_selection(
         hardware=HardwareProfile(
             platform="darwin",
@@ -202,6 +212,27 @@ def test_probe_thermal_state_quiet_disallows_fans():
     thermal = probe_thermal_state(preference="quiet")
     assert thermal.preference == "quiet"
     assert thermal.fans_allowed is False
+
+
+def test_probe_thermal_state_treats_no_warnings_as_nominal(monkeypatch):
+    monkeypatch.setattr(hardware_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        hardware_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout=(
+                "Note: No thermal warning level has been recorded\n"
+                "Note: No performance warning level has been recorded\n"
+                "Note: No CPU power status has been recorded\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    thermal = probe_thermal_state(preference="quiet")
+
+    assert thermal.telemetry_available is True
+    assert thermal.thermal_pressure == "nominal"
 
 
 def test_local_runtime_manager_recommend_uses_quiet_preference():
@@ -264,9 +295,6 @@ def test_local_runtime_manager_start_managed_applies_quiet_profile():
 
 
 def test_local_runtime_manager_can_track_multiple_managed_runtimes():
-    registry = LocalModelRegistry()
-    small = registry.adopt("/tmp/qwen-small.gguf", display_name="qwen-small")
-    big = registry.adopt("/tmp/qwen-big.gguf", display_name="qwen-big")
     with TemporaryDirectory() as tmp:
         controller = ManagedProcessController(
             state_path=Path(tmp) / "runtime.json",
@@ -274,9 +302,10 @@ def test_local_runtime_manager_can_track_multiple_managed_runtimes():
         )
         manager = LocalRuntimeManager(
             backends={"llama_cpp": LlamaCppBackend()},
-            model_registry=registry,
             process_controller=controller,
         )
+        small = manager.model_registry().adopt("/tmp/qwen-small.gguf", display_name="qwen-small")
+        big = manager.model_registry().adopt("/tmp/qwen-big.gguf", display_name="qwen-big")
         captured = []
 
         def fake_wait_until_healthy(*, backend, config, timeout_seconds=60.0, poll_seconds=0.25):
@@ -349,12 +378,30 @@ def test_thermal_controller_holds_cooldown_latch_after_nominal_sample():
 
 def test_thermal_controller_allows_nominal_after_cooldown_expiry():
     with TemporaryDirectory() as tmp:
-        controller = ThermalController(state_path=Path(tmp) / "thermal.json", cooldown_ttl_seconds=0)
+        controller = ThermalController(
+            state_path=Path(tmp) / "thermal.json", cooldown_ttl_seconds=0
+        )
         first = controller.evaluate(ThermalState(preference="quiet", thermal_pressure="fair"))
         second = controller.evaluate(ThermalState(preference="quiet", thermal_pressure="nominal"))
         assert first.action == "cooldown"
         assert second.action == "allow"
         assert second.latched == "nominal"
+
+
+def test_thermal_controller_records_compact_history():
+    with TemporaryDirectory() as tmp:
+        controller = ThermalController(state_path=Path(tmp) / "thermal.json", history_limit=24)
+        controller.evaluate(ThermalState(preference="quiet", thermal_pressure="fair"))
+        controller.evaluate(
+            ThermalState(preference="quiet", thermal_pressure="nominal"), bypass_hysteresis=True
+        )
+
+        summary = controller.history_summary()
+
+        assert summary["sample_count"] == 2
+        assert summary["samples"] == {"fair": 1, "nominal": 1}
+        assert summary["actions"] == {"cooldown": 1, "allow": 1}
+        assert summary["nominal_ratio"] == 0.5
 
 
 def test_managed_process_status_clears_stale_state():
@@ -460,8 +507,18 @@ def test_rating_store_tracks_domain_scoped_pairwise_winner():
         ratings = RatingStore(state_path=Path(tmp) / "ratings.json")
         qwen = "/tmp/qwen.gguf"
         gemma = "/tmp/gemma.gguf"
-        ratings.record_matchup(domain="local_model:coding", left_variant_id=qwen, right_variant_id=gemma, left_score=1.0)
-        ratings.record_matchup(domain="local_model:coding", left_variant_id=qwen, right_variant_id=gemma, left_score=1.0)
+        ratings.record_matchup(
+            domain="local_model:coding",
+            left_variant_id=qwen,
+            right_variant_id=gemma,
+            left_score=1.0,
+        )
+        ratings.record_matchup(
+            domain="local_model:coding",
+            left_variant_id=qwen,
+            right_variant_id=gemma,
+            left_score=1.0,
+        )
         assert ratings.get_domain_leader(domain="local_model:coding", min_matches=2) == qwen
 
 
@@ -469,16 +526,24 @@ def test_local_model_arena_records_observations_and_matchup():
     class FakeLmStudio:
         def generate(self, *, model_key, prompt, system_prompt=None, ttl_seconds=300):
             from astrata.local.lmstudio import LmStudioGeneration
+
             content = "left output" if "left" in model_key else "right output"
             duration = 2.0 if "left" in model_key else 4.0
-            return LmStudioGeneration(model_key=model_key, prompt=prompt, content=content, duration_seconds=duration)
+            return LmStudioGeneration(
+                model_key=model_key, prompt=prompt, content=content, duration_seconds=duration
+            )
 
     class FakeJudge:
         name = "fake-judge"
 
         def complete(self, request):
             from astrata.providers.base import CompletionResponse
-            return CompletionResponse(provider="fake", model=None, content='{"left_score": 1.0, "rationale": "Left is better and faster."}')
+
+            return CompletionResponse(
+                provider="fake",
+                model=None,
+                content='{"left_score": 1.0, "rationale": "Left is better and faster."}',
+            )
 
     with TemporaryDirectory() as tmp:
         telemetry = LocalModelTelemetryStore(state_path=Path(tmp) / "telemetry.json")
@@ -496,7 +561,10 @@ def test_local_model_arena_records_observations_and_matchup():
         right_summary = telemetry.summarize("/tmp/right.gguf")
         assert left_summary.observed_sample_count == 1
         assert right_summary.observed_sample_count == 1
-        assert ratings.get_domain_leader(domain="local_model:coding", min_matches=1) == "/tmp/left.gguf"
+        assert (
+            ratings.get_domain_leader(domain="local_model:coding", min_matches=1)
+            == "/tmp/left.gguf"
+        )
 
 
 def test_managed_process_controller_reports_not_running_without_state():
@@ -508,3 +576,44 @@ def test_managed_process_controller_reports_not_running_without_state():
         status = controller.status()
         assert status.running is False
         assert status.detail == "not_running"
+
+
+def test_local_runtime_client_complete_makes_request_and_extracts_content(monkeypatch):
+    client = LocalRuntimeClient()
+
+    def mock_urlopen(req, timeout=90):
+        # Verify request structure
+        assert req.headers["Content-Type"] == "application/json"
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["model"] == "test-model"
+        assert payload["messages"] == [{"role": "user", "content": "Hello"}]
+        assert payload["stream"] is False
+        assert payload.get("temperature") == 0.5
+        assert payload.get("max_tokens") == 100
+        assert payload.get("metadata") == {"allow_degraded_fallback": True}
+        assert payload.get("thread_id") == "test-thread"
+
+        # Return mock response
+        response_data = {"choices": [{"message": {"content": "Hello back"}}]}
+        response = SimpleNamespace()
+        response.read = lambda: json.dumps(response_data).encode("utf-8")
+        response.__enter__ = lambda: response
+        response.__exit__ = lambda *args: None
+        return response
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+
+    request = CompletionRequest(
+        model="test-model",
+        messages=[Message(role="user", content="Hello")],
+        temperature=0.5,
+        metadata={"max_tokens": 100, "allow_degraded_fallback": True},
+    )
+    result = client.complete(
+        base_url="http://127.0.0.1:8080",
+        request=request,
+        thread_id="test-thread",
+        allow_degraded_fallback=True,
+    )
+
+    assert result == "Hello back"

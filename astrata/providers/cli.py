@@ -11,7 +11,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from astrata.providers.base import CompletionRequest, CompletionResponse, Provider, assert_projected_memory_request
+from astrata.providers.base import (
+    CompletionRequest,
+    CompletionResponse,
+    Provider,
+    assert_projected_memory_request,
+)
 from astrata.providers.kilocode_registry import default_kilocode_model
 
 
@@ -19,14 +24,15 @@ CLI_TOOL_SPECS: dict[str, dict[str, str]] = {
     "codex-cli": {"exec": "codex", "underlying_provider": "openai"},
     "gemini-cli": {"exec": "gemini", "underlying_provider": "google"},
     "claude-code": {"exec": "claude", "underlying_provider": "anthropic"},
-    "kilocode": {"exec": "kilo", "underlying_provider": "custom"},
+    "kilocode": {"exec": "kilo", "underlying_provider": "kilo-gateway"},
+    "vibeduel": {"exec": "vibeduel", "underlying_provider": "vibeduel"},
 }
 
 
 class CliProvider(Provider):
     def __init__(self, *, name: str = "cli") -> None:
         self._name = name
-        self._completion_timeout_seconds = int(os.environ.get("ASTRATA_CLI_TIMEOUT_SECONDS", "90"))
+        self._completion_timeout_seconds = int(os.environ.get("ASTRATA_CLI_TIMEOUT_SECONDS", "60"))
         self._codex_default_model = (
             str(
                 os.environ.get("ASTRATA_CODEX_CLI_MODEL")
@@ -56,7 +62,7 @@ class CliProvider(Provider):
 
     def available_tools(self) -> list[str]:
         ordered: list[str] = []
-        for tool in ("kilocode", "gemini-cli", "claude-code", "codex-cli"):
+        for tool in ("kilocode", "gemini-cli", "claude-code", "codex-cli", "vibeduel"):
             if self._tool_is_usable(tool):
                 ordered.append(tool)
         return ordered
@@ -157,6 +163,8 @@ class CliProvider(Provider):
             return False
         if tool == "codex-cli":
             return self._codex_authenticated()
+        if tool == "vibeduel":
+            return os.environ.get("ASTRATA_ENABLE_VIBEDUEL_CLI", "") in {"1", "true", "TRUE"}
         return True
 
     def _codex_authenticated(self) -> bool:
@@ -171,7 +179,10 @@ class CliProvider(Provider):
         tokens = payload.get("tokens") or {}
         if not isinstance(tokens, dict):
             return False
-        return bool(str(tokens.get("access_token") or "").strip() or str(payload.get("OPENAI_API_KEY") or "").strip())
+        return bool(
+            str(tokens.get("access_token") or "").strip()
+            or str(payload.get("OPENAI_API_KEY") or "").strip()
+        )
 
     def _build_args(
         self,
@@ -197,13 +208,25 @@ class CliProvider(Provider):
             if model:
                 args.extend(["-m", model])
             return args
+        if tool == "vibeduel":
+            args = [exec_path, "run", prompt, "--auto", "--format", "json"]
+            if model:
+                args.extend(["-m", model])
+            return args
         if tool == "gemini-cli":
             args = [exec_path, "-p", prompt, "-y", "--output-format", "text"]
             if model:
                 args[1:1] = ["-m", model]
             return args
         if tool == "claude-code":
-            args = [exec_path, "-p", prompt, "--output-format", "text", "--dangerously-skip-permissions"]
+            args = [
+                exec_path,
+                "-p",
+                prompt,
+                "--output-format",
+                "text",
+                "--dangerously-skip-permissions",
+            ]
             if model:
                 args.extend(["--model", model])
             return args

@@ -33,7 +33,13 @@ def reconcile_running_attempts(
     resolved_at = now or datetime.now(timezone.utc)
     tasks_by_id = {
         str(task.get("task_id") or ""): task
-        for task in db.iter_records("tasks")
+        for task in db.select_json_fields(
+            "tasks",
+            fields={
+                "task_id": "$.task_id",
+                "status": "$.status",
+            },
+        )
         if str(task.get("task_id") or "").strip()
     }
     updated: list[dict[str, Any]] = []

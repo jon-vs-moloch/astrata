@@ -25,6 +25,12 @@ class UISendMessageRequest(BaseModel):
     conversation_id: str = ""
     intent: str = "principal_message"
     kind: str = "request"
+    chat_kind: str = "agent"
+    thread_id: str = ""
+    start_new_thread: bool = False
+    agent_mode: str = "persistent"
+    provider_id: str = ""
+    model_id: str = ""
 
 
 class UIActionResponse(BaseModel):
@@ -59,6 +65,20 @@ class UIConnectorOAuthSetupRequest(BaseModel):
 class UIRelayPairingRequest(BaseModel):
     label: str = "Astrata Desktop"
     ttl_minutes: int = 15
+
+
+class UIChatThreadRequest(BaseModel):
+    chat_kind: str = "agent"
+    title: str = ""
+    agent_id: str = "prime"
+    recipient: str = ""
+    agent_mode: str = "persistent"
+    provider_id: str = ""
+    model_id: str = ""
+    endpoint_runtime_key: str = ""
+    memory_policy: dict[str, Any] = Field(default_factory=dict)
+    permissions_profile: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def create_app() -> FastAPI:
@@ -132,9 +152,37 @@ def create_app() -> FastAPI:
                 conversation_id=payload.conversation_id,
                 intent=payload.intent,
                 kind=payload.kind,
+                chat_kind=payload.chat_kind,
+                thread_id=payload.thread_id,
+                start_new_thread=payload.start_new_thread,
+                agent_mode=payload.agent_mode,
+                provider_id=payload.provider_id,
+                model_id=payload.model_id,
             )
         )
         return UIActionResponse(status="sent", detail=record)
+
+    @app.get("/api/chats")
+    def chats() -> dict:
+        summary = service.snapshot()
+        return summary.get("chats", {})
+
+    @app.post("/api/chats")
+    def create_chat_thread(payload: UIChatThreadRequest) -> UIActionResponse:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Chat threads materialize with their first message. "
+                "Use /api/messages with start_new_thread=true."
+            ),
+        )
+
+    @app.post("/api/chats/{thread_id}/{action}")
+    def update_chat_thread(thread_id: str, action: str) -> UIActionResponse:
+        result = service.update_chat_thread_status(thread_id, action)
+        if result.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=result)
+        return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
 
     @app.post("/api/messages/{communication_id}/ack")
     def acknowledge_message(communication_id: str) -> UIActionResponse:
@@ -166,8 +214,13 @@ def create_app() -> FastAPI:
         return UIActionResponse(status=str(result.get("status") or "ok"), detail=result)
 
     @app.post("/api/local-runtime/stop")
-    def stop_local_runtime() -> UIActionResponse:
-        result = service.stop_local_runtime()
+    def stop_local_runtime(runtime_key: str | None = None) -> UIActionResponse:
+        result = service.stop_local_runtime(runtime_key=runtime_key)
+        return UIActionResponse(status="stopped", detail=result)
+
+    @app.post("/api/local-runtime/{runtime_key}/stop")
+    def stop_named_local_runtime(runtime_key: str) -> UIActionResponse:
+        result = service.stop_local_runtime(runtime_key=runtime_key)
         return UIActionResponse(status="stopped", detail=result)
 
     @app.post("/api/account/invite/redeem")

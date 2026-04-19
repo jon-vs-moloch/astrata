@@ -11,6 +11,7 @@ from astrata.providers.cli import CliProvider
 from astrata.providers.codex_direct import CodexDirectProvider
 from astrata.providers.google_ai_studio import GoogleAiStudioProvider
 from astrata.providers.http_openai_compatible import OpenAICompatibleProvider
+from astrata.providers.model_catalog import ModelCatalogRecord, catalog_record
 from astrata.providers.sources import (
     CLI_SOURCE_PROVIDERS,
     source_display_name,
@@ -30,7 +31,7 @@ class ProviderRegistry:
         if name:
             provider = self._providers.get(name)
             return provider if provider and provider.is_configured() else None
-        for candidate in ("cli", "openai", "google", "anthropic", "ollama", "custom"):
+        for candidate in ("cli", "openai", "openrouter", "kilo-gateway", "google", "anthropic", "pollinations", "ollama", "custom"):
             provider = self._providers.get(candidate)
             if provider and provider.is_configured():
                 return provider
@@ -79,9 +80,36 @@ class ProviderRegistry:
                 )
         return sources
 
+    def list_model_catalog(self) -> list[dict[str, Any]]:
+        records: list[ModelCatalogRecord] = []
+        seen: set[str] = set()
+        for provider in self._providers.values():
+            for record in provider.list_model_catalog():
+                if record.catalog_id in seen:
+                    continue
+                seen.add(record.catalog_id)
+                records.append(record)
+        for record in _static_source_catalog():
+            if record.catalog_id in seen:
+                continue
+            seen.add(record.catalog_id)
+            records.append(record)
+        return [record.model_dump(mode="json") for record in sorted(records, key=lambda item: (item.provider_id, item.display_name))]
+
     def configured_provider_names(self) -> list[str]:
         ordered: list[str] = []
-        preferred = ("codex", "cli", "openai", "google", "anthropic", "ollama", "custom")
+        preferred = (
+            "codex",
+            "cli",
+            "openai",
+            "openrouter",
+            "kilo-gateway",
+            "google",
+            "anthropic",
+            "pollinations",
+            "ollama",
+            "custom",
+        )
         for candidate in preferred:
             provider = self._providers.get(candidate)
             if provider and provider.is_configured():
@@ -116,6 +144,32 @@ def build_default_registry() -> ProviderRegistry:
         )
     )
     registry.register(
+        OpenAICompatibleProvider(
+            name="openrouter",
+            endpoint_env="ASTRATA_OPENROUTER_ENDPOINT",
+            api_key_env="ASTRATA_OPENROUTER_API_KEY",
+            model_env="ASTRATA_OPENROUTER_MODEL",
+            default_endpoint="https://openrouter.ai/api/v1/chat/completions",
+            models_endpoint="https://openrouter.ai/api/v1/models",
+            capabilities=["chat", "vision"],
+            input_modalities=["text", "image", "video", "file"],
+            output_modalities=["text", "audio"],
+        )
+    )
+    registry.register(
+        OpenAICompatibleProvider(
+            name="kilo-gateway",
+            endpoint_env="ASTRATA_KILO_GATEWAY_ENDPOINT",
+            api_key_env="ASTRATA_KILO_API_KEY",
+            model_env="ASTRATA_KILO_GATEWAY_MODEL",
+            default_endpoint="https://api.kilo.ai/api/gateway/chat/completions",
+            models_endpoint="https://api.kilo.ai/api/gateway/models",
+            capabilities=["chat", "tool_use"],
+            input_modalities=["text", "image"],
+            output_modalities=["text"],
+        )
+    )
+    registry.register(
         GoogleAiStudioProvider(
             name="google",
             api_key=secrets.get_provider_secret("google", "api_key"),
@@ -144,6 +198,19 @@ def build_default_registry() -> ProviderRegistry:
     )
     registry.register(
         OpenAICompatibleProvider(
+            name="pollinations",
+            endpoint_env="ASTRATA_POLLINATIONS_TEXT_ENDPOINT",
+            api_key_env=None,
+            model_env="ASTRATA_POLLINATIONS_MODEL",
+            default_endpoint="https://text.pollinations.ai/openai",
+            models_endpoint="https://text.pollinations.ai/models",
+            capabilities=["chat", "text", "image", "video", "audio"],
+            input_modalities=["text", "image"],
+            output_modalities=["text", "image", "video", "audio"],
+        )
+    )
+    registry.register(
+        OpenAICompatibleProvider(
             name="custom",
             endpoint_env="ASTRATA_CUSTOM_ENDPOINT",
             api_key_env="ASTRATA_CUSTOM_API_KEY",
@@ -152,3 +219,20 @@ def build_default_registry() -> ProviderRegistry:
         )
     )
     return registry
+
+
+def _static_source_catalog() -> list[ModelCatalogRecord]:
+    return [
+        catalog_record(
+            provider_id="vibeduel",
+            model_id="arena",
+            display_name="VibeDuel Arena",
+            capabilities=["chat"],  # type: ignore[list-item]
+            status="research_required",
+            source="vibeduel_site",
+            notes=(
+                "VibeDuel appears to be CLI/arena-first with a voting-for-credits mechanic. "
+                "Astrata should only enable this source once a non-voting or explicitly user-approved mode is verified."
+            ),
+        )
+    ]

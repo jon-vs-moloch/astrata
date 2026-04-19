@@ -7,7 +7,8 @@ CLI_SOURCE_PROVIDERS: dict[str, str] = {
     "codex-cli": "openai",
     "gemini-cli": "google",
     "claude-code": "anthropic",
-    "kilocode": "custom",
+    "kilocode": "kilo-gateway",
+    "vibeduel": "vibeduel",
 }
 
 

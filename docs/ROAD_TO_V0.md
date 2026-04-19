@@ -56,3 +56,18 @@ When in doubt, v0 work should reduce operator rescue:
 - route cheap worker work through KiloCode or Google before spending Prime
 - turn repeated maintenance into Procedures, then Routines
 - preserve disclosure boundaries even when remote access is convenient
+
+## Post-v0 Cleanup Direction
+
+After v0, Astrata should use its new maturity to help pay down its own architectural debt.
+
+The cleanup target is [progressive disclosure doctrine](/Users/jon/Projects/Astrata/docs/PROGRESSIVE_DISCLOSURE_DOCTRINE.md) across the whole system:
+
+- store summaries, references, indexes, and artifact pointers before raw documents or traces
+- split large monolithic files, prompts, controllers, and scripts into small composable units
+- prefer YAML for human-authored manifests, prompts, procedures, policy notes, and compact internal docs
+- reserve JSON for wire formats, strict API payloads, generated state, and integration boundaries
+- make audits, verifications, startup, hygiene, repair, reconciliation, and release checks first-class Procedures
+- describe Tools and Procedures by name, summary, contract, side effects, and references before raw code
+
+The end state is a codebase and runtime that a local agent can maintain without loading the whole database, the whole codebase, or whole documents into memory just to make a safe next move.

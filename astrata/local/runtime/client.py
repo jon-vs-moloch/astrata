@@ -22,7 +22,10 @@ class LocalRuntimeClient:
         endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
         payload: dict[str, Any] = {
             "model": request.model or "local",
-            "messages": [message.model_dump(exclude_none=True) for message in request.messages],
+            "messages": [
+                message.model_dump(exclude_none=True, exclude_defaults=True)
+                for message in request.messages
+            ],
             "stream": False,
         }
         if request.temperature is not None:
@@ -46,8 +49,16 @@ class LocalRuntimeClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=300) as response:
+        # urllib normalizes this to ``Content-type`` internally, but tests and
+        # a few debug probes inspect ``Request.headers`` directly.
+        req.headers["Content-Type"] = "application/json"
+        response = urllib.request.urlopen(req, timeout=90)
+        try:
             raw = json.loads(response.read().decode("utf-8"))
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
         return _extract_openai_compatible_content(raw)
 
     def health(self, *, base_url: str) -> dict[str, Any]:

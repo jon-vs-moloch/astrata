@@ -132,7 +132,9 @@ def generate_python_preflight_report(
 
     issues = [
         {
-            "severity": "critical" if check["name"] in {"selected_python_exists", "selected_python_imports"} else "high",
+            "severity": "critical"
+            if check["name"] in {"selected_python_exists", "selected_python_imports"}
+            else "high",
             "kind": check["name"],
             "detail": check["detail"],
         }
@@ -188,8 +190,14 @@ def run_startup_reflection(
         json.dumps(
             {
                 "ok": report["ok"],
-                "issues": report["issues"],
-                "default_route": report["providers"]["default_route"],
+                "issues": [
+                    {
+                        "severity": issue.get("severity"),
+                        "kind": issue.get("kind"),
+                        "detail": issue.get("detail"),
+                    }
+                    for issue in report["issues"]
+                ],
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -207,7 +215,10 @@ def run_startup_reflection(
             description=report["summary"],
             priority=9,
             urgency=7,
-            provenance={"source": "startup_diagnostic", "report_path": str(runtime_report_path(settings))},
+            provenance={
+                "source": "startup_diagnostic",
+                "report_path": str(runtime_report_path(settings)),
+            },
             permissions={},
             risk="low",
             status="pending",
@@ -249,7 +260,9 @@ def run_startup_reflection(
             "last_issue_count": len(report["issues"]),
         },
     )
-    return StartupReflectionResult(report=report, task_created=task_created, message_sent=message_sent)
+    return StartupReflectionResult(
+        report=report, task_created=task_created, message_sent=message_sent
+    )
 
 
 def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, Any]:
@@ -287,11 +300,14 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
             }
         )
     else:
-        managed_endpoint = managed_status.endpoint if managed_status and managed_status.endpoint else None
+        managed_endpoint = (
+            managed_status.endpoint if managed_status and managed_status.endpoint else None
+        )
         manager.select_runtime(
             backend_id="llama_cpp",
             mode="managed",
-            endpoint=managed_endpoint or f"http://{settings.local_runtime.llama_cpp_host}:{settings.local_runtime.llama_cpp_port}/health",
+            endpoint=managed_endpoint
+            or f"http://{settings.local_runtime.llama_cpp_host}:{settings.local_runtime.llama_cpp_port}/health",
         )
         local_health = manager.health(
             config=_llama_config_from_endpoint(
@@ -325,8 +341,10 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
                 }
             )
     thermal_state = probe_thermal_state(preference=settings.local_runtime.thermal_preference)
-    thermal_controller = ThermalController(state_path=settings.paths.data_dir / "thermal_state.json")
-    thermal_decision = thermal_controller.evaluate(thermal_state)
+    thermal_controller = ThermalController(
+        state_path=settings.paths.data_dir / "thermal_state.json"
+    )
+    thermal_decision = thermal_controller.evaluate(thermal_state, bypass_hysteresis=True)
     runtime_client = LocalRuntimeClient()
     native_strata = StrataEndpointService(
         state_path=settings.paths.data_dir / "strata_threads.json",
@@ -370,7 +388,9 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
             + "; ".join(issue["kind"] for issue in issues[:4])
         )
     else:
-        summary_parts.append("Startup reflection looks healthy enough to continue normal operation.")
+        summary_parts.append(
+            "Startup reflection looks healthy enough to continue normal operation."
+        )
     if default_route:
         summary_parts.append(
             "Default route is "
@@ -399,7 +419,9 @@ def _build_runtime_report(settings: Settings, db: AstrataDatabase) -> dict[str, 
             },
             "health": None if local_health is None else local_health.model_dump(mode="json"),
             "adopted_existing_endpoint": adopted_existing_endpoint,
-            "managed_process": None if manager.managed_status() is None else {
+            "managed_process": None
+            if manager.managed_status() is None
+            else {
                 "running": manager.managed_status().running,
                 "pid": manager.managed_status().pid,
                 "endpoint": manager.managed_status().endpoint,

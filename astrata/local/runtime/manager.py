@@ -35,6 +35,9 @@ class LocalRuntimeManager:
         self._process_controllers: dict[str, ManagedProcessController] = {}
         if process_controller is not None:
             self._process_controllers["default"] = process_controller
+            self._process_controllers.update(
+                _discover_existing_process_controllers(process_controller)
+            )
         self._selections: dict[str, RuntimeSelection] = {}
         self._active_runtime_key: str | None = None
 
@@ -185,7 +188,9 @@ class LocalRuntimeManager:
                 port=port,
                 model_path=model.path,
                 extra_args=tuple(profile.llama_cpp_args) + tuple(extra_args),
-            ) if backend_id == "llama_cpp" else {
+            )
+            if backend_id == "llama_cpp"
+            else {
                 "binary_path": binary_path,
                 "host": host,
                 "port": port,
@@ -222,12 +227,19 @@ class LocalRuntimeManager:
         statuses: dict[str, ManagedProcessStatus] = {}
         for key, controller in self._process_controllers.items():
             status = controller.status()
-            if key not in self._selections and not status.running and not status.endpoint and not status.command:
+            if (
+                key not in self._selections
+                and not status.running
+                and not status.endpoint
+                and not status.command
+            ):
                 continue
             statuses[key] = status
         return dict(sorted(statuses.items()))
 
-    def health(self, *, runtime_key: str | None = None, config: Any | None = None) -> RuntimeHealthSnapshot | None:
+    def health(
+        self, *, runtime_key: str | None = None, config: Any | None = None
+    ) -> RuntimeHealthSnapshot | None:
         selection = self.current_selection(runtime_key)
         if selection is None:
             return None
@@ -341,6 +353,38 @@ def _derive_runtime_path(path: Path, runtime_key: str) -> Path:
     stem = path.name[: -len(suffix)] if suffix else path.name
     filename = f"{stem}-{runtime_key}{suffix}"
     return path.with_name(filename)
+
+
+def _discover_existing_process_controllers(
+    template: ManagedProcessController,
+) -> dict[str, ManagedProcessController]:
+    suffix = "".join(template.state_path.suffixes)
+    stem = template.state_path.name[: -len(suffix)] if suffix else template.state_path.name
+    pattern = f"{stem}-*{suffix}"
+    controllers: dict[str, ManagedProcessController] = {}
+    for candidate in sorted(template.state_path.parent.glob(pattern)):
+        runtime_key = _runtime_key_from_state_path(template.state_path, candidate)
+        if runtime_key is None or runtime_key == "default":
+            continue
+        controllers[runtime_key] = ManagedProcessController(
+            state_path=candidate,
+            log_path=_derive_runtime_path(template.log_path, runtime_key),
+        )
+    return controllers
+
+
+def _runtime_key_from_state_path(template_path: Path, candidate_path: Path) -> str | None:
+    suffix = "".join(template_path.suffixes)
+    template_stem = template_path.name[: -len(suffix)] if suffix else template_path.name
+    candidate_name = candidate_path.name
+    if suffix and not candidate_name.endswith(suffix):
+        return None
+    candidate_stem = candidate_name[: -len(suffix)] if suffix else candidate_name
+    prefix = f"{template_stem}-"
+    if not candidate_stem.startswith(prefix):
+        return None
+    raw_key = candidate_stem[len(prefix) :]
+    return _normalize_runtime_key(raw_key) if raw_key else None
 
 
 def _port_is_available(host: str, port: int) -> bool:

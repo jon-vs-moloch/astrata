@@ -58,11 +58,15 @@ const APP = {
   relayPairing: null,
   accountLinkResult: null,
   connectorSetupResult: null,
+  assetFingerprint: null,
+  assetReloadCheckedAt: 0,
 
   // Per-lane chat state
   pendingResponse: {},
   lastSentAt: {},
   composerMode: {},
+  activeThreadByScope: {},
+  pendingNewChatByScope: {},
 
   // Sessions
   sessions: {},
@@ -104,6 +108,46 @@ async function desktopInvoke(command, args = {}) {
   const invoke = window.__TAURI_INTERNALS__?.invoke;
   if (!invoke) throw new Error('Astrata desktop controls are unavailable.');
   return invoke(command, args);
+}
+
+async function sha256Text(text) {
+  if (!window.crypto?.subtle) return String(text.length);
+  const bytes = new TextEncoder().encode(text);
+  const digest = await window.crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function fetchAssetFingerprint() {
+  const resp = await fetch(`/static/app.js?asset_check=${Date.now()}`, { cache: 'no-store' });
+  if (!resp.ok) throw new Error(`Asset check failed: HTTP ${resp.status}`);
+  return sha256Text(await resp.text());
+}
+
+async function rememberCurrentAssetFingerprint() {
+  try {
+    APP.assetFingerprint = await fetchAssetFingerprint();
+  } catch (err) {
+    console.warn('Asset fingerprint unavailable:', err);
+  }
+}
+
+async function reloadIfAssetsChanged() {
+  const now = Date.now();
+  if (!APP.assetFingerprint || now - APP.assetReloadCheckedAt < 5000) return;
+  APP.assetReloadCheckedAt = now;
+  try {
+    const latest = await fetchAssetFingerprint();
+    if (latest === APP.assetFingerprint) return;
+    const reloadedHash = sessionStorage.getItem('astrata_reloaded_asset_hash');
+    if (reloadedHash !== latest) {
+      sessionStorage.setItem('astrata_reloaded_asset_hash', latest);
+      window.location.reload();
+    } else {
+      APP.assetFingerprint = latest;
+    }
+  } catch (err) {
+    console.warn('Asset staleness check failed:', err);
+  }
 }
 
 /* ─── FORMATTING ────────────────────────────────────── */
@@ -225,6 +269,7 @@ const VIEW_MAP = {
   attempts:     'viewAttempts',
   artifacts:    'viewArtifacts',
   history:      'viewHistory',
+  agents:       'viewAgents',
   models:       'viewModels',
   settings:     'viewSettings',
   startup:      'viewStartup',
@@ -275,14 +320,14 @@ function renderContextPanel(viewId) {
   actBtn.hidden  = true;
 
   if (viewId === 'chat') {
-    title.textContent = APP.activeLane === 'prime' ? 'Prime' : (APP.activeLane === 'local' ? 'Local' : humanLane(APP.activeLane));
+    title.textContent = isModelScope() ? 'Models' : agentLabel(APP.activeLane);
     sub.textContent   = 'Conversations';
     actBtn.hidden     = false;
     actBtn.title      = 'New Chat';
-    actBtn.onclick    = () => { createNewSession(APP.activeLane); renderContextPanel('chat'); };
-    renderSessionListInto(body, APP.activeLane);
+    actBtn.onclick    = () => startNewChatDraft();
+    renderConversationListInto(body, APP.activeLane);
 
-  } else if (viewId === 'tasks' || viewId === 'task-detail' || viewId === 'attempts' || viewId === 'artifacts' || viewId === 'history') {
+  } else if (viewId === 'tasks' || viewId === 'task-detail' || viewId === 'attempts' || viewId === 'artifacts' || viewId === 'history' || viewId === 'agents') {
     title.textContent = 'Workspace';
     sub.textContent   = 'Views';
     renderWorkspaceNavInto(body);
@@ -295,6 +340,37 @@ function renderContextPanel(viewId) {
   } else {
     title.textContent = 'Astrata';
     sub.textContent   = 'Navigation';
+  }
+}
+
+function renderConversationListInto(container, scope) {
+  const threads = chatThreadsForScope(APP.summary, scope);
+  const selectedId = APP.activeThreadByScope[scope];
+  const draftActive = selectedId === '__new__' || Boolean(APP.pendingNewChatByScope[scope]);
+  container.appendChild(el('button', {
+    className: `new-session-btn${draftActive ? ' active' : ''}`,
+    onClick: () => startNewChatDraft(),
+  }, '+ New chat'));
+
+  threads.forEach(thread => {
+    const active = !draftActive && activeThreadForScope(APP.summary || {}, scope)?.thread_id === thread.thread_id;
+    const item = el('div', {
+      className: `nav-item${active ? ' active' : ''}`,
+      onClick: () => {
+        delete APP.pendingNewChatByScope[scope];
+        APP.activeThreadByScope[scope] = thread.thread_id;
+        renderContextPanel('chat');
+        renderActiveChat(APP.summary || {});
+      },
+    },
+      el('svg', { className: 'nav-icon', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', html: '<path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>' }),
+      el('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1' } }, thread.title || defaultThreadTitle(thread)),
+    );
+    container.appendChild(item);
+  });
+
+  if (!threads.length && !draftActive) {
+    container.appendChild(el('div', { style: { padding: '12px 10px', fontSize: '12px', color: 'var(--text-dim)' } }, 'No conversations yet.'));
   }
 }
 
@@ -324,6 +400,7 @@ function renderWorkspaceNavInto(container) {
     { view: 'attempts',  icon: '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>',             label: 'Attempts' },
     { view: 'artifacts', icon: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',  label: 'Artifacts' },
     { view: 'history',   icon: '<path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 3"/>',          label: 'History' },
+    { view: 'agents',    icon: '<circle cx="12" cy="7" r="4"/><path d="M5.5 21a6.5 6.5 0 0 1 13 0"/>',                                  label: 'Agents' },
   ];
   items.forEach(({ view, icon, label }) => {
     const item = el('div', {
@@ -366,48 +443,127 @@ function switchSession(lane, sessionId) {
   renderContextPanel('chat');
   switchView('chat');
   if (APP.summary) {
-    const key = lane === 'local' ? 'local_conversation' : 'prime_conversation';
-    const messages = APP.summary.communications?.[key] || [];
-    renderChatMessages(
-      document.getElementById('chatMessages'),
-      messages, lane
-    );
+    renderChatTabs(APP.summary);
+    renderActiveChat(APP.summary);
   }
 }
 
 function switchAgent(lane) {
   APP.activeLane = lane;
-  const activeId = APP.getActiveSession(lane);
-  switchSession(lane, activeId);
+  APP.pendingResponse[lane] = false;
+  renderContextPanel('chat');
+  switchView('chat');
+  if (APP.summary) {
+    renderChatTabs(APP.summary);
+    renderActiveChat(APP.summary);
+  }
 }
 
 
-/* ─── MODE TOGGLE ───────────────────────────────────── */
+/* ─── CHAT SCOPE ────────────────────────────────────── */
 
-function setupModeToggle() {
-  const toggle = document.getElementById('chatModeToggle');
-  const labelObj = document.getElementById('chatModeLabel');
-  if (!toggle) return;
+function chatScope() {
+  return APP.activeLane || 'prime';
+}
 
-  toggle.querySelectorAll('.mode-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const lane = APP.activeLane;
-      toggle.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      APP.composerMode[lane] = btn.dataset.mode;
-      if (labelObj) {
-        labelObj.textContent = btn.dataset.mode === 'ephemeral'
-          ? `Sends to ${humanLane(lane)} · no task created`
-          : `Sends to ${humanLane(lane)} · creates tasks`;
-      }
+function isModelScope(scope = chatScope()) {
+  return scope === 'model';
+}
+
+function agentLabel(agentId, summary = APP.summary) {
+  const agent = summary?.agents?.[agentId] || {};
+  return agent.title || humanLane(agentId);
+}
+
+function chatThreadsForScope(summary, scope = chatScope()) {
+  const threads = Array.isArray(summary?.chats?.threads) ? summary.chats.threads : [];
+  return threads
+    .filter(thread => {
+      if (thread.status !== 'active') return false;
+      if (!thread.metadata?.main_lane && Number(thread.message_count_total || 0) === 0) return false;
+      if (isModelScope(scope)) return thread.chat_kind === 'model';
+      return thread.chat_kind === 'agent' && thread.agent_id === scope;
+    })
+    .sort((a, b) => {
+      const aMain = Boolean(a.metadata?.main_lane);
+      const bMain = Boolean(b.metadata?.main_lane);
+      if (aMain !== bMain) return aMain ? -1 : 1;
+      return (parseISODate(b.updated_at)?.getTime() || 0) - (parseISODate(a.updated_at)?.getTime() || 0);
     });
+}
+
+function defaultThreadTitle(thread) {
+  if (!thread) return 'New chat';
+  if (thread.chat_kind === 'model') return `Model chat: ${thread.model_id || 'local'}`;
+  if (thread.agent_mode === 'ephemeral') return 'Ephemeral chat';
+  if (thread.agent_mode === 'temporary') return 'Temporary chat';
+  return thread.metadata?.main_lane ? 'Main chat' : 'Chat';
+}
+
+function activeThreadForScope(summary, scope = chatScope()) {
+  if (APP.activeThreadByScope[scope] === '__new__') return null;
+  const candidates = chatThreadsForScope(summary, scope);
+  const selectedId = APP.activeThreadByScope[scope];
+  if (selectedId && candidates.some(thread => thread.thread_id === selectedId)) {
+    return candidates.find(thread => thread.thread_id === selectedId);
+  }
+  const main = candidates.find(thread => thread.metadata?.main_lane);
+  return main || candidates[0] || null;
+}
+
+function startNewChatDraft() {
+  const scope = chatScope();
+  APP.pendingNewChatByScope[scope] = {
+    agentMode: 'persistent',
+    providerId: '',
+    modelId: 'local',
+  };
+  APP.activeThreadByScope[scope] = '__new__';
+  renderContextPanel('chat');
+  renderActiveChat(APP.summary || {});
+}
+
+function messagesForActiveScope(summary, scope = chatScope()) {
+  const thread = activeThreadForScope(summary, scope);
+  if (thread?.thread_id) {
+    return summary?.communications?.chat_thread_conversations?.[thread.thread_id] || [];
+  }
+  if (!isModelScope(scope)) {
+    return summary?.communications?.[`${scope}_conversation`] || [];
+  }
+  return [];
+}
+
+function renderChatTabs(summary) {
+  const agentTabsContainer = document.getElementById('chatAgentTabs');
+  if (!agentTabsContainer) return;
+  agentTabsContainer.innerHTML = '';
+  const agents = Object.values(summary?.agents || {});
+  agents.forEach(agent => {
+    const agentId = agent.agent_id;
+    const tab = el('button', {
+      className: `agent-tab${APP.activeLane === agentId ? ' active' : ''}`,
+      onClick: () => switchAgent(agentId),
+    }, agent.title || humanLane(agentId));
+    agentTabsContainer.appendChild(tab);
   });
+  agentTabsContainer.appendChild(el('button', {
+    className: `agent-tab${APP.activeLane === 'model' ? ' active' : ''}`,
+    onClick: () => switchAgent('model'),
+  }, 'Models'));
+}
+
+function renderActiveChat(summary) {
+  const scope = chatScope();
+  const activeThread = activeThreadForScope(summary, scope);
+  if (activeThread?.thread_id) APP.activeThreadByScope[scope] = activeThread.thread_id;
+  renderChatMessages(document.getElementById('chatMessages'), messagesForActiveScope(summary, scope), scope, activeThread);
 }
 
 /* ─── SENDING MESSAGES ──────────────────────────────── */
 
 async function sendMessage() {
-  const lane = APP.activeLane;
+  const lane = chatScope();
   const input = document.getElementById('chatInput');
   const message = input.value.trim();
   if (!message || APP.pendingResponse[lane]) return;
@@ -426,20 +582,34 @@ async function sendMessage() {
   input.value = '';
   autoResizeTextarea(input);
 
-  const mode = APP.getComposerMode(lane);
-  const sessionId = APP.getActiveSession(lane);
+  const modelScope = isModelScope(lane);
+  const draft = APP.pendingNewChatByScope[lane] || null;
+  const activeThread = await ensureThreadForSend(lane);
+  const selectedModel = modelScope
+    ? {
+        provider_id: activeThread?.provider_id || draft?.providerId || '',
+        model_id: activeThread?.model_id || draft?.modelId || 'local',
+      }
+    : { provider_id: '', model_id: '' };
 
   try {
     await api('/api/messages', {
       method: 'POST',
       body: JSON.stringify({
         message,
-        recipient: lane,
-        conversation_id: sessionId === 'default' ? '' : sessionId,
-        intent: mode === 'ephemeral' ? 'ephemeral_message' : 'principal_message',
+        recipient: modelScope ? 'model' : lane,
+        conversation_id: activeThread?.conversation_id || '',
+        intent: modelScope ? 'model_chat_message' : 'principal_message',
         kind: 'request',
+        chat_kind: modelScope ? 'model' : 'agent',
+        thread_id: activeThread?.thread_id || '',
+        start_new_thread: Boolean(draft),
+        agent_mode: activeThread?.agent_mode || draft?.agentMode || 'persistent',
+        provider_id: selectedModel.provider_id,
+        model_id: selectedModel.model_id,
       }),
     });
+    delete APP.pendingNewChatByScope[lane];
     await refresh();
   } catch (err) {
     console.error('Send failed:', err);
@@ -448,6 +618,15 @@ async function sendMessage() {
   } finally {
     sendBtn.disabled = false;
   }
+}
+
+async function ensureThreadForSend(scope) {
+  const draft = APP.pendingNewChatByScope[scope] || null;
+  const activeThread = activeThreadForScope(APP.summary || {}, scope);
+  if (activeThread && APP.activeThreadByScope[scope] !== '__new__' && !draft) {
+    return activeThread;
+  }
+  return null;
 }
 
 function appendUserBubble(container, text) {
@@ -507,17 +686,92 @@ function shouldGroup(current, previous) {
 
 /* ─── CHAT RENDERING ────────────────────────────────── */
 
-function renderChatMessages(container, messages, lane) {
+function renderNewChatOptions(scope) {
+  const draft = APP.pendingNewChatByScope[scope] || {
+    agentMode: 'persistent',
+    providerId: '',
+    modelId: 'local',
+  };
+  APP.pendingNewChatByScope[scope] = draft;
+  if (isModelScope(scope)) {
+    return el('div', { className: 'new-chat-options' },
+      el('label', { className: 'new-chat-field' },
+        el('span', {}, 'Provider'),
+        renderProviderSelect({
+          value: draft.providerId || 'all',
+          onChange: value => {
+            APP.pendingNewChatByScope[scope] = {
+              ...draft,
+              providerId: value === 'all' ? '' : value,
+              modelId: 'local',
+            };
+            renderActiveChat(APP.summary || {});
+          },
+        }),
+      ),
+      el('label', { className: 'new-chat-field' },
+        el('span', {}, 'Model'),
+        renderModelSelect({
+          providerId: draft.providerId || '',
+          value: draft.modelId || 'local',
+          onChange: (modelId, providerId) => {
+            APP.pendingNewChatByScope[scope] = {
+              ...draft,
+              providerId: providerId === 'local' ? '' : providerId,
+              modelId: modelId || 'local',
+            };
+          },
+        }),
+      ),
+    );
+  }
+  const typeSelect = el('select', {
+    className: 'input new-chat-select',
+    onChange: event => {
+      APP.pendingNewChatByScope[scope] = {
+        ...draft,
+        agentMode: event.target.value || 'persistent',
+      };
+    },
+  },
+    el('option', { value: 'persistent' }, 'Normal chat'),
+    el('option', { value: 'ephemeral' }, 'Ephemeral chat'),
+    el('option', { value: 'temporary' }, 'Temporary agent chat'),
+  );
+  typeSelect.value = draft.agentMode || 'persistent';
+  return el('div', { className: 'new-chat-options' },
+    el('label', { className: 'new-chat-field' },
+      el('span', {}, 'Chat type'),
+      typeSelect,
+    ),
+  );
+}
+
+function renderChatMessages(container, messages, lane, activeThread = null) {
   // Clear generating bubble
   removeGeneratingBubble(lane);
 
   if (!messages || messages.length === 0) {
-    if (container.dataset.lastMsgIds === 'empty') return;
-    container.dataset.lastMsgIds = 'empty';
+    const draft = APP.pendingNewChatByScope[lane] || null;
+    const emptySig = `empty:${lane}:${activeThread?.thread_id || 'none'}:${JSON.stringify(draft || {})}`;
+    if (container.dataset.lastMsgIds === emptySig) return;
+    container.dataset.lastMsgIds = emptySig;
+    const isDraft = APP.activeThreadByScope[lane] === '__new__' || !activeThread;
+    const title = isModelScope(lane)
+      ? 'Direct model chat'
+      : `Talk to ${agentLabel(lane)}`;
+    const body = isDraft
+      ? 'Choose the chat shape, then send the first message.'
+      : activeThread
+      ? 'This chat is ready. Send a message to begin.'
+      : (isModelScope(lane)
+          ? 'Choose a model and start a new model chat.'
+          : 'No messages in this chat scope yet. Start a new chat when you are ready.');
     clearAndAppend(container, el('div', { className: 'chat-empty' },
       el('div', { className: 'chat-empty-icon' }, el('span', {}, '✦')),
-      el('h2', {}, `Talk to ${humanLane(lane)}`),
-      el('p', {}, `Send a message to start a conversation. Use Agent mode to spawn governed tasks, or Ephemeral for a lightweight one-off chat.`),
+      el('h2', {}, title),
+      el('p', {}, body),
+      isDraft ? renderNewChatOptions(lane) : null,
     ));
     return;
   }
@@ -555,7 +809,7 @@ function renderChatMessages(container, messages, lane) {
       avatarText   = 'S';
     } else {
       avatarClass += ' agent';
-      avatarText   = lane === 'local' ? 'L' : 'P';
+      avatarText   = isModelScope(lane) ? 'M' : String(agentLabel(lane)).slice(0, 1).toUpperCase();
       if (lane === 'local') avatarStyle = 'background:rgba(0,217,255,0.14);border:1px solid rgba(0,217,255,0.2);color:#9fefff;';
     }
 
@@ -918,6 +1172,163 @@ function renderHistory(summary) {
   clearAndAppend(document.getElementById('historyContent'), sections);
 }
 
+/* ─── AGENTS VIEW ──────────────────────────────────── */
+
+function renderAgents(summary) {
+  const agents = Object.values(summary?.agents || {});
+  const activeAgents = agents.filter(agent => agent.status === 'active');
+  const localOnlyAgents = agents.filter(agent => !agent.permissions_profile?.network);
+  const routedAgents = agents.filter(agent => agent.display_route?.label);
+
+  clearAndAppend(document.getElementById('agentMetrics'), [
+    metricTile(agents.length, 'Agents'),
+    metricTile(activeAgents.length, 'Active'),
+    metricTile(localOnlyAgents.length, 'Local-only'),
+    metricTile(routedAgents.length, 'Routed'),
+  ]);
+
+  const agentList = document.getElementById('agentList');
+  if (!agentList) return;
+  if (!agents.length) {
+    clearAndAppend(agentList, el('div', { className: 'empty-state' }, 'No durable agents registered yet.'));
+    return;
+  }
+  clearAndAppend(agentList, el('div', { className: 'endpoint-grid' },
+    ...agents.map(agent => el('div', { className: 'endpoint-card' },
+      el('div', { className: 'endpoint-card-head' },
+        el('div', {},
+          el('div', { className: 'model-card-name' }, agent.title || agent.agent_id),
+          el('div', { className: 'endpoint-subtitle' }, `${agent.agent_id} · ${agent.role || 'agent'}`),
+        ),
+        pill(agent.status || 'unknown', pillClass(agent.status || 'neutral')),
+      ),
+      agent.persona_prompt ? el('div', { className: 'transcript-body' }, truncate(agent.persona_prompt, 180)) : null,
+      el('div', { className: 'model-card-meta' },
+        agent.display_route?.label ? pill(agent.display_route.label, 'accent') : null,
+        agent.permissions_profile?.network ? pill('network', 'success') : pill('local-only', 'neutral'),
+        agent.permissions_profile?.local_memory ? pill('memory', 'success') : null,
+      ),
+      (agent.responsibilities || []).length ? el('div', { className: 'endpoint-list' },
+        ...(agent.responsibilities || []).slice(0, 4).map(item => el('div', { className: 'endpoint-row' },
+          el('span', {}, 'Does'),
+          el('code', {}, item),
+        ))
+      ) : null,
+    ))
+  ));
+}
+
+function renderProviderSelect({ value = 'all', onChange = null } = {}) {
+  const select = el('select', {
+    className: 'input new-chat-select',
+    onChange: event => { if (onChange) onChange(event.target.value); },
+  });
+  select.appendChild(el('option', { value: 'all' }, 'All providers'));
+  select.appendChild(el('option', { value: 'local' }, 'Local runtime'));
+  providerIdsForCatalog(APP.summary || {}).forEach(providerId => {
+    select.appendChild(el('option', { value: providerId }, providerId));
+  });
+  select.value = Array.from(select.options).some(option => option.value === value) ? value : 'all';
+  return select;
+}
+
+function renderModelSelect({ providerId = '', value = 'local', onChange = null } = {}) {
+  const select = el('select', {
+    className: 'input new-chat-select',
+    onChange: event => {
+      if (!onChange) return;
+      const option = event.target.selectedOptions?.[0];
+      onChange(event.target.value, option?.dataset?.providerId || providerId || '');
+    },
+  });
+  populateModelSelect(select, APP.summary || {}, providerId, value);
+  return select;
+}
+
+function providerIdsForCatalog(summary) {
+  const catalog = Array.isArray(summary?.providers?.model_catalog) ? summary.providers.model_catalog : [];
+  return Array.from(new Set(catalog.map(item => item.provider_id).filter(Boolean))).sort();
+}
+
+function populateModelSelect(select, summary, providerId = '', current = '') {
+  const catalog = Array.isArray(summary?.providers?.model_catalog) ? summary.providers.model_catalog : [];
+  const chatModels = catalog.filter(item => (item.capabilities || []).includes('chat') || (item.capabilities || []).includes('text'));
+  select.innerHTML = '';
+  const localOption = el('option', { value: 'local' }, 'Local runtime · selected/loaded model');
+  localOption.dataset.providerId = 'local';
+  select.appendChild(localOption);
+  chatModels
+    .filter(item => !providerId || providerId === 'local' || item.provider_id === providerId)
+    .forEach(item => {
+    const status = item.status && item.status !== 'available' ? ` (${item.status})` : '';
+    const option = el('option', { value: item.model_id }, `${item.provider_id} · ${item.display_name || item.model_id}${status}`);
+    option.dataset.providerId = item.provider_id || '';
+    select.appendChild(option);
+  });
+  if (current && Array.from(select.options).some(option => option.value === current)) {
+    select.value = current;
+  }
+}
+
+function renderChatThreadCard(thread) {
+  const statusTone = thread.status === 'active' ? 'success' : (thread.status === 'archived' ? 'warning' : 'neutral');
+  const isMainThread = Boolean(thread.metadata?.main_lane);
+  const target = thread.chat_kind === 'model'
+    ? (thread.model_id || 'local model')
+    : (thread.agent_id || 'agent');
+  return el('div', { className: 'endpoint-card' },
+    el('div', { className: 'endpoint-card-head' },
+      el('div', {},
+        el('div', { className: 'model-card-name' }, thread.title || thread.thread_id),
+        el('div', { className: 'endpoint-subtitle' }, `${thread.chat_kind} · ${target} · ${thread.agent_mode || 'single-session'}`),
+      ),
+      pill(thread.status || 'active', statusTone),
+    ),
+    thread.preview ? el('div', { className: 'transcript-body' }, truncate(thread.preview, 180)) : null,
+    el('div', { className: 'model-card-meta' },
+      pill(thread.memory_policy?.update_agent_memory ? 'memory updates' : 'no memory update', thread.memory_policy?.update_agent_memory ? 'success' : 'neutral'),
+      thread.memory_policy?.convertible_to_permanent ? pill('convertible', 'warning') : null,
+      pill(`${thread.message_count_recent || 0} recent`, 'neutral'),
+    ),
+    el('div', { className: 'endpoint-mono' }, thread.conversation_id || thread.thread_id),
+    el('div', { className: 'model-card-actions' },
+      thread.status === 'active' ? el('button', {
+        className: 'btn btn-ghost btn-sm',
+        onClick: async () => {
+          await api(`/api/chats/${encodeURIComponent(thread.thread_id)}/archive`, { method: 'POST' });
+          await refresh();
+        },
+      }, 'Archive') : null,
+      thread.status === 'archived' ? el('button', {
+        className: 'btn btn-secondary btn-sm',
+        onClick: async () => {
+          await api(`/api/chats/${encodeURIComponent(thread.thread_id)}/restore`, { method: 'POST' });
+          await refresh();
+        },
+      }, 'Restore') : null,
+      thread.agent_mode === 'ephemeral' ? el('button', {
+        className: 'btn btn-secondary btn-sm',
+        onClick: async () => {
+          await api(`/api/chats/${encodeURIComponent(thread.thread_id)}/convert`, { method: 'POST' });
+          await refresh();
+        },
+      }, 'Make permanent') : null,
+      el('button', {
+        className: 'btn btn-danger btn-sm',
+        onClick: async () => {
+          const verb = isMainThread ? 'clear' : 'delete';
+          const confirmed = isMainThread
+            ? window.confirm('Clear this main chat lane? The main thread will remain available.')
+            : window.confirm('Delete this chat thread from the active registry? Messages remain in durable communication history for now.');
+          if (!confirmed) return;
+          await api(`/api/chats/${encodeURIComponent(thread.thread_id)}/delete`, { method: 'POST' });
+          await refresh();
+        },
+      }, isMainThread ? 'Clear' : 'Delete'),
+    ),
+  );
+}
+
 /* ─── MODELS & RUNTIME ──────────────────────────────── */
 
 function renderModels(summary) {
@@ -927,8 +1338,12 @@ function renderModels(summary) {
   const policy   = APP.generalSettings?.local_runtime_policy || runtime?.policy || {};
   const thermal  = runtime?.thermal_state || {};
   const decision = runtime?.thermal_decision || {};
+  const thermalHistory = runtime?.thermal_history || {};
   const rec      = runtime?.recommendation || {};
   const managed  = runtime?.managed_process || {};
+  const loadedModels = Array.isArray(runtime?.loaded_models) ? runtime.loaded_models : [];
+  const servedEndpoints = Array.isArray(runtime?.served_endpoints) ? runtime.served_endpoints : [];
+  const endpointConfig = runtime?.endpoint_config || {};
   const loaded   = runtime?.loaded_model || null;
   const inventory = runtime?.inventory || {};
   const running  = Boolean(managed?.running);
@@ -938,6 +1353,10 @@ function renderModels(summary) {
 
   function formatGb(value) {
     return value == null || value === '' ? '—' : `${Number(value).toFixed(1)} GB`;
+  }
+
+  function formatRatio(value) {
+    return value == null || Number.isNaN(Number(value)) ? '—' : `${Math.round(Number(value) * 100)}%`;
   }
 
   async function savePolicy(nextPolicy, { refreshAfter = true } = {}) {
@@ -960,16 +1379,18 @@ function renderModels(summary) {
       override_resource_policy: String(Boolean(overrideResourcePolicy)),
     });
     const result = await api(`/api/local-runtime/start?${query.toString()}`, { method: 'POST' });
+    const detail = result?.detail || result || {};
+    const status = detail?.status || result?.status;
     if (
-      (result?.status === 'deferred_for_thermal' || result?.status === 'blocked_by_resource_policy')
+      (status === 'deferred_for_thermal' || status === 'blocked_by_resource_policy')
       && policy?.allow_manual_override
     ) {
-      const reason = result?.status === 'deferred_for_thermal'
+      const reason = status === 'deferred_for_thermal'
         ? 'Astrata would normally defer this load because of current thermal pressure.'
-        : (result?.resource_policy?.reasons || []).join(' ');
+        : (detail?.resource_policy?.reasons || []).join(' ');
       const confirmed = window.confirm(`${reason} Force-load ${model.display_name || model.model_id} anyway?`);
       if (confirmed) {
-        await api(
+        const forced = await api(
           `/api/local-runtime/start?${new URLSearchParams({
             model_id: model.model_id,
             operator_initiated: 'true',
@@ -978,7 +1399,14 @@ function renderModels(summary) {
           }).toString()}`,
           { method: 'POST' },
         );
+        const forcedDetail = forced?.detail || forced || {};
+        if (forcedDetail?.status && forcedDetail.status !== 'started') {
+          window.alert(`Model load did not start: ${forcedDetail.status}`);
+        }
       }
+    } else if (status && status !== 'started') {
+      const reason = detail?.resource_policy?.reasons?.join(' ') || detail?.error || detail?.thermal_decision?.reason || status;
+      window.alert(`Model load did not start: ${reason}`);
     }
     await refresh();
   }
@@ -994,8 +1422,12 @@ function renderModels(summary) {
     el('div', { className: 'metric-grid' },
       metricTile(thermal?.thermal_pressure || 'unknown', 'Thermal'),
       metricTile(decision?.action || '—', 'Decision'),
+      metricTile(formatRatio(thermalHistory?.nominal_ratio), `Nominal / ${thermalHistory?.sample_count || 0} samples`),
       metricTile(loaded?.display_name || rec?.model?.display_name || 'None', running ? 'Loaded' : 'Recommended'),
       metricTile(models.length, 'Models Found'),
+    ),
+    el('div', { style: { fontSize: '12px', color: 'var(--text-dim)', lineHeight: '1.6' } },
+      `Thermal latch: ${decision?.latched || 'unknown'}. ${decision?.reason || 'No thermal decision recorded.'}`,
     ),
     running ? el('div', { style: { marginTop: '12px', fontSize: '13px', color: 'var(--text-muted)', lineHeight: '1.7' } },
       `${loaded?.display_name || 'Unknown model'} is loaded`,
@@ -1025,6 +1457,9 @@ function renderModels(summary) {
       `Desktop backend: ${backendRunning ? 'running' : (backendStopped ? 'stopped deliberately' : 'recovering')}.`) : null,
   ));
 
+  renderServedEndpointsPane(servedEndpoints);
+  renderEndpointConfigPane(endpointConfig);
+
   const desktopIndicator = document.getElementById('desktopBackendIndicator');
   if (desktopIndicator) {
     const runningText = backendRunning ? 'backend: running'
@@ -1041,19 +1476,14 @@ function renderModels(summary) {
   renderConnectorStatus(summary);
 
   // Local runtime indicator in Local chat header
-  const indicator = document.getElementById('localRuntimeIndicator');
+  const indicator = document.getElementById('runtimeIndicator');
   if (indicator) {
     indicator.textContent = running ? '● Running' : '○ Stopped';
     indicator.className = `pill pill-${running ? 'success' : 'neutral'}`;
+    indicator.hidden = false;
   }
 
   const grid = document.getElementById('modelGrid');
-  if (!models.length) {
-    clearAndAppend(grid, el('div', { className: 'empty-state' },
-      'No local models discovered. Configure model search paths in Settings.'));
-    return;
-  }
-
   const eligibleSet = new Set(policy?.eligible_model_ids || []);
   const selectedProfile = policy?.default_profile_id || '';
   const profileOptions = ['quiet', 'balanced', 'turbo', 'quality'];
@@ -1191,10 +1621,15 @@ function renderModels(summary) {
         isLoaded ? el('button', {
           className: 'btn btn-secondary btn-sm',
           onClick: async () => {
-            await api('/api/local-runtime/stop', { method: 'POST' });
+            const loadedRuntime = loadedModels.find(item => item?.model?.model_id === model.model_id);
+            const runtimeKey = loadedRuntime?.runtime_key;
+            const endpoint = runtimeKey
+              ? `/api/local-runtime/${encodeURIComponent(runtimeKey)}/stop`
+              : '/api/local-runtime/stop';
+            await api(endpoint, { method: 'POST' });
             await refresh();
           },
-        }, 'Unload') : el('button', {
+        }, 'Eject') : el('button', {
           className: 'btn btn-secondary btn-sm',
           onClick: async (e) => {
             const btn = e.currentTarget;
@@ -1212,7 +1647,228 @@ function renderModels(summary) {
     );
   });
 
-  clearAndAppend(grid, [policyPanel, ...cards]);
+  renderLoadedModelsPane(loadedModels, running, {
+    policyPanel,
+    recommendation: rec,
+    loadRecommended: rec?.model ? () => loadModel(rec.model) : null,
+  });
+  clearAndAppend(grid, cards.length ? cards : el('div', { className: 'empty-state' },
+    'No local models discovered. Configure model search paths in Settings.'));
+}
+
+function renderLoadedModelsPane(loadedModels, running, options = {}) {
+  const pane = document.getElementById('loadedModelsPane');
+  if (!pane) return;
+  const policyPanel = options.policyPanel || null;
+  if (!loadedModels.length) {
+    clearAndAppend(pane, [
+      policyPanel,
+      el('div', { className: 'empty-state' },
+        running
+          ? 'Runtime is live, but Astrata could not resolve a loaded model record yet.'
+          : 'None. No local model is currently loaded by Astrata.',
+        options.loadRecommended ? el('div', { style: { marginTop: '12px' } },
+          el('button', {
+            className: 'btn btn-secondary btn-sm',
+            onClick: async (e) => {
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              btn.textContent = 'Loading…';
+              try { await options.loadRecommended(); }
+              catch (err) { console.error('Recommended load failed:', err); }
+              finally {
+                btn.disabled = false;
+                btn.textContent = 'Load recommended model';
+              }
+            },
+          }, 'Load recommended model'),
+        ) : null,
+      ),
+    ]);
+    return;
+  }
+  clearAndAppend(pane, [
+    policyPanel,
+    el('div', { className: 'endpoint-grid' },
+      ...loadedModels.map(item => {
+      const model = item?.model || {};
+      const proc = item?.managed_process || {};
+      return el('div', { className: 'endpoint-card' },
+        el('div', { className: 'endpoint-card-head' },
+          el('div', {},
+            el('div', { className: 'model-card-name' }, model.display_name || model.model_id || 'Unknown model'),
+            el('div', { className: 'endpoint-subtitle' }, `${item.runtime_key || 'default'} · ${item.backend_id || 'backend'}`),
+          ),
+          pill(proc.running ? 'loaded' : 'stale', proc.running ? 'success' : 'warning'),
+        ),
+        el('div', { className: 'model-card-meta' },
+          model.family ? pill(model.family, 'neutral') : null,
+          model.quantization ? pill(model.quantization, 'neutral') : null,
+          item.profile_id ? pill(`profile ${item.profile_id}`, 'neutral') : null,
+          item.load_origin ? pill(`by ${item.load_origin}`, item.load_origin === 'user' ? 'success' : 'neutral') : null,
+        ),
+        model.path ? el('div', { className: 'endpoint-mono' }, model.path) : null,
+        el('div', { className: 'endpoint-kv' },
+          el('span', {}, 'PID'),
+          el('strong', {}, proc.pid || '—'),
+          el('span', {}, 'Endpoint'),
+          el('strong', {}, proc.endpoint || '—'),
+        ),
+        el('div', { className: 'model-card-actions' },
+          el('button', {
+            className: 'btn btn-danger btn-sm',
+            disabled: !proc.running,
+            onClick: async (e) => {
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              btn.textContent = 'Ejecting…';
+              try {
+                await api(`/api/local-runtime/${encodeURIComponent(item.runtime_key || 'default')}/stop`, { method: 'POST' });
+                await refresh();
+              } catch (err) {
+                console.error('Eject failed:', err);
+              } finally {
+                btn.disabled = false;
+                btn.textContent = 'Eject model';
+              }
+            },
+          }, 'Eject model'),
+          proc.log_path ? el('span', { className: 'endpoint-subtitle' }, `log: ${truncate(proc.log_path, 48)}`) : null,
+        ),
+      );
+      })
+    ),
+  ]);
+}
+
+function renderServedEndpointsPane(endpoints) {
+  const pane = document.getElementById('servedEndpointsPane');
+  if (!pane) return;
+  if (!endpoints.length) {
+    clearAndAppend(pane, el('div', { className: 'empty-state' },
+      'None. Astrata is not serving a local inference endpoint right now.',
+      el('div', { style: { marginTop: '12px', display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' } },
+        el('button', {
+          className: 'btn btn-secondary btn-sm',
+          onClick: async (e) => {
+            const btn = e.currentTarget;
+            btn.disabled = true;
+            btn.textContent = 'Starting…';
+            try { await api('/api/local-runtime/start?operator_initiated=true', { method: 'POST' }); await refresh(); }
+            catch (err) { console.error('Endpoint start failed:', err); }
+            finally {
+              btn.disabled = false;
+              btn.textContent = 'Bring endpoint up';
+            }
+          },
+        }, 'Bring endpoint up'),
+      ),
+    ));
+    return;
+  }
+  clearAndAppend(pane, el('div', { className: 'endpoint-grid' },
+    ...endpoints.map(endpoint => {
+      const model = endpoint?.model || {};
+      return el('div', { className: 'endpoint-card' },
+        el('div', { className: 'endpoint-card-head' },
+          el('div', {},
+            el('div', { className: 'model-card-name' }, endpoint.base_url || endpoint.health_url || 'Endpoint'),
+            el('div', { className: 'endpoint-subtitle' }, `${endpoint.runtime_key || 'runtime'} · ${endpoint.backend_id || 'backend'} · ${endpoint.mode || 'managed'}`),
+          ),
+          pill(endpoint.running ? 'serving' : (endpoint.status || 'configured'), endpoint.running ? 'success' : 'neutral'),
+        ),
+        model.display_name ? el('div', { className: 'transcript-body' }, `Model: ${model.display_name}`) : null,
+        el('div', { className: 'endpoint-list' },
+          endpoint.chat_completions_url ? endpointRow('Chat completions', endpoint.chat_completions_url) : null,
+          endpoint.legacy_completion_url ? endpointRow('Completion', endpoint.legacy_completion_url) : null,
+          endpoint.health_url ? endpointRow('Health', endpoint.health_url) : null,
+        ),
+        endpoint?.config?.profile_id || endpoint?.pid ? el('div', { className: 'model-card-meta' },
+          endpoint.pid ? pill(`pid ${endpoint.pid}`, 'neutral') : null,
+          endpoint?.config?.profile_id ? pill(`profile ${endpoint.config.profile_id}`, 'neutral') : null,
+        ) : null,
+        el('div', { className: 'model-card-actions' },
+          endpoint.mode === 'external' ? pill('external endpoint', 'neutral') : el('button', {
+            className: endpoint.running ? 'btn btn-danger btn-sm' : 'btn btn-secondary btn-sm',
+            onClick: async (e) => {
+              const btn = e.currentTarget;
+              const runtimeKey = endpoint.runtime_key || 'default';
+              btn.disabled = true;
+              btn.textContent = endpoint.running ? 'Stopping…' : 'Starting…';
+              try {
+                if (endpoint.running) {
+                  await api(`/api/local-runtime/${encodeURIComponent(runtimeKey)}/stop`, { method: 'POST' });
+                } else {
+                  await api('/api/local-runtime/start?operator_initiated=true', { method: 'POST' });
+                }
+                await refresh();
+              } catch (err) {
+                console.error('Endpoint control failed:', err);
+              } finally {
+                btn.disabled = false;
+                btn.textContent = endpoint.running ? 'Bring down' : 'Bring up';
+              }
+            },
+          }, endpoint.running ? 'Bring down' : 'Bring up'),
+        ),
+      );
+    })
+  ));
+}
+
+function endpointRow(label, value) {
+  return el('div', { className: 'endpoint-row' },
+    el('span', {}, label),
+    el('code', {}, value),
+    el('button', {
+      className: 'btn btn-ghost btn-sm',
+      onClick: async () => {
+        try { await navigator.clipboard.writeText(value); }
+        catch (err) { console.error('Copy endpoint failed:', err); }
+      },
+    }, 'Copy'),
+  );
+}
+
+function renderEndpointConfigPane(config) {
+  const pane = document.getElementById('endpointConfigPane');
+  if (!pane) return;
+  const profiles = Array.isArray(config?.profiles) ? config.profiles : [];
+  const searchPaths = Array.isArray(config?.model_search_paths) ? config.model_search_paths : [];
+  clearAndAppend(pane, [
+    el('div', { className: 'endpoint-config-grid' },
+      metricTile(config?.host || '127.0.0.1', 'Host'),
+      metricTile(config?.port || 8080, 'Port'),
+      metricTile(config?.managed ? 'managed' : 'manual', 'Mode'),
+      metricTile(profiles.length, 'Profiles'),
+    ),
+    el('div', { className: 'runtime-card' },
+      el('div', { className: 'runtime-status-row' },
+        el('span', { style: { fontWeight: '700', fontSize: '14px' } }, 'llama.cpp launch config'),
+        pill(config?.backend_id || 'llama_cpp', 'neutral'),
+      ),
+      el('div', { className: 'endpoint-kv' },
+        el('span', {}, 'Binary'),
+        el('strong', {}, config?.binary_path || 'llama-server'),
+        el('span', {}, 'Default chat endpoint'),
+        el('strong', {}, config?.default_chat_completions_url || '—'),
+        el('span', {}, 'External base URL'),
+        el('strong', {}, config?.base_url || '—'),
+      ),
+      profiles.length ? el('div', { className: 'endpoint-list' },
+        ...profiles.map(profile => el('div', { className: 'endpoint-row' },
+          el('span', {}, profile.profile_id || profile.name || 'profile'),
+          el('code', {}, (profile.llama_cpp_args || []).join(' ') || 'default args'),
+        ))
+      ) : null,
+      searchPaths.length ? el('div', { className: 'endpoint-list' },
+        ...searchPaths.map(path => el('div', { className: 'endpoint-row' },
+          el('span', {}, 'Search path'),
+          el('code', {}, path),
+        ))
+      ) : null,
+    ),
+  ]);
 }
 
 function setDesktopOverlay({ title, body, dismissible = true } = {}) {
@@ -2005,41 +2661,8 @@ async function refresh() {
     APP.summary   = summary;
     hideDesktopOverlay();
 
-    // Render Agent Tabs
-    const agentTabsContainer = document.getElementById('chatAgentTabs');
-    if (agentTabsContainer) {
-      agentTabsContainer.innerHTML = '';
-      const agents = Object.keys(summary?.agents || { prime: {}, local: {} });
-      if (!agents.includes('prime')) agents.unshift('prime');
-      if (!agents.includes('local') && agents.indexOf('prime') === 0) agents.splice(1, 0, 'local');
-      else if (!agents.includes('local')) agents.push('local');
-      
-      agents.forEach(agentId => {
-        const agentDef = summary?.agents?.[agentId] || {};
-        const label = agentId === 'prime' ? 'Prime' : (agentId === 'local' ? 'Local' : (agentDef.display_route?.label || humanLane(agentId)));
-        
-        const tab = el('div', {
-          className: `agent-tab${APP.activeLane === agentId ? ' active' : ''}`,
-          onClick: () => switchAgent(agentId),
-          style: {
-            padding: '8px 16px',
-            cursor: 'pointer',
-            borderBottom: APP.activeLane === agentId ? '2px solid var(--accent)' : '2px solid transparent',
-            color: APP.activeLane === agentId ? 'var(--text)' : 'var(--text-dim)',
-            fontWeight: APP.activeLane === agentId ? '600' : '400',
-            whiteSpace: 'nowrap',
-          }
-        }, label);
-        
-        agentTabsContainer.appendChild(tab);
-      });
-    }
-
-    // Chat rendering for active agent
-    const lane = APP.activeLane || 'prime';
-    const key = lane + '_conversation';
-    const conv = summary?.communications?.[key] || [];
-    renderChatMessages(document.getElementById('chatMessages'), conv, lane);
+    renderChatTabs(summary);
+    renderActiveChat(summary);
 
     // Unread badges (icon rail)
     let totalUnread = 0;
@@ -2056,6 +2679,7 @@ async function refresh() {
     renderAttempts(summary);
     renderArtifacts(summary);
     renderHistory(summary);
+    renderAgents(summary);
     renderModels(summary);
     renderSettings(summary);
     renderStartup(summary);
@@ -2116,6 +2740,8 @@ function updateTelemetry(summary) {
 /* ─── INIT ──────────────────────────────────────────── */
 
 window.addEventListener('DOMContentLoaded', async () => {
+  await rememberCurrentAssetFingerprint();
+
   // Icon rail navigation
   document.querySelectorAll('.rail-btn[data-view]').forEach(btn => {
     btn.addEventListener('click', () => switchView(btn.dataset.view));
@@ -2130,6 +2756,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Refresh buttons
   document.getElementById('refreshBtn').addEventListener('click', refresh);
   document.getElementById('refreshTasksBtn').addEventListener('click', refresh);
+  document.getElementById('refreshAgentsBtn').addEventListener('click', refresh);
+  const reloadUiBtn = document.getElementById('reloadUiBtn');
+  if (reloadUiBtn) reloadUiBtn.addEventListener('click', () => window.location.reload());
 
   // Loop step
   document.getElementById('runLoopBtn').addEventListener('click', async () => {
@@ -2284,9 +2913,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     hideDesktopOverlay();
   });
 
-  // Mode toggles
-  setupModeToggle();
-
   // Context panel
   renderContextPanel('chat');
 
@@ -2294,9 +2920,13 @@ window.addEventListener('DOMContentLoaded', async () => {
   await refresh();
 });
 
-window.addEventListener('focus', () => { void refresh(); });
+window.addEventListener('focus', () => {
+  void reloadIfAssetsChanged();
+  void refresh();
+});
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
+    void reloadIfAssetsChanged();
     void refresh();
   }
 });

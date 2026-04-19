@@ -26,9 +26,17 @@ class ThermalDecision:
 
 
 class ThermalController:
-    def __init__(self, *, state_path: Path, cooldown_ttl_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        *,
+        state_path: Path,
+        cooldown_ttl_seconds: int = 300,
+        history_limit: int = 500,
+    ) -> None:
         self.state_path = state_path
+        self.history_path = state_path.with_name("thermal_history.json")
         self.cooldown_ttl_seconds = max(0, int(cooldown_ttl_seconds))
+        self.history_limit = max(24, int(history_limit))
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
 
     def evaluate(
@@ -90,6 +98,35 @@ class ThermalController:
     def clear_latch(self) -> None:
         self.state_path.unlink(missing_ok=True)
 
+    def history_summary(self, *, window: int = 100) -> dict[str, object]:
+        history = self._load_history()
+        recent = history[-max(1, int(window)) :]
+
+        def counts_for(key: str) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for item in recent:
+                value = str(item.get(key) or "unknown")
+                counts[value] = counts.get(value, 0) + 1
+            return counts
+
+        sample_counts = counts_for("sample")
+        action_counts = counts_for("action")
+        sample_count = len(recent)
+        nominal_count = sample_counts.get("nominal", 0)
+        fair_or_worse = sum(
+            sample_counts.get(label, 0) for label in ("fair", "severe", "critical")
+        )
+        return {
+            "sample_count": sample_count,
+            "last_sample_at": recent[-1].get("sampled_at") if recent else None,
+            "samples": sample_counts,
+            "actions": action_counts,
+            "latched": counts_for("latched"),
+            "nominal_ratio": nominal_count / sample_count if sample_count else None,
+            "fair_or_worse_ratio": fair_or_worse / sample_count if sample_count else None,
+            "recent": recent[-24:],
+        }
+
     def _load_state(self) -> dict[str, object]:
         if not self.state_path.exists():
             return {}
@@ -99,6 +136,7 @@ class ThermalController:
             return {}
 
     def _store_state(self, decision: ThermalDecision) -> None:
+        now = time.time()
         payload = {
             "sample": decision.sample,
             "latched": decision.latched,
@@ -106,9 +144,35 @@ class ThermalController:
             "should_start_new_local_work": decision.should_start_new_local_work,
             "should_throttle_background": decision.should_throttle_background,
             "reason": decision.reason,
-            "updated_at": time.time(),
+            "updated_at": now,
         }
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._append_history(decision, sampled_at=now)
+
+    def _load_history(self) -> list[dict[str, object]]:
+        if not self.history_path.exists():
+            return []
+        try:
+            payload = json.loads(self.history_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return payload if isinstance(payload, list) else []
+
+    def _append_history(self, decision: ThermalDecision, *, sampled_at: float) -> None:
+        history = self._load_history()
+        history.append(
+            {
+                "sampled_at": sampled_at,
+                "sample": decision.sample,
+                "latched": decision.latched,
+                "action": decision.action,
+                "should_start_new_local_work": decision.should_start_new_local_work,
+            }
+        )
+        self.history_path.write_text(
+            json.dumps(history[-self.history_limit :], separators=(",", ":")),
+            encoding="utf-8",
+        )
 
 
 def _normalize_pressure(value: str) -> ThermalSeverity:
